@@ -1,0 +1,325 @@
+import ipaddress
+import logging
+import re
+import socket
+from collections.abc import Mapping
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+
+from src.config import config
+from src.util import try_proxied_get
+
+
+logger = logging.getLogger("qq-bot")
+
+MAX_URL_BYTES = 512 * 1024
+MAX_URL_TEXT_CHARS = 6000
+MAX_REDIRECTS = 3
+URL_PATTERN = re.compile(r"https?://[^\s<>'\"\]]+", re.IGNORECASE)
+TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？)]}）】》"
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+ALLOWED_CONTENT_TYPES = {
+    "text/html",
+    "text/plain",
+    "application/xhtml+xml",
+    "application/json",
+    "application/ld+json",
+}
+
+
+@dataclass(frozen=True)
+class UrlFetchResult:
+    ok: bool
+    status: str
+    text: str
+
+
+class _ReadableHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self._in_title = False
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, _attrs) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "template"}:
+            self._ignored_depth += 1
+            return
+        if tag == "title":
+            self._in_title = True
+            return
+        if tag in {"p", "br", "div", "section", "article", "header", "footer", "li", "tr", "h1", "h2", "h3"}:
+            self.text_parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "template"}:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+            return
+        if tag == "title":
+            self._in_title = False
+            return
+        if tag in {"p", "div", "section", "article", "li", "tr", "h1", "h2", "h3"}:
+            self.text_parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        if self._in_title:
+            self.title_parts.append(data)
+            return
+        self.text_parts.append(data)
+
+
+def _collapse_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    text = _collapse_spaces(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip("，,。；;：:") + "..."
+
+
+def extract_first_url(text: str) -> str:
+    match = URL_PATTERN.search(str(text or ""))
+    if not match:
+        return ""
+    return match.group(0).rstrip(TRAILING_URL_PUNCTUATION)
+
+
+def has_url(text: str) -> bool:
+    return bool(extract_first_url(text))
+
+
+def _format_failure(status: str, url: str, message: str) -> str:
+    return (
+        f"获取状态：{status}\n"
+        "内容类型：url\n"
+        f"URL：{url or '无'}\n"
+        f"说明：{message}"
+    )
+
+
+def _format_success(url: str, title: str, text: str, content_type: str) -> str:
+    title = title or "无标题"
+    excerpt = _truncate_text(text, MAX_URL_TEXT_CHARS)
+    return (
+        "获取状态：success\n"
+        "内容类型：url\n"
+        f"URL：{url}\n"
+        f"标题：{title}\n"
+        f"响应类型：{content_type or '未知'}\n"
+        f"正文字符数：{len(_collapse_spaces(text))}\n"
+        "正文摘录：\n"
+        f"{excerpt}"
+    )
+
+
+def _is_unsafe_ip(ip_text: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+def _validate_url(url: str) -> tuple[bool, str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False, "unsupported_scheme", "只支持 http/https 网页。"
+    if not parsed.hostname:
+        return False, "invalid_url", "URL 缺少有效域名。"
+
+    hostname = parsed.hostname.strip().lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return False, "unsafe_url", "出于安全原因，不能读取本机或局域网地址。"
+
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return False, "invalid_url", "URL 端口无效。"
+
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False, "dns_error", "域名解析失败。"
+
+    if not addr_infos:
+        return False, "dns_error", "域名解析失败。"
+
+    for info in addr_infos:
+        try:
+            ip_text = str(info[4][0])
+        except (IndexError, TypeError):
+            return False, "dns_error", "域名解析失败。"
+        if _is_unsafe_ip(ip_text):
+            return False, "unsafe_url", "出于安全原因，不能读取本机或局域网地址。"
+
+    return True, "", ""
+
+
+def _content_type(headers: Mapping) -> str:
+    content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _content_length(headers: Mapping) -> int:
+    raw_value = str(headers.get("Content-Length") or headers.get("content-length") or "").strip()
+    if not raw_value:
+        return 0
+    try:
+        return int(raw_value)
+    except ValueError:
+        return 0
+
+
+def _read_limited_text(response) -> tuple[bool, str, str]:
+    content = getattr(response, "content", None)
+    if content is None and hasattr(response, "iter_content"):
+        chunks = bytearray()
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            if isinstance(chunk, str):
+                chunk = chunk.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
+            chunks.extend(chunk)
+            if len(chunks) > MAX_URL_BYTES:
+                return False, "too_large", ""
+        content = bytes(chunks)
+
+    if content is not None:
+        if isinstance(content, str):
+            content = content.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
+        if len(content) > MAX_URL_BYTES:
+            return False, "too_large", ""
+        encoding = getattr(response, "encoding", None) or getattr(response, "apparent_encoding", None) or "utf-8"
+        return True, "", content.decode(encoding, errors="replace")
+
+    return True, "", str(getattr(response, "text", "") or "")
+
+
+def _extract_readable_text(raw_text: str, content_type: str) -> tuple[str, str]:
+    raw_text = str(raw_text or "")
+    if content_type in {"text/html", "application/xhtml+xml"} or "<html" in raw_text[:1000].lower():
+        parser = _ReadableHtmlParser()
+        parser.feed(raw_text)
+        title = _collapse_spaces(" ".join(parser.title_parts))
+        body = _collapse_spaces(" ".join(parser.text_parts))
+        return title, body
+    body = _collapse_spaces(raw_text)
+    title = ""
+    return title, body
+
+
+def _fetch_response(url: str):
+    current_url = url
+    for _redirect_index in range(MAX_REDIRECTS + 1):
+        valid, status, message = _validate_url(current_url)
+        if not valid:
+            return None, current_url, status, message
+
+        try:
+            response = try_proxied_get(
+                current_url,
+                proxies=config.proxies,
+                timeout=config.request_timeout,
+                headers={
+                    "User-Agent": "ATRI-url-fetch/1.0",
+                    "Accept": "text/html,text/plain,application/json;q=0.8,*/*;q=0.2",
+                },
+                allow_redirects=False,
+                stream=True,
+            )
+        except Exception:
+            logger.debug("URL fetch request failed: %s", current_url)
+            return None, current_url, "request_error", "网页读取失败，可能是网络或站点暂时不可用。"
+
+        if getattr(response, "status_code", 200) in REDIRECT_STATUS_CODES:
+            response_headers = getattr(response, "headers", {})
+            location = response_headers.get("Location") if isinstance(response_headers, Mapping) else None
+            if not location:
+                return None, current_url, "redirect_error", "网页重定向缺少目标地址。"
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            current_url = urljoin(current_url, str(location))
+            continue
+
+        try:
+            response.raise_for_status()
+        except Exception:
+            return None, current_url, "http_error", "网页返回了错误状态码。"
+
+        return response, str(getattr(response, "url", "") or current_url), "", ""
+
+    return None, current_url, "too_many_redirects", "网页重定向次数过多。"
+
+
+def fetch_url(text: str) -> UrlFetchResult:
+    url = extract_first_url(text)
+    if not url:
+        return UrlFetchResult(
+            ok=False,
+            status="empty_url",
+            text=_format_failure("empty_url", "", "没有找到可读取的 URL。"),
+        )
+
+    response, final_url, status, message = _fetch_response(url)
+    if response is None:
+        return UrlFetchResult(ok=False, status=status, text=_format_failure(status, final_url or url, message))
+
+    response_headers = getattr(response, "headers", {})
+    headers = response_headers if isinstance(response_headers, Mapping) else {}
+    content_type = _content_type(headers)
+    if content_type and content_type not in ALLOWED_CONTENT_TYPES and not content_type.startswith("text/"):
+        return UrlFetchResult(
+            ok=False,
+            status="unsupported_content_type",
+            text=_format_failure("unsupported_content_type", final_url, "这个链接不是可直接阅读的文本网页。"),
+        )
+    if _content_length(headers) > MAX_URL_BYTES:
+        return UrlFetchResult(
+            ok=False,
+            status="too_large",
+            text=_format_failure("too_large", final_url, "网页内容太大，已停止读取。"),
+        )
+
+    readable, read_status, raw_text = _read_limited_text(response)
+    if not readable:
+        return UrlFetchResult(
+            ok=False,
+            status=read_status,
+            text=_format_failure(read_status, final_url, "网页内容太大，已停止读取。"),
+        )
+
+    title, body = _extract_readable_text(raw_text, content_type)
+    if not body:
+        return UrlFetchResult(
+            ok=False,
+            status="no_text",
+            text=_format_failure("no_text", final_url, "没有提取到可阅读的正文。"),
+        )
+
+    return UrlFetchResult(
+        ok=True,
+        status="success",
+        text=_format_success(final_url, title, body, content_type),
+    )
+
+
+def url_fetch(text: str) -> str:
+    return fetch_url(text).text
