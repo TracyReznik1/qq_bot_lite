@@ -121,16 +121,7 @@ def _is_unsafe_ip(ip_text: str) -> bool:
         ip = ipaddress.ip_address(ip_text)
     except ValueError:
         return True
-    return any(
-        (
-            ip.is_private,
-            ip.is_loopback,
-            ip.is_link_local,
-            ip.is_multicast,
-            ip.is_reserved,
-            ip.is_unspecified,
-        )
-    )
+    return not ip.is_global or ip.is_multicast
 
 
 def _validate_url(url: str) -> tuple[bool, str, str]:

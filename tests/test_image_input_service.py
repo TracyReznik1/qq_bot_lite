@@ -1,4 +1,5 @@
 import importlib
+import socket
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -8,11 +9,21 @@ import src.util as util
 
 
 class FakeResponse:
-    def __init__(self, chunks, content_type="image/png", content_length=""):
+    def __init__(
+        self,
+        chunks,
+        content_type="image/png",
+        content_length="",
+        status_code=200,
+        location="",
+    ):
         self._chunks = chunks
         self.headers = {"Content-Type": content_type}
         if content_length:
             self.headers["Content-Length"] = content_length
+        if location:
+            self.headers["Location"] = location
+        self.status_code = status_code
         self.closed = False
 
     def raise_for_status(self):
@@ -26,11 +37,32 @@ class FakeResponse:
 
 
 class ImageInputServiceTests(unittest.TestCase):
+    def setUp(self):
+        public_dns = mock.patch(
+            "src.services.url_fetch_service.socket.getaddrinfo",
+            return_value=self.dns_result("93.184.216.34"),
+        )
+        public_dns.start()
+        self.addCleanup(public_dns.stop)
+
     def service(self):
         try:
             return importlib.import_module("src.services.image_input_service")
         except ModuleNotFoundError as error:
             self.fail(f"image input service is missing: {error}")
+
+    @staticmethod
+    def dns_result(ip_address, port=443):
+        family = socket.AF_INET6 if ":" in ip_address else socket.AF_INET
+        return [
+            (
+                family,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (ip_address, port),
+            )
+        ]
 
     def test_parses_structured_image_and_removes_cq_image_from_text(self):
         service = self.service()
@@ -66,6 +98,56 @@ class ImageInputServiceTests(unittest.TestCase):
             self.fail(f"expected CQ URL fallback, got: {error}")
         self.assertEqual("", parsed.text)
         self.assertEqual(("https://img.example/a.png",), parsed.image_urls)
+
+    def test_fills_each_missing_structured_url_from_matching_cq_position(self):
+        service = self.service()
+        event = {
+            "message": [
+                {"type": "image", "data": {"url": "https://img.example/a.png"}},
+                {"type": "image", "data": {"file": "b.png"}},
+            ]
+        }
+
+        parsed = service.parse_image_message(
+            event,
+            "[CQ:image,file=a.png,url=https://img.example/a.png]"
+            "[CQ:image,file=b.png,url=https://img.example/b.png]",
+        )
+
+        self.assertEqual(
+            ("https://img.example/a.png", "https://img.example/b.png"),
+            parsed.image_urls,
+        )
+
+    def test_five_structured_segments_cannot_be_hidden_by_one_cq_segment(self):
+        service = self.service()
+        event = {
+            "message": [
+                {"type": "image", "data": {"file": f"{index}.png"}}
+                for index in range(5)
+            ]
+        }
+
+        with self.assertRaisesRegex(service.ImageInputError, "最多发送 4 张图片"):
+            service.parse_image_message(
+                event,
+                "[CQ:image,file=0.png,url=https://img.example/0.png]",
+            )
+
+    def test_unresolved_logical_image_slot_is_rejected_instead_of_silently_dropped(self):
+        service = self.service()
+        event = {
+            "message": [
+                {"type": "image", "data": {"url": "https://img.example/a.png"}},
+                {"type": "image", "data": {"file": "b.png"}},
+            ]
+        }
+
+        with self.assertRaisesRegex(service.ImageInputError, "没有取得可读取的图片地址"):
+            service.parse_image_message(
+                event,
+                "[CQ:image,file=a.png,url=https://img.example/a.png]",
+            )
 
     def test_cq_fallback_counts_duplicate_segments_before_deduplication(self):
         service = self.service()
@@ -149,6 +231,132 @@ class ImageInputServiceTests(unittest.TestCase):
             loaded = service.load_chat_images(["https://img.example/a.png"])
         self.assertEqual(["data:image/png;base64,cG5nLWJ5dGVz"], loaded)
         self.assertTrue(response.closed)
+
+    def test_rejects_non_public_ipv4_and_ipv6_targets_before_downloading(self):
+        service = self.service()
+        unsafe_targets = (
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.0.0.8", "10.0.0.8"),
+            ("100.64.0.1", "100.64.0.1"),
+            ("169.254.1.1", "169.254.1.1"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("224.0.0.1", "224.0.0.1"),
+            ("192.0.2.1", "192.0.2.1"),
+            ("[::1]", "::1"),
+            ("[fc00::1]", "fc00::1"),
+            ("[fe80::1]", "fe80::1"),
+        )
+
+        for url_host, resolved_ip in unsafe_targets:
+            with self.subTest(url_host=url_host):
+                with (
+                    mock.patch(
+                        "src.services.url_fetch_service.socket.getaddrinfo",
+                        return_value=self.dns_result(resolved_ip),
+                    ),
+                    mock.patch.object(service, "try_proxied_get") as download,
+                    self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+                ):
+                    service.load_chat_images([f"http://{url_host}/a.png"])
+                download.assert_not_called()
+
+    def test_rejects_hostname_when_dns_resolves_to_private_address(self):
+        service = self.service()
+        with (
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("192.168.1.10"),
+            ),
+            mock.patch.object(service, "try_proxied_get") as download,
+            self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+        ):
+            service.load_chat_images(["https://images.example/a.png"])
+        download.assert_not_called()
+
+    def test_rejects_hostname_when_any_dns_result_is_not_public(self):
+        service = self.service()
+        mixed_results = self.dns_result("93.184.216.34") + self.dns_result(
+            "192.168.1.10"
+        )
+        with (
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=mixed_results,
+            ),
+            mock.patch.object(service, "try_proxied_get") as download,
+            self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+        ):
+            service.load_chat_images(["https://images.example/a.png"])
+        download.assert_not_called()
+
+    def test_rejects_public_redirect_to_private_target_and_closes_redirect(self):
+        service = self.service()
+        redirect = FakeResponse(
+            [], status_code=302, location="http://127.0.0.1/private.png"
+        )
+
+        def resolve(hostname, port, **_kwargs):
+            if hostname == "public.example":
+                return self.dns_result("93.184.216.34", port)
+            return self.dns_result("127.0.0.1", port)
+
+        with (
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                side_effect=resolve,
+            ),
+            mock.patch.object(
+                service, "try_proxied_get", return_value=redirect
+            ) as download,
+            self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+        ):
+            service.load_chat_images(["https://public.example/a.png"])
+
+        self.assertEqual(1, download.call_count)
+        self.assertFalse(download.call_args.kwargs["allow_redirects"])
+        self.assertTrue(redirect.closed)
+
+    def test_follows_public_redirect_explicitly_and_closes_every_response(self):
+        service = self.service()
+        redirect = FakeResponse(
+            [], status_code=302, location="/final.png"
+        )
+        final = FakeResponse([b"png-bytes"])
+        with (
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("93.184.216.34"),
+            ),
+            mock.patch.object(
+                service, "try_proxied_get", side_effect=[redirect, final]
+            ) as download,
+        ):
+            loaded = service.load_chat_images(["https://public.example/a.png"])
+
+        self.assertEqual(["data:image/png;base64,cG5nLWJ5dGVz"], loaded)
+        self.assertEqual(2, download.call_count)
+        self.assertTrue(
+            all(not call.kwargs["allow_redirects"] for call in download.call_args_list)
+        )
+        self.assertTrue(redirect.closed)
+        self.assertTrue(final.closed)
+
+    def test_rejects_too_many_redirects_and_closes_every_intermediate_response(self):
+        service = self.service()
+        redirects = [
+            FakeResponse([], status_code=302, location=f"/{index + 1}.png")
+            for index in range(service.MAX_REDIRECTS + 1)
+        ]
+        with (
+            mock.patch.object(
+                service, "try_proxied_get", side_effect=redirects
+            ) as download,
+            self.assertRaisesRegex(service.ImageInputError, "重定向次数过多"),
+        ):
+            service.load_chat_images(["https://public.example/0.png"])
+
+        self.assertEqual(service.MAX_REDIRECTS + 1, download.call_count)
+        self.assertTrue(all(response.closed for response in redirects))
 
     def test_rejects_non_http_image_url_without_downloading(self):
         service = self.service()

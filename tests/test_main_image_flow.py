@@ -1,8 +1,14 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import src.chat.chat_service as chat_service
 import src.main as main
 from src.commands import CommandResult
+from src.services.llm_types import ChatResponse
 
 
 IMAGE_URL = "https://img.example/a.png?token=temporary-secret"
@@ -204,6 +210,49 @@ class MainImageFlowTests(unittest.TestCase):
         self.assertNotIn(IMAGE_URL, logged)
         self.assertNotIn("base64", logged)
         self.assertIn("[图片]", logged)
+
+    def test_real_history_file_omits_image_data_and_temporary_url(self):
+        event = private_event(
+            f"帮我看看 [CQ:image,file=a.png,url={IMAGE_URL}]",
+            [
+                {"type": "text", "data": {"text": "帮我看看 "}},
+                {"type": "image", "data": {"url": IMAGE_URL}},
+            ],
+            message_id=210,
+        )
+        session_key = "private:1"
+        chat_service.chat_history.pop(session_key, None)
+        self.addCleanup(chat_service.chat_history.pop, session_key, None)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL]),
+                mock.patch.object(chat_service, "HISTORY_DIR", Path(temp_dir)),
+                mock.patch.object(
+                    chat_service,
+                    "config",
+                    SimpleNamespace(persist_history=True, history_turns=8),
+                ),
+                mock.patch.object(
+                    chat_service.llm,
+                    "chat",
+                    return_value=ChatResponse(content="看到了"),
+                ),
+                mock.patch.object(main.onebot, "send_msg"),
+                mock.patch.object(main.time, "sleep"),
+            ):
+                main.process_message(event)
+
+            history_files = list(Path(temp_dir).glob("*.json"))
+            self.assertEqual(1, len(history_files))
+            raw_history = history_files[0].read_text(encoding="utf-8")
+            persisted = json.loads(raw_history)
+
+        self.assertEqual("[图片]\n帮我看看", persisted["messages"][0]["content"])
+        self.assertNotIn("data:image", raw_history)
+        self.assertNotIn("base64", raw_history)
+        self.assertNotIn(IMAGE_URL, raw_history)
+        self.assertNotIn("temporary-secret", raw_history)
 
 
 if __name__ == "__main__":

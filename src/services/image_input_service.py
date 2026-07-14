@@ -1,11 +1,17 @@
 import base64
 import html
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 from src.config import config
+from src.services.url_fetch_service import (
+    MAX_REDIRECTS,
+    REDIRECT_STATUS_CODES,
+    _validate_url,
+)
 from src.util import try_proxied_get
 
 
@@ -25,47 +31,50 @@ class ParsedImageMessage:
     image_urls: tuple[str, ...]
 
 
-def _structured_image_urls(data: dict[str, Any]) -> tuple[int, list[str]]:
+def _structured_image_urls(data: dict[str, Any]) -> list[str]:
     message = data.get("message")
     if not isinstance(message, list):
-        return 0, []
-    image_count = 0
+        return []
     urls = []
     for segment in message:
         if not isinstance(segment, dict) or segment.get("type") != "image":
             continue
-        image_count += 1
         segment_data = segment.get("data")
-        if isinstance(segment_data, dict):
-            url = str(segment_data.get("url") or "").strip()
-            if url:
-                urls.append(url)
-    return image_count, urls
+        url = (
+            str(segment_data.get("url") or "").strip()
+            if isinstance(segment_data, dict)
+            else ""
+        )
+        urls.append(url)
+    return urls
 
 
-def _cq_image_urls(raw_text: str) -> tuple[int, list[str]]:
+def _cq_image_urls(raw_text: str) -> list[str]:
     matches = CQ_IMAGE_PATTERN.findall(str(raw_text or ""))
     urls = []
     for attributes in matches:
         match = re.search(r"(?:^|,)url=([^,]+)", attributes, flags=re.IGNORECASE)
-        if match:
-            urls.append(html.unescape(match.group(1).strip()))
-    return len(matches), urls
+        url = html.unescape(match.group(1).strip()) if match else ""
+        urls.append(url)
+    return urls
 
 
 def parse_image_message(data: dict[str, Any], raw_text: str) -> ParsedImageMessage:
-    structured_count, structured_urls = _structured_image_urls(data)
-    cq_count, cq_urls = _cq_image_urls(raw_text)
-    image_count, urls = (
-        (structured_count, structured_urls)
-        if structured_urls
-        else (cq_count, cq_urls)
-    )
+    structured_urls = _structured_image_urls(data)
+    cq_urls = _cq_image_urls(raw_text)
+    image_count = max(len(structured_urls), len(cq_urls))
 
     if image_count > MAX_CHAT_IMAGES:
         raise ImageInputError(f"每条消息最多发送 {MAX_CHAT_IMAGES} 张图片。")
-    if image_count and not urls:
-        raise ImageInputError("没有取得可读取的图片地址，请重新发送图片。")
+
+    urls = []
+    for index in range(image_count):
+        structured_url = structured_urls[index] if index < len(structured_urls) else ""
+        cq_url = cq_urls[index] if index < len(cq_urls) else ""
+        url = structured_url or cq_url
+        if not url:
+            raise ImageInputError("没有取得可读取的图片地址，请重新发送图片。")
+        urls.append(url)
 
     urls = list(dict.fromkeys(urls))
     text = CQ_IMAGE_PATTERN.sub("", str(raw_text or "")).strip()
@@ -76,19 +85,45 @@ def _content_type(response) -> str:
     return str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
 
 
+def _close_response(response) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()
+
+
+def _fetch_image_response(url: str):
+    current_url = url
+    for _redirect_index in range(MAX_REDIRECTS + 1):
+        valid, _status, _message = _validate_url(current_url)
+        if not valid:
+            raise ImageInputError("图片地址无效，只支持公网 http/https 图片。")
+
+        response = try_proxied_get(
+            current_url,
+            proxies=config.proxies,
+            timeout=config.request_timeout,
+            stream=True,
+            allow_redirects=False,
+            hide_url_in_logs=True,
+        )
+        if getattr(response, "status_code", 200) not in REDIRECT_STATUS_CODES:
+            return response
+
+        headers = getattr(response, "headers", {})
+        location = headers.get("Location") if isinstance(headers, Mapping) else None
+        _close_response(response)
+        if not location:
+            raise ImageInputError("图片重定向缺少目标地址，请重新发送。")
+        current_url = urljoin(current_url, str(location))
+
+    raise ImageInputError("图片重定向次数过多，请重新发送。")
+
+
 def load_chat_images(image_urls: list[str] | tuple[str, ...]) -> list[str]:
     loaded = []
     for url in image_urls:
-        if urlparse(url).scheme.lower() not in {"http", "https"}:
-            raise ImageInputError("图片地址无效，只支持 http/https 图片。")
         try:
-            response = try_proxied_get(
-                url,
-                proxies=config.proxies,
-                timeout=config.request_timeout,
-                stream=True,
-                hide_url_in_logs=True,
-            )
+            response = _fetch_image_response(url)
             try:
                 response.raise_for_status()
                 mime_type = _content_type(response)
@@ -110,7 +145,7 @@ def load_chat_images(image_urls: list[str] | tuple[str, ...]) -> list[str]:
                 encoded = base64.b64encode(bytes(content)).decode("ascii")
                 loaded.append(f"data:{mime_type};base64,{encoded}")
             finally:
-                response.close()
+                _close_response(response)
         except ImageInputError:
             raise
         except Exception as error:
