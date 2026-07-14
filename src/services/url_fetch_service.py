@@ -92,10 +92,6 @@ def extract_first_url(text: str) -> str:
     return match.group(0).rstrip(TRAILING_URL_PUNCTUATION)
 
 
-def has_url(text: str) -> bool:
-    return bool(extract_first_url(text))
-
-
 def _format_failure(status: str, url: str, message: str) -> str:
     return (
         f"获取状态：{status}\n"
@@ -319,7 +315,3 @@ def fetch_url(text: str) -> UrlFetchResult:
         status="success",
         text=_format_success(final_url, title, body, content_type),
     )
-
-
-def url_fetch(text: str) -> str:
-    return fetch_url(text).text
