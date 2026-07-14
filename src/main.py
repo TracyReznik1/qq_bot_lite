@@ -8,7 +8,7 @@ from flask import Flask, request
 from src.chat.chat_service import generate_reply
 from src.chat.memory import migrate_legacy_memory_files
 from src.commands import CommandContext, handle_command
-from src.config import config
+from src.config import BASE_DIR, config
 from src.messaging import (
     MessageQueue,
     enqueue_message,
@@ -23,6 +23,7 @@ from src.services.image_input_service import (
 )
 from src.services.llm_client import ImageRecognitionUnavailable
 from src.services.onebot_client import OneBotClient
+from src.utils.data_migration import LEGACY_DATA_DIR_NAME, migrate_legacy_data
 
 
 app = Flask(__name__)
@@ -53,6 +54,14 @@ def startup() -> None:
     if _startup_initialized:
         return
 
+    default_data_dir = (BASE_DIR / "qqbot_data").resolve()
+    if config.data_dir.resolve() == default_data_dir:
+        migrate_legacy_data(
+            BASE_DIR / LEGACY_DATA_DIR_NAME,
+            config.data_dir,
+            config.history_turns,
+            config.memory_limit,
+        )
     migrate_legacy_memory_files()
     _startup_initialized = True
 
@@ -250,6 +259,7 @@ def onebot_event() -> dict[str, str] | tuple[dict[str, str], int]:
         logger.warning("Rejected unauthorized OneBot callback")
         return {"status": "forbidden"}, 403
 
+    startup()
     data = request.get_json(silent=True) or {}
     if data.get("post_type") == "message":
         seen = mark_message_seen(data, message_queue)

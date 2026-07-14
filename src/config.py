@@ -11,6 +11,7 @@ load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_BOT_NAME = "qqbot"
 DEFAULT_BOT_PERSONA = "你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
+DEFAULT_DATA_DIR_NAME = "qqbot_data"
 
 
 def env_text(name: str, default: str) -> str:
@@ -99,7 +100,12 @@ class Config:
     port: int = env_int("BOT_PORT", 5000)
     require_group_at: bool = env_bool("REQUIRE_GROUP_AT", True)
     admin_qq_ids: frozenset[str] = env_csv_set("ADMIN_QQ_IDS")
-    data_dir: Path = resolve_path(os.getenv("DATA_DIR", ""), "atri_data")
+    data_dir: Path = field(
+        default_factory=lambda: resolve_path(
+            os.getenv("DATA_DIR", ""),
+            DEFAULT_DATA_DIR_NAME,
+        )
+    )
     search_max_results: int = env_int("SEARCH_MAX_RESULTS", 4)
     history_turns: int = env_int("HISTORY_TURNS", 8)
     memory_limit: int = env_int("MEMORY_LIMIT", 30)

@@ -8,6 +8,11 @@ __pycache__/
 data_tmp/
 ddy_data/
 atri_data/
+qqbot_data/
+atri_data.backup-*/
+.qqbot_data.migrating-*/
+.qqbot_data.rollback-*/
+.qqbot_data.failed-*/
 _google_backup_tmp*/
 gemini*/
 CLAUDE_*.md
