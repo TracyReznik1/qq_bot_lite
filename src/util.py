@@ -25,7 +25,11 @@ def try_proxied_get(
     if proxies:
         try:
             resp = requests.get(url, proxies=proxies, timeout=timeout, **kwargs)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError:
+                resp.close()
+                raise
             return resp
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             request_label = "[hidden URL]" if hide_url_in_logs else url
