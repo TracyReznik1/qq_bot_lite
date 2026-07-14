@@ -25,46 +25,49 @@ class ParsedImageMessage:
     image_urls: tuple[str, ...]
 
 
-def _structured_image_urls(data: dict[str, Any]) -> tuple[bool, list[str]]:
+def _structured_image_urls(data: dict[str, Any]) -> tuple[int, list[str]]:
     message = data.get("message")
     if not isinstance(message, list):
-        return False, []
-    saw_image = False
+        return 0, []
+    image_count = 0
     urls = []
     for segment in message:
         if not isinstance(segment, dict) or segment.get("type") != "image":
             continue
-        saw_image = True
+        image_count += 1
         segment_data = segment.get("data")
         if isinstance(segment_data, dict):
             url = str(segment_data.get("url") or "").strip()
             if url:
                 urls.append(url)
-    return saw_image, urls
+    return image_count, urls
 
 
-def _cq_image_urls(raw_text: str) -> tuple[bool, list[str]]:
+def _cq_image_urls(raw_text: str) -> tuple[int, list[str]]:
     matches = CQ_IMAGE_PATTERN.findall(str(raw_text or ""))
     urls = []
     for attributes in matches:
         match = re.search(r"(?:^|,)url=([^,]+)", attributes, flags=re.IGNORECASE)
         if match:
             urls.append(html.unescape(match.group(1).strip()))
-    return bool(matches), urls
+    return len(matches), urls
 
 
 def parse_image_message(data: dict[str, Any], raw_text: str) -> ParsedImageMessage:
-    structured_saw_image, structured_urls = _structured_image_urls(data)
-    cq_saw_image, cq_urls = _cq_image_urls(raw_text)
-    saw_image = structured_saw_image or cq_saw_image
-    urls = structured_urls or cq_urls
-    urls = list(dict.fromkeys(urls))
+    structured_count, structured_urls = _structured_image_urls(data)
+    cq_count, cq_urls = _cq_image_urls(raw_text)
+    image_count, urls = (
+        (structured_count, structured_urls)
+        if structured_count
+        else (cq_count, cq_urls)
+    )
 
-    if saw_image and not urls:
-        raise ImageInputError("没有取得可读取的图片地址，请重新发送图片。")
-    if len(urls) > MAX_CHAT_IMAGES:
+    if image_count > MAX_CHAT_IMAGES:
         raise ImageInputError(f"每条消息最多发送 {MAX_CHAT_IMAGES} 张图片。")
+    if image_count and not urls:
+        raise ImageInputError("没有取得可读取的图片地址，请重新发送图片。")
 
+    urls = list(dict.fromkeys(urls))
     text = CQ_IMAGE_PATTERN.sub("", str(raw_text or "")).strip()
     return ParsedImageMessage(text=text, image_urls=tuple(urls))
 
