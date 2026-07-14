@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -7,6 +7,14 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
+
+
+DEFAULT_BOT_NAME = "qqbot"
+DEFAULT_BOT_PERSONA = "你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
+
+
+def env_text(name: str, default: str) -> str:
+    return os.getenv(name, "").strip() or default
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -45,10 +53,11 @@ def resolve_path(value: str, default: str) -> Path:
 
 @dataclass(frozen=True)
 class Config:
-    bot_name: str = os.getenv("BOT_NAME", "ATRI")
-    bot_persona: str = os.getenv(
-        "BOT_PERSONA",
-        "你是 ATRI，一个 QQ 聊天机器人。说话自然、可爱、有一点吐槽感，但要友好、简洁、靠谱。",
+    bot_name: str = field(
+        default_factory=lambda: env_text("BOT_NAME", DEFAULT_BOT_NAME)
+    )
+    bot_persona: str = field(
+        default_factory=lambda: env_text("BOT_PERSONA", DEFAULT_BOT_PERSONA)
     )
     # ── Gemini / Google AI Studio ──
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
