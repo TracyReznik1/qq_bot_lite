@@ -21,6 +21,7 @@ from src.services.image_input_service import (
     load_chat_images,
     parse_image_message,
 )
+from src.services.llm_client import ImageRecognitionUnavailable
 from src.services.onebot_client import OneBotClient
 
 
@@ -212,6 +213,9 @@ def process_message(data: dict[str, Any]) -> None:
         logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
         send_reply(target_id, reply, is_group)
     except ImageInputError as error:
+        send_reply(target_id, str(error), is_group)
+    except ImageRecognitionUnavailable as error:
+        logger.info("Image recognition unavailable session_key=%s", session_key)
         send_reply(target_id, str(error), is_group)
     except RuntimeError as error:
         logger.exception("Configuration error")

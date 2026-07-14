@@ -47,6 +47,23 @@ def _model_supports_tools(provider: str, model_name: str) -> bool:
 _FALLBACK_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
+class ImageRecognitionUnavailable(RuntimeError):
+    """Raised after every configured model fails a request with images."""
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in content
+        ):
+            return True
+    return False
+
+
 def _is_retryable_error(exc: BaseException) -> bool:
     """Return True when *exc* signals a transient failure worth retrying."""
     if isinstance(exc, requests.HTTPError):
@@ -83,6 +100,7 @@ class FallbackLLMClient:
         tool_choice: str | dict[str, Any] | None = None,
     ) -> ChatResponse:
         has_tools = bool(tools)
+        has_images = _messages_have_images(messages)
 
         for spec in self._chain:
             if has_tools and not spec.supports_tools:
@@ -143,9 +161,9 @@ class FallbackLLMClient:
                 continue
 
         # All models exhausted
-        raise RuntimeError(
-            "所有模型暂时不可用，请稍后再试。"
-        )
+        if has_images:
+            raise ImageRecognitionUnavailable("当前模型无法识别该图片。")
+        raise RuntimeError("所有模型暂时不可用，请稍后再试。")
 
     # ── helpers ─────────────────────────────────────────────────────
 
