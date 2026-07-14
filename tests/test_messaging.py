@@ -1,12 +1,21 @@
 import logging
+import os
 import unittest
 from threading import Event, Lock
+from unittest import mock
 from unittest.mock import patch
 
+from src.config import Config
 from src.messaging import MessageQueue, get_event_session_key
 
 
 WAIT_TIMEOUT = 2
+
+
+def config_with(value: str | None) -> Config:
+    environment = {} if value is None else {"MESSAGE_WORKERS": value}
+    with mock.patch.dict(os.environ, environment, clear=True):
+        return Config()
 
 
 def private_message(user_id: int, raw_message: str) -> dict:
@@ -15,6 +24,21 @@ def private_message(user_id: int, raw_message: str) -> dict:
         "user_id": user_id,
         "raw_message": raw_message,
     }
+
+
+class MessageWorkerConfigurationTests(unittest.TestCase):
+    def test_defaults_to_eight_when_environment_variable_is_missing(self):
+        self.assertEqual(8, config_with(None).message_workers)
+
+    def test_uses_positive_environment_value(self):
+        self.assertEqual(16, config_with("16").message_workers)
+
+    def test_normalizes_non_positive_values_to_one(self):
+        self.assertEqual(1, config_with("0").message_workers)
+        self.assertEqual(1, config_with("-3").message_workers)
+
+    def test_falls_back_to_eight_for_invalid_value(self):
+        self.assertEqual(8, config_with("many").message_workers)
 
 
 class MessageQueueConcurrencyTests(unittest.TestCase):
