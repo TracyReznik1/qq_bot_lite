@@ -1,6 +1,10 @@
 import importlib
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import requests
+import src.util as util
 
 
 class FakeResponse:
@@ -196,6 +200,37 @@ class ImageInputServiceTests(unittest.TestCase):
             self.assertRaisesRegex(service.ImageInputError, "图片读取失败"),
         ):
             service.load_chat_images(["https://img.example/a.png"])
+
+    def test_proxy_fallback_hides_temporary_image_url_from_debug_logs(self):
+        service = self.service()
+        image_url = "https://img.example/private/a.png?token=temporary-secret"
+        response = FakeResponse([b"png-bytes"])
+        proxy_error = requests.exceptions.ConnectionError("proxy unavailable")
+
+        with (
+            mock.patch.object(
+                service,
+                "config",
+                SimpleNamespace(
+                    proxies={"https": "http://proxy.example:8080"},
+                    request_timeout=3,
+                ),
+            ),
+            mock.patch.object(
+                util.requests, "get", side_effect=[proxy_error, response]
+            ) as request_get,
+            mock.patch.object(util.logger, "debug") as debug_log,
+        ):
+            loaded = service.load_chat_images([image_url])
+
+        self.assertEqual(["data:image/png;base64,cG5nLWJ5dGVz"], loaded)
+        self.assertEqual(2, request_get.call_count)
+        self.assertNotIn("proxies", request_get.call_args_list[1].kwargs)
+        logged = repr(debug_log.call_args_list)
+        self.assertNotIn(image_url, logged)
+        self.assertNotIn("temporary-secret", logged)
+        self.assertNotIn("base64", logged)
+        self.assertIn("[hidden URL]", logged)
 
 
 if __name__ == "__main__":

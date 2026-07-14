@@ -87,6 +87,7 @@ def load_chat_images(image_urls: list[str] | tuple[str, ...]) -> list[str]:
                 proxies=config.proxies,
                 timeout=config.request_timeout,
                 stream=True,
+                hide_url_in_logs=True,
             )
             try:
                 response.raise_for_status()
