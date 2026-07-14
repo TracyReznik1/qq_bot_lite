@@ -2,7 +2,6 @@ from typing import Any
 import logging
 
 import requests
-from pathlib import Path
 
 from src.config import Config
 
@@ -58,20 +57,3 @@ class OneBotClient:
                 is_group,
                 len(message),
             )
-
-    def send_image(self, target_id: Any, image_path: str, is_group: bool = False) -> None:
-        """Send an image via CQ image ``file://`` URI.
-
-        First edition uses ``[CQ:image,file=<uri>]``.  Some OneBot clients
-        (e.g. NapCat) may not support ``file://`` URIs — in that case a
-        base64 fallback should be added in a future iteration.
-        """
-        resolved = Path(image_path).resolve()
-        if not resolved.exists():
-            logger.warning(
-                "OneBot image send skipped: file not found path=%s", resolved
-            )
-            return
-        uri = resolved.as_uri()
-        message = f"[CQ:image,file={uri}]"
-        self.send_msg(target_id, message, is_group=is_group)
