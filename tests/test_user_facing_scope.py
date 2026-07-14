@@ -3,6 +3,10 @@ from pathlib import Path
 
 from src.chat.prompt import build_system_prompt
 from src.commands.help import help_text
+from src.config import config
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class UserFacingScopeTests(unittest.TestCase):
@@ -22,6 +26,14 @@ class UserFacingScopeTests(unittest.TestCase):
         self.assertIn("图片理解", readme)
         self.assertIn("/search <关键词>", readme)
         self.assertIn("不提供独立 URL 直读", readme)
+
+    def test_readme_and_help_do_not_present_atri_as_identity(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        help_message = help_text()
+
+        self.assertNotIn("ATRI", readme)
+        self.assertNotIn("ATRI", help_message)
+        self.assertIn(config.bot_name, help_message)
 
 
 if __name__ == "__main__":

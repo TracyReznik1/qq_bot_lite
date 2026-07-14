@@ -1,4 +1,4 @@
-# ATRI — qqbot_lite
+# qqbot — qqbot_lite
 
 一个运行在 QQ 里的轻量聊天机器人（OneBot + Flask），只保留聊天和网页搜索，不搞复杂 Agent。
 
@@ -41,7 +41,7 @@ copy .env.example .env
 
 # 3. 启动
 python run_bot.py
-# 或者双击 启动ATRI.bat
+# 或者双击 启动qqbot.bat
 ```
 
 ## 配置
@@ -49,6 +49,8 @@ python run_bot.py
 `.env` 就这几项：
 
 ```env
+BOT_NAME=qqbot
+BOT_PERSONA=你是一个自然、友好、简洁、可靠的 QQ 聊天助手。
 GEMINI_API_KEY=     # 推荐（免费，https://aistudio.google.com/apikey）
 DEEPSEEK_API_KEY=   # 备选
 TAVILY_API_KEY=     # 可选，搜索用（https://tavily.com）
@@ -66,13 +68,13 @@ ONEBOT_ACCESS_TOKEN=
 
 ## OneBot 设置
 
-ATRI 监听 `http://127.0.0.1:5000/`，向 `http://127.0.0.1:3000` 发消息。
+qqbot 监听 `http://127.0.0.1:5000/`，向 `http://127.0.0.1:3000` 发消息。
 
 在 OneBot 客户端里把 HTTP 事件上报地址设为 `http://127.0.0.1:5000/`。
 
 ## 群聊行为
 
-群聊默认需要 `@ATRI` 才响应，不想用的可以 `.env` 里设 `REQUIRE_GROUP_AT=false`。
+默认名称是 `qqbot`，群聊通常需要 `@qqbot` 才响应；可以通过 `BOT_NAME` 自定义名称，不想要求 @ 的可以在 `.env` 里设 `REQUIRE_GROUP_AT=false`。
 
 ## 模型 Fallback
 
@@ -92,7 +94,7 @@ src/chat/           聊天生成、system prompt、记忆
 src/commands/       命令实现（search/help/reset/remember）
 src/services/       LLM 客户端、OneBot、网页搜索
 src/utils/          JSON 存储、文件名清洗
-启动ATRI.bat        Windows 一键启动脚本
+启动qqbot.bat       Windows 一键启动脚本
 ```
 
-本地数据放在 `atri_data/`（不提交）。
+本地数据放在 `qqbot_data/`（不提交）。

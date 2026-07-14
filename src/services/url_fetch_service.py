@@ -16,6 +16,7 @@ logger = logging.getLogger("qq-bot")
 MAX_URL_BYTES = 512 * 1024
 MAX_URL_TEXT_CHARS = 6000
 MAX_REDIRECTS = 3
+URL_FETCH_USER_AGENT = "qqbot-url-fetch/1.0"
 URL_PATTERN = re.compile(r"https?://[^\s<>'\"\]]+", re.IGNORECASE)
 TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？)]}）】》"
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
@@ -225,7 +226,7 @@ def _fetch_response(url: str):
                 proxies=config.proxies,
                 timeout=config.request_timeout,
                 headers={
-                    "User-Agent": "ATRI-url-fetch/1.0",
+                    "User-Agent": URL_FETCH_USER_AGENT,
                     "Accept": "text/html,text/plain,application/json;q=0.8,*/*;q=0.2",
                 },
                 allow_redirects=False,

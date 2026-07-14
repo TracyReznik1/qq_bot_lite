@@ -31,6 +31,8 @@ app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("qq-bot")
+CALLBACK_SECRET_HEADER = "X-QQBOT-Callback-Secret"
+LEGACY_CALLBACK_SECRET_HEADER = "X-ATRI-Callback-Secret"
 
 MAX_PROCESSED_MESSAGE_IDS = 500
 _startup_initialized = False
@@ -253,10 +255,17 @@ def is_callback_authorized() -> bool:
         return True
 
     authorization = request.headers.get("Authorization", "").strip()
-    callback_secret = request.headers.get("X-ATRI-Callback-Secret", "").strip()
-    return hmac.compare_digest(authorization, f"Bearer {secret}") or hmac.compare_digest(
-        callback_secret, secret
-    )
+    callback_secret = request.headers.get(CALLBACK_SECRET_HEADER, "").strip()
+    legacy_secret = request.headers.get(LEGACY_CALLBACK_SECRET_HEADER, "").strip()
+    if hmac.compare_digest(authorization, f"Bearer {secret}") or hmac.compare_digest(
+        callback_secret,
+        secret,
+    ):
+        return True
+    if legacy_secret and hmac.compare_digest(legacy_secret, secret):
+        logger.warning("Legacy callback header accepted; update OneBot configuration")
+        return True
+    return False
 
 
 @app.route("/", methods=["POST"])
