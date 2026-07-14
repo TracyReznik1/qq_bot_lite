@@ -1,9 +1,9 @@
 import logging
 import unittest
 from threading import Event, Lock
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from src.messaging import MessageQueue, build_session_key
+from src.messaging import MessageQueue, get_event_session_key
 
 
 WAIT_TIMEOUT = 2
@@ -118,9 +118,9 @@ class MessageQueueConcurrencyTests(unittest.TestCase):
                 raise RuntimeError("first message failed")
             second_finished.set()
 
-        logger = Mock(spec=logging.Logger)
+        logger = logging.getLogger("qq-bot")
         try:
-            with patch("logging.getLogger", return_value=logger) as get_logger:
+            with patch.object(logger, "exception") as log_exception:
                 queue.enqueue(private_message(7, "1"), process)
                 self.assertTrue(first_started.wait(WAIT_TIMEOUT))
                 queue.enqueue(private_message(7, "2"), process)
@@ -131,8 +131,7 @@ class MessageQueueConcurrencyTests(unittest.TestCase):
                 with state_lock:
                     self.assertEqual([1, 2], order)
                 self.assertFalse(first_timed_out.is_set())
-                get_logger.assert_called_once_with("qq-bot")
-                logger.exception.assert_called_once_with(
+                log_exception.assert_called_once_with(
                     "Background message processing failed"
                 )
         finally:
@@ -140,16 +139,37 @@ class MessageQueueConcurrencyTests(unittest.TestCase):
             queue.executor.shutdown(wait=True)
 
     def test_session_keys_separate_private_group_user_and_group_scopes(self):
-        self.assertEqual("private:7", build_session_key("7", {}, False))
-        self.assertEqual(
-            "group:10:7", build_session_key("7", {"group_id": 10}, True)
+        private_event = private_message(7, "private")
+        group_event = {
+            "message_type": "group",
+            "user_id": 7,
+            "group_id": 10,
+            "raw_message": "group",
+        }
+        same_group_and_user_event = {
+            **group_event,
+            "raw_message": "another message",
+        }
+        same_user_other_group_event = {**group_event, "group_id": 11}
+        same_group_other_user_event = {**group_event, "user_id": 8}
+
+        private_key = get_event_session_key(private_event)
+        group_key = get_event_session_key(group_event)
+        same_group_and_user_key = get_event_session_key(same_group_and_user_event)
+        same_user_other_group_key = get_event_session_key(
+            same_user_other_group_event
+        )
+        same_group_other_user_key = get_event_session_key(
+            same_group_other_user_event
         )
 
-        same_user_other_group = build_session_key("7", {"group_id": 11}, True)
-        same_group_other_user = build_session_key("8", {"group_id": 10}, True)
-        self.assertNotEqual("group:10:7", same_user_other_group)
-        self.assertNotEqual("group:10:7", same_group_other_user)
-        self.assertNotEqual(same_user_other_group, same_group_other_user)
+        self.assertEqual("private:7", private_key)
+        self.assertEqual("group:10:7", group_key)
+        self.assertEqual(group_key, same_group_and_user_key)
+        self.assertNotEqual(group_key, same_user_other_group_key)
+        self.assertNotEqual(group_key, same_group_other_user_key)
+        self.assertNotEqual(private_key, group_key)
+        self.assertNotEqual(same_user_other_group_key, same_group_other_user_key)
 
 
 if __name__ == "__main__":
