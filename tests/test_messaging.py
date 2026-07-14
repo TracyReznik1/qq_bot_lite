@@ -5,6 +5,7 @@ from threading import Event, Lock
 from unittest import mock
 from unittest.mock import patch
 
+import src.main as main
 from src.config import Config
 from src.messaging import MessageQueue, get_event_session_key
 
@@ -39,6 +40,14 @@ class MessageWorkerConfigurationTests(unittest.TestCase):
 
     def test_falls_back_to_eight_for_invalid_value(self):
         self.assertEqual(8, config_with("many").message_workers)
+
+
+class MainMessageQueueConfigurationTests(unittest.TestCase):
+    def test_global_queue_uses_configured_worker_count(self):
+        self.assertEqual(
+            main.config.message_workers,
+            main.message_queue.executor._max_workers,
+        )
 
 
 class MessageQueueConcurrencyTests(unittest.TestCase):

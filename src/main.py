@@ -41,7 +41,7 @@ _startup_lock = Lock()
 onebot = OneBotClient(config)
 
 message_queue = MessageQueue(
-    max_workers=4,
+    max_workers=config.message_workers,
     max_processed_message_ids=MAX_PROCESSED_MESSAGE_IDS,
 )
 
