@@ -41,6 +41,29 @@ def group_event(raw_message, message, message_id=11):
 
 
 class MainImageFlowTests(unittest.TestCase):
+    def test_private_cq_file_image_is_resolved_only_for_chat_loading(self):
+        event = private_event(
+            "[CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+            "[CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+        )
+        with (
+            mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL]) as load,
+            mock.patch.object(main, "generate_reply", return_value="看到了") as generate,
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        load.assert_called_once_with(
+            ("",),
+            image_file_ids=("opaque-file-id",),
+            image_url_resolver=main.onebot.get_image_url,
+        )
+        generate.assert_called_once_with(
+            "private:1", "", image_data_urls=[IMAGE_DATA_URL]
+        )
+        send.assert_called_once_with("1", "看到了", is_group=False)
+
     def test_private_image_only_message_reaches_multimodal_chat(self):
         event = private_event(
             f"[CQ:image,file=a.png,url={IMAGE_URL}]",
@@ -54,7 +77,11 @@ class MainImageFlowTests(unittest.TestCase):
         ):
             main.process_message(event)
 
-        load.assert_called_once_with((IMAGE_URL,))
+        load.assert_called_once_with(
+            (IMAGE_URL,),
+            image_file_ids=("a.png",),
+            image_url_resolver=main.onebot.get_image_url,
+        )
         generate.assert_called_once_with(
             "private:1", "", image_data_urls=[IMAGE_DATA_URL]
         )
@@ -141,6 +168,27 @@ class MainImageFlowTests(unittest.TestCase):
         self.assertEqual("help", handle.call_args.args[0].command)
         self.assertEqual("/help", handle.call_args.args[1].raw_message)
         send.assert_called_once_with("1", "帮助", is_group=False)
+
+    def test_command_with_file_only_image_does_not_resolve_or_download(self):
+        event = private_event(
+            "/help [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+            "/help [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+        )
+        with (
+            mock.patch.object(main, "load_chat_images") as load,
+            mock.patch.object(main.onebot, "get_image_url") as resolve,
+            mock.patch.object(
+                main, "handle_command", return_value=CommandResult(True, "帮助")
+            ),
+            mock.patch.object(main, "generate_reply") as generate,
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        resolve.assert_not_called()
+        load.assert_not_called()
+        generate.assert_not_called()
 
     def test_parse_error_is_returned_to_user_without_chat_or_download(self):
         event = private_event(

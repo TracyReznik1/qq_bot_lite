@@ -18,6 +18,21 @@ class OneBotClient:
             headers["Authorization"] = f"Bearer {self.cfg.onebot_access_token}"
         return headers
 
+    def get_image_url(self, file_id: str) -> str:
+        response = requests.post(
+            f"{self.cfg.onebot_url}/get_image",
+            json={"file": file_id},
+            headers=self._headers(),
+            timeout=self.cfg.request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        url = str(data.get("url") or "").strip() if isinstance(data, dict) else ""
+        if payload.get("retcode") != 0 or not url:
+            raise RuntimeError("OneBot could not resolve the received image")
+        return url
+
     def send_msg(self, target_id: Any, message: str, is_group: bool = False) -> None:
         message = (message or "").strip()
         if not message:

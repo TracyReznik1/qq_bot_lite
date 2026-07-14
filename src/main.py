@@ -221,7 +221,11 @@ def process_message(data: dict[str, Any]) -> None:
             return
 
         logger.info("Generating chat reply session_key=%s is_group=%s", session_key, is_group)
-        image_data_urls = load_chat_images(parsed_message.image_urls)
+        image_data_urls = load_chat_images(
+            parsed_message.image_urls,
+            image_file_ids=parsed_message.image_file_ids,
+            image_url_resolver=onebot.get_image_url,
+        )
         reply = generate_reply(
             session_key,
             parsed_message.text,

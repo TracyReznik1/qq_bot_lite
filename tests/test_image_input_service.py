@@ -6,6 +6,7 @@ from unittest import mock
 
 import requests
 import src.util as util
+from src.services.onebot_client import OneBotClient
 
 
 class FakeResponse:
@@ -99,6 +100,16 @@ class ImageInputServiceTests(unittest.TestCase):
         self.assertEqual("", parsed.text)
         self.assertEqual(("https://img.example/a.png",), parsed.image_urls)
 
+    def test_preserves_onebot_file_id_when_cq_url_is_empty(self):
+        service = self.service()
+        parsed = service.parse_image_message(
+            {},
+            "[CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+        )
+
+        self.assertEqual(("",), parsed.image_urls)
+        self.assertEqual(("opaque-file-id",), parsed.image_file_ids)
+
     def test_fills_each_missing_structured_url_from_matching_cq_position(self):
         service = self.service()
         event = {
@@ -134,7 +145,7 @@ class ImageInputServiceTests(unittest.TestCase):
                 "[CQ:image,file=0.png,url=https://img.example/0.png]",
             )
 
-    def test_unresolved_logical_image_slot_is_rejected_instead_of_silently_dropped(self):
+    def test_preserves_file_id_for_each_logical_image_slot_without_a_url(self):
         service = self.service()
         event = {
             "message": [
@@ -143,11 +154,13 @@ class ImageInputServiceTests(unittest.TestCase):
             ]
         }
 
-        with self.assertRaisesRegex(service.ImageInputError, "没有取得可读取的图片地址"):
-            service.parse_image_message(
-                event,
-                "[CQ:image,file=a.png,url=https://img.example/a.png]",
-            )
+        parsed = service.parse_image_message(
+            event,
+            "[CQ:image,file=a.png,url=https://img.example/a.png]",
+        )
+
+        self.assertEqual(("https://img.example/a.png", ""), parsed.image_urls)
+        self.assertEqual(("a.png", "b.png"), parsed.image_file_ids)
 
     def test_cq_fallback_counts_duplicate_segments_before_deduplication(self):
         service = self.service()
@@ -218,11 +231,13 @@ class ImageInputServiceTests(unittest.TestCase):
         parsed = service.parse_image_message(event, "images")
         self.assertEqual(("https://img.example/a.png",), parsed.image_urls)
 
-    def test_rejects_image_segment_without_usable_url(self):
+    def test_preserves_structured_image_file_id_without_a_url(self):
         service = self.service()
         event = {"message": [{"type": "image", "data": {"file": "a.png"}}]}
-        with self.assertRaisesRegex(service.ImageInputError, "没有取得可读取的图片地址"):
-            service.parse_image_message(event, "[CQ:image,file=a.png]")
+        parsed = service.parse_image_message(event, "[CQ:image,file=a.png]")
+
+        self.assertEqual(("",), parsed.image_urls)
+        self.assertEqual(("a.png",), parsed.image_file_ids)
 
     def test_loads_valid_image_as_data_url_and_closes_response(self):
         service = self.service()
@@ -231,6 +246,162 @@ class ImageInputServiceTests(unittest.TestCase):
             loaded = service.load_chat_images(["https://img.example/a.png"])
         self.assertEqual(["data:image/png;base64,cG5nLWJ5dGVz"], loaded)
         self.assertTrue(response.closed)
+
+    def test_resolves_onebot_file_to_trusted_qq_cdn_through_proxy_fake_ip(self):
+        service = self.service()
+        response = FakeResponse([b"jpeg-bytes"], content_type="image/jpeg")
+        resolver = mock.Mock(
+            return_value="https://multimedia.nt.qq.com.cn/download?token=hidden"
+        )
+        with (
+            mock.patch.object(
+                service,
+                "config",
+                SimpleNamespace(
+                    proxies={"https": "http://proxy.example:8080"},
+                    request_timeout=3,
+                ),
+            ),
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("198.18.0.1"),
+            ),
+            mock.patch.object(service.requests, "get", return_value=response) as request_get,
+        ):
+            loaded = service.load_chat_images(
+                [""],
+                image_file_ids=["opaque-file-id"],
+                image_url_resolver=resolver,
+            )
+
+        self.assertEqual(["data:image/jpeg;base64,anBlZy1ieXRlcw=="], loaded)
+        resolver.assert_called_once_with("opaque-file-id")
+        self.assertEqual(1, request_get.call_count)
+        self.assertEqual(
+            {"https": "http://proxy.example:8080"},
+            request_get.call_args.kwargs["proxies"],
+        )
+        self.assertTrue(response.closed)
+
+    def test_trusted_onebot_fake_ip_proxy_failure_never_falls_back_direct(self):
+        service = self.service()
+        proxy_error = requests.exceptions.ConnectionError("proxy unavailable")
+        unexpected_direct_response = FakeResponse([b"must-not-be-read"])
+
+        with (
+            mock.patch.object(
+                service,
+                "config",
+                SimpleNamespace(
+                    proxies={"https": "http://proxy.example:8080"},
+                    request_timeout=3,
+                ),
+            ),
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("198.18.0.1"),
+            ),
+            mock.patch.object(
+                util.requests,
+                "get",
+                side_effect=[proxy_error, unexpected_direct_response],
+            ) as request_get,
+            self.assertRaisesRegex(service.ImageInputError, "图片读取失败"),
+        ):
+            service.load_chat_images(
+                [""],
+                image_file_ids=["opaque-file-id"],
+                image_url_resolver=lambda _file_id: (
+                    "https://multimedia.nt.qq.com.cn/download?token=hidden"
+                ),
+            )
+
+        self.assertEqual(1, request_get.call_count)
+        self.assertIn("proxies", request_get.call_args.kwargs)
+        self.assertFalse(unexpected_direct_response.closed)
+
+    def test_trusted_onebot_redirect_to_private_target_is_rejected(self):
+        service = self.service()
+        redirect = FakeResponse(
+            [], status_code=302, location="http://127.0.0.1/private.png"
+        )
+
+        with (
+            mock.patch.object(
+                service,
+                "config",
+                SimpleNamespace(
+                    proxies={"https": "http://proxy.example:8080"},
+                    request_timeout=3,
+                ),
+            ),
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("127.0.0.1"),
+            ),
+            mock.patch.object(util.requests, "get", return_value=redirect) as request_get,
+            self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+        ):
+            service.load_chat_images(
+                [""],
+                image_file_ids=["opaque-file-id"],
+                image_url_resolver=lambda _file_id: (
+                    "https://multimedia.nt.qq.com.cn/download?token=hidden"
+                ),
+            )
+
+        self.assertEqual(1, request_get.call_count)
+        self.assertTrue(redirect.closed)
+
+    def test_onebot_resolved_private_url_is_still_rejected(self):
+        service = self.service()
+        with (
+            mock.patch(
+                "src.services.url_fetch_service.socket.getaddrinfo",
+                return_value=self.dns_result("127.0.0.1"),
+            ),
+            mock.patch.object(service, "try_proxied_get") as download,
+            self.assertRaisesRegex(service.ImageInputError, "图片地址无效"),
+        ):
+            service.load_chat_images(
+                [""],
+                image_file_ids=["opaque-file-id"],
+                image_url_resolver=lambda _file_id: "http://127.0.0.1/private.png",
+            )
+        download.assert_not_called()
+
+    def test_onebot_client_resolves_received_image_file_to_url(self):
+        cfg = SimpleNamespace(
+            onebot_url="http://127.0.0.1:3000",
+            onebot_access_token="",
+            request_timeout=3,
+        )
+        response = SimpleNamespace(
+            raise_for_status=mock.Mock(),
+            json=mock.Mock(
+                return_value={
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "url": "https://multimedia.nt.qq.com.cn/download?token=hidden"
+                    },
+                }
+            ),
+        )
+        with mock.patch(
+            "src.services.onebot_client.requests.post", return_value=response
+        ) as post:
+            resolved = OneBotClient(cfg).get_image_url("opaque-file-id")
+
+        self.assertEqual(
+            "https://multimedia.nt.qq.com.cn/download?token=hidden", resolved
+        )
+        post.assert_called_once_with(
+            "http://127.0.0.1:3000/get_image",
+            json={"file": "opaque-file-id"},
+            headers={"Content-Type": "application/json"},
+            timeout=3,
+        )
 
     def test_rejects_non_public_ipv4_and_ipv6_targets_before_downloading(self):
         service = self.service()
