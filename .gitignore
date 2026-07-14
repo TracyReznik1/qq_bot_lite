@@ -4,6 +4,7 @@ __pycache__/
 .idea/
 .claude/
 .codex_tmp/
+.worktrees/
 data_tmp/
 ddy_data/
 atri_data/
