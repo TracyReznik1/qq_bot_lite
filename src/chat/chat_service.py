@@ -228,7 +228,35 @@ def _ensure_history_loaded(session_key: str) -> None:
             history.extend(loaded)
 
 
-def generate_reply(session_key: str, text: str, tool_context: str = "") -> str:
+def build_user_content(text: str, image_data_urls: list[str]):
+    text = str(text or "").strip()
+    if not image_data_urls:
+        return text
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": text or "请识别图片内容并回答。"}
+    ]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": image_data_url}}
+        for image_data_url in image_data_urls
+    )
+    return content
+
+
+def history_user_text(text: str, image_count: int) -> str:
+    parts = ["[图片]"] * max(image_count, 0)
+    text = str(text or "").strip()
+    if text:
+        parts.append(text)
+    return "\n".join(parts)
+
+
+def generate_reply(
+    session_key: str,
+    text: str,
+    tool_context: str = "",
+    image_data_urls: list[str] | None = None,
+) -> str:
+    images = list(image_data_urls or [])
     _ensure_history_loaded(session_key)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(session_key, tool_context)},
@@ -236,7 +264,7 @@ def generate_reply(session_key: str, text: str, tool_context: str = "") -> str:
     ]
     with chat_history_lock:
         messages.extend(chat_history.get(session_key, []).copy())
-    messages.append({"role": "user", "content": text})
+    messages.append({"role": "user", "content": build_user_content(text, images)})
 
     if tool_context.strip():
         reply = normalize_chat_response(llm.chat(messages, temperature=0.75)).content
@@ -263,7 +291,7 @@ def generate_reply(session_key: str, text: str, tool_context: str = "") -> str:
             if not tool_calls:
                 needs_final_summary = False
                 break
-            messages.extend(build_tool_messages(tool_calls, text))
+            messages.extend(build_tool_messages(tool_calls, text or "图片内容"))
             needs_final_summary = True
 
         if needs_final_summary:
@@ -272,5 +300,5 @@ def generate_reply(session_key: str, text: str, tool_context: str = "") -> str:
                 reply = TOOL_CALL_LIMIT_FALLBACK
 
     reply = re.sub(r"\[(?:SRCH|MEM|CHAT):?.*?\]", "", reply).strip()
-    append_history(session_key, text, reply)
+    append_history(session_key, history_user_text(text, len(images)), reply)
     return reply
