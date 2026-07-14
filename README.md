@@ -57,7 +57,10 @@ TAVILY_API_KEY=     # 可选，搜索用（https://tavily.com）
 ADMIN_QQ_IDS=       # 你的 QQ 号
 PROXY_URL=          # 代理地址，不用留空
 PERSIST_HISTORY=true
+MESSAGE_WORKERS=8      # 同时处理的活跃会话数
 ```
+
+默认可同时处理 8 个活跃会话。不同会话可以并行处理，同一会话仍按顺序处理和回复；可通过 `MESSAGE_WORKERS` 调整并发会话数，修改后需要重启。
 
 加上 OneBot 的连接配置（默认就够用）：
 

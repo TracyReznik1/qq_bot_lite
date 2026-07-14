@@ -54,6 +54,15 @@ class QqbotBrandingTests(unittest.TestCase):
         self.assertNotIn("启动ATRI", readme)
         self.assertNotIn("@ATRI", readme)
 
+    def test_operator_files_describe_concurrent_conversation_setting(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("MESSAGE_WORKERS=8", env_example)
+        self.assertIn("MESSAGE_WORKERS=8", readme)
+        self.assertIn("不同会话可以并行", readme)
+        self.assertIn("同一会话仍按顺序", readme)
+
     def test_runtime_atri_references_are_only_legacy_compatibility(self):
         matches = []
         for path in (ROOT / "src").rglob("*.py"):
