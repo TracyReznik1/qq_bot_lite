@@ -1,5 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +27,63 @@ class DataMigrationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def patch_replace_failure(self, predicate, calls=None):
+        original_replace = Path.replace
+
+        def failing_replace(path, destination):
+            destination = Path(destination)
+            if calls is not None:
+                calls.append((path, destination))
+            if predicate(path, destination):
+                raise OSError(f"injected replace failure: {path} -> {destination}")
+            return original_replace(path, destination)
+
+        return patch.object(Path, "replace", failing_replace)
+
+    def write_history_pair(self, source: Path, target: Path, *, had_target: bool) -> None:
+        write_json(
+            source / "history" / "private_1.json",
+            {"messages": [{"role": "user", "content": "旧消息"}]},
+        )
+        if had_target:
+            write_json(
+                target / "history" / "private_1.json",
+                {"messages": [{"role": "assistant", "content": "新消息"}]},
+            )
+
+    def assert_clean_retry(self, source: Path, target: Path, *, had_target: bool) -> None:
+        state = target.with_name(f".{target.name}.migration-state")
+        self.assertFalse(state.exists())
+        self.assertTrue(source.exists())
+        if had_target:
+            self.assertEqual(
+                ["新消息"],
+                [
+                    item["content"]
+                    for item in read_json(target / "history" / "private_1.json")["messages"]
+                ],
+            )
+        else:
+            self.assertFalse(target.exists())
+
+        backup = self.migrate(source, target)
+
+        self.assertIsNotNone(backup)
+        expected = ["旧消息", "新消息"] if had_target else ["旧消息"]
+        self.assertEqual(
+            expected,
+            [
+                item["content"]
+                for item in read_json(target / "history" / "private_1.json")["messages"]
+            ],
+        )
+
+    @staticmethod
+    def migrate(source: Path, target: Path):
+        from src.utils.data_migration import migrate_legacy_data
+
+        return migrate_legacy_data(source, target, 8, 30, timestamp="fixed")
 
     def test_merges_known_data_copies_missing_files_and_archives_source(self):
         write_json(self.source / "memories" / "global.json", {"facts": ["旧一", "重复", "旧二"]})
@@ -99,21 +159,222 @@ class DataMigrationTests(unittest.TestCase):
         self.assertIsNone(migrate_legacy_data(self.source, self.target, 8, 30, timestamp="fixed"))
         self.assertEqual("保持", marker.read_text(encoding="utf-8"))
 
-    def test_source_archive_failure_restores_original_target(self):
-        write_json(self.source / "memories" / "global.json", {"facts": ["旧"]})
-        write_json(self.target / "memories" / "global.json", {"facts": ["新"]})
+    def test_source_to_backup_failure_restores_original_target_and_allows_clean_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path == self.source
+            and destination.name.startswith("atri_data.backup-")
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_clean_retry(self.source, self.target, had_target=True)
+
+    def test_target_to_rollback_failure_preserves_originals_and_allows_clean_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path == self.target
+            and destination.name.startswith(".qqbot_data.rollback-")
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_clean_retry(self.source, self.target, had_target=True)
+
+    def test_staging_to_target_failure_with_original_target_allows_clean_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path.name.startswith(".qqbot_data.migrating-")
+            and destination == self.target
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_clean_retry(self.source, self.target, had_target=True)
+
+    def test_staging_to_target_failure_without_original_target_allows_clean_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=False)
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path.name.startswith(".qqbot_data.migrating-")
+            and destination == self.target
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_clean_retry(self.source, self.target, had_target=False)
+
+    def test_target_to_failed_failure_blocks_retry_with_or_without_original_target(self):
+        from src.utils.data_migration import MigrationError
+
+        for had_target in (True, False):
+            with self.subTest(had_target=had_target):
+                root = self.root / f"target-to-failed-{had_target}"
+                source = root / "atri_data"
+                target = root / "qqbot_data"
+                self.write_history_pair(source, target, had_target=had_target)
+                replace_calls = []
+
+                def fails_archive_and_quarantine(path, destination):
+                    return (
+                        path == source and destination.name.startswith("atri_data.backup-")
+                    ) or (
+                        path == target and destination.name.startswith(".qqbot_data.failed-")
+                    )
+
+                with self.patch_replace_failure(fails_archive_and_quarantine, replace_calls):
+                    with self.assertRaises(MigrationError):
+                        self.migrate(source, target)
+
+                state = target.with_name(".qqbot_data.migration-state")
+                self.assertTrue(state.exists())
+                self.assertTrue(source.exists())
+                source_snapshot = (source / "history" / "private_1.json").read_text(encoding="utf-8")
+                target_snapshot = (target / "history" / "private_1.json").read_text(encoding="utf-8")
+                rollback_paths = list(root.glob(".qqbot_data.rollback-*"))
+                self.assertEqual(1 if had_target else 0, len(rollback_paths))
+                if had_target:
+                    self.assertTrue(
+                        any(
+                            path.name.startswith(".qqbot_data.rollback-")
+                            and destination == target
+                            for path, destination in replace_calls
+                        )
+                    )
+                    self.assertEqual(
+                        ["新消息"],
+                        [
+                            item["content"]
+                            for item in read_json(rollback_paths[0] / "history" / "private_1.json")["messages"]
+                        ],
+                    )
+
+                with self.assertRaises(MigrationError):
+                    self.migrate(source, target)
+
+                self.assertEqual(source_snapshot, (source / "history" / "private_1.json").read_text(encoding="utf-8"))
+                self.assertEqual(target_snapshot, (target / "history" / "private_1.json").read_text(encoding="utf-8"))
+
+    def test_rollback_to_target_failure_keeps_recovery_state_and_blocks_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+
+        from src.utils.data_migration import MigrationError
+
+        def fails_archive_and_restore(path, destination):
+            return (
+                path == self.source and destination.name.startswith("atri_data.backup-")
+            ) or (
+                path.name.startswith(".qqbot_data.rollback-") and destination == self.target
+            )
+
+        with self.patch_replace_failure(fails_archive_and_restore):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        state = self.target.with_name(".qqbot_data.migration-state")
+        rollback = list(self.root.glob(".qqbot_data.rollback-*"))
+        failed = list(self.root.glob(".qqbot_data.failed-*"))
+        self.assertTrue(state.exists())
+        self.assertTrue(self.source.exists())
+        self.assertFalse(self.target.exists())
+        self.assertEqual(1, len(rollback))
+        self.assertEqual(1, len(failed))
+        self.assertEqual(
+            ["新消息"],
+            [
+                item["content"]
+                for item in read_json(rollback[0] / "history" / "private_1.json")["messages"]
+            ],
+        )
+
+        with self.assertRaises(MigrationError):
+            self.migrate(self.source, self.target)
+
+        self.assertTrue(state.exists())
+        self.assertFalse(self.target.exists())
+
+    def test_existing_transaction_state_blocks_even_when_source_is_absent(self):
+        state = self.target.with_name(".qqbot_data.migration-state")
+        state.write_text("{}", encoding="utf-8")
+
+        from src.utils.data_migration import MigrationError
+
+        with self.assertRaises(MigrationError):
+            self.migrate(self.source, self.target)
+
+        self.assertTrue(state.exists())
+        self.assertFalse(self.target.exists())
+
+    def test_orphaned_recovery_material_blocks_even_without_state_or_source(self):
+        from src.utils.data_migration import MigrationError
+
+        for recovery_kind in ("migrating", "rollback", "failed"):
+            with self.subTest(recovery_kind=recovery_kind):
+                root = self.root / recovery_kind
+                source = root / "atri_data"
+                target = root / "qqbot_data"
+                recovery = root / f".qqbot_data.{recovery_kind}-orphaned"
+                recovery.mkdir(parents=True)
+
+                with self.assertRaises(MigrationError):
+                    self.migrate(source, target)
+
+                self.assertTrue(recovery.exists())
+                self.assertFalse(source.exists())
+                self.assertFalse(target.exists())
+
+    def test_atomic_transaction_state_blocks_a_second_caller(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
 
         from src.utils import data_migration
 
-        original_archive = data_migration._archive_source
-        with patch.object(data_migration, "_archive_source", side_effect=OSError("archive failed")):
-            with self.assertRaises(data_migration.MigrationError):
-                data_migration.migrate_legacy_data(self.source, self.target, 8, 30, timestamp="fixed")
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+        call_lock = threading.Lock()
+        call_count = 0
+        original_copy = data_migration._copy_unknown_files
 
-        self.assertEqual(["新"], read_json(self.target / "memories" / "global.json")["facts"])
-        self.assertTrue(self.source.exists())
-        self.assertFalse((self.root / "atri_data.backup-fixed").exists())
-        self.assertIsNotNone(original_archive)
+        def blocking_copy(source, staging):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("test release timeout")
+            else:
+                second_entered.set()
+            return original_copy(source, staging)
+
+        state = self.target.with_name(".qqbot_data.migration-state")
+        with patch.object(data_migration, "_copy_unknown_files", side_effect=blocking_copy):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(self.migrate, self.source, self.target)
+                self.assertTrue(entered.wait(timeout=2))
+                second = executor.submit(self.migrate, self.source, self.target)
+                try:
+                    with self.assertRaises(data_migration.MigrationError):
+                        second.result(timeout=2)
+                    self.assertFalse(second_entered.is_set())
+                    self.assertTrue(state.exists())
+                finally:
+                    release.set()
+                self.assertIsNotNone(first.result(timeout=2))
+
+        self.assertFalse(state.exists())
 
     def test_invalid_known_json_keeps_source_and_original_target(self):
         invalid = self.source / "memories" / "broken.json"
@@ -129,8 +390,102 @@ class DataMigrationTests(unittest.TestCase):
         self.assertTrue(self.source.exists())
         self.assertEqual(["保持"], read_json(self.target / "memories" / "global.json")["facts"])
 
+    def test_invalid_known_items_keep_source_and_original_target(self):
+        cases = (
+            ("non-string-fact", "memories/global.json", {"facts": ["有效", 7]}),
+            ("missing-content", "history/private_1.json", {"messages": [{"role": "user"}]}),
+            (
+                "non-string-content",
+                "history/private_1.json",
+                {"messages": [{"role": "user", "content": 7}]},
+            ),
+            (
+                "non-string-role",
+                "history/private_1.json",
+                {"messages": [{"role": 7, "content": "内容"}]},
+            ),
+        )
+
+        from src.utils.data_migration import MigrationError, migrate_legacy_data
+
+        for case_name, relative, invalid_data in cases:
+            for invalid_side in ("source", "target"):
+                with self.subTest(case=case_name, side=invalid_side):
+                    root = self.root / f"{case_name}-{invalid_side}"
+                    source = root / "atri_data"
+                    target = root / "qqbot_data"
+                    write_json(source / "memories" / "global.json", {"facts": ["旧"]})
+                    write_json(
+                        source / "history" / "private_1.json",
+                        {"messages": [{"role": "user", "content": "旧消息"}]},
+                    )
+                    write_json(target / "memories" / "global.json", {"facts": ["新"]})
+                    write_json(
+                        target / "history" / "private_1.json",
+                        {"messages": [{"role": "assistant", "content": "新消息"}]},
+                    )
+                    (source / "source-marker.txt").write_text("源", encoding="utf-8")
+                    (target / "target-marker.txt").write_text("目标", encoding="utf-8")
+                    invalid_root = source if invalid_side == "source" else target
+                    write_json(invalid_root / relative, invalid_data)
+
+                    with self.assertRaises(MigrationError):
+                        migrate_legacy_data(source, target, 8, 30, timestamp="fixed")
+
+                    self.assertEqual("源", (source / "source-marker.txt").read_text(encoding="utf-8"))
+                    self.assertEqual("目标", (target / "target-marker.txt").read_text(encoding="utf-8"))
+                    self.assertEqual(invalid_data, read_json(invalid_root / relative))
+
 
 class StartupMigrationTests(unittest.TestCase):
+    def test_startup_serializes_concurrent_initialization(self):
+        from src import main
+
+        previous_initialized = main._startup_initialized
+        self.addCleanup(setattr, main, "_startup_initialized", previous_initialized)
+        main._startup_initialized = False
+        fake_config = SimpleNamespace(
+            data_dir=main.BASE_DIR / "qqbot_data",
+            history_turns=8,
+            memory_limit=30,
+        )
+        start = threading.Barrier(3)
+        call_lock = threading.Lock()
+        calls = {"directory": 0, "memory-layout": 0}
+        errors = []
+
+        def directory_migration(*args, **kwargs):
+            with call_lock:
+                calls["directory"] += 1
+            time.sleep(0.05)
+
+        def memory_layout_migration():
+            with call_lock:
+                calls["memory-layout"] += 1
+
+        def worker():
+            start.wait()
+            try:
+                main.startup()
+            except Exception as error:
+                errors.append(error)
+
+        with (
+            patch.object(main, "config", fake_config),
+            patch.object(main, "migrate_legacy_data", side_effect=directory_migration),
+            patch.object(main, "migrate_legacy_memory_files", side_effect=memory_layout_migration),
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual([], errors)
+        self.assertEqual({"directory": 1, "memory-layout": 1}, calls)
+
     def test_startup_migrates_default_data_before_legacy_memory_layout(self):
         from src import main
 

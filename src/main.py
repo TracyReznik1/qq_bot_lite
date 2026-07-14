@@ -1,6 +1,7 @@
 import hmac
 import logging
 import time
+from threading import Lock
 from typing import Any
 
 from flask import Flask, request
@@ -33,6 +34,7 @@ logger = logging.getLogger("qq-bot")
 
 MAX_PROCESSED_MESSAGE_IDS = 500
 _startup_initialized = False
+_startup_lock = Lock()
 
 onebot = OneBotClient(config)
 
@@ -54,16 +56,20 @@ def startup() -> None:
     if _startup_initialized:
         return
 
-    default_data_dir = (BASE_DIR / "qqbot_data").resolve()
-    if config.data_dir.resolve() == default_data_dir:
-        migrate_legacy_data(
-            BASE_DIR / LEGACY_DATA_DIR_NAME,
-            config.data_dir,
-            config.history_turns,
-            config.memory_limit,
-        )
-    migrate_legacy_memory_files()
-    _startup_initialized = True
+    with _startup_lock:
+        if _startup_initialized:
+            return
+
+        default_data_dir = (BASE_DIR / "qqbot_data").resolve()
+        if config.data_dir.resolve() == default_data_dir:
+            migrate_legacy_data(
+                BASE_DIR / LEGACY_DATA_DIR_NAME,
+                config.data_dir,
+                config.history_turns,
+                config.memory_limit,
+            )
+        migrate_legacy_memory_files()
+        _startup_initialized = True
 
 
 def strip_bot_mention(raw_msg: str, self_id: str) -> tuple[bool, str]:

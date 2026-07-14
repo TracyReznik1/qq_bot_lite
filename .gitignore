@@ -13,6 +13,7 @@ atri_data.backup-*/
 .qqbot_data.migrating-*/
 .qqbot_data.rollback-*/
 .qqbot_data.failed-*/
+.qqbot_data.migration-state
 _google_backup_tmp*/
 gemini*/
 CLAUDE_*.md
