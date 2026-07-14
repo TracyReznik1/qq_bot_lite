@@ -16,6 +16,11 @@ from src.messaging import (
     mark_message_seen,
 )
 from src.router import route_message
+from src.services.image_input_service import (
+    ImageInputError,
+    load_chat_images,
+    parse_image_message,
+)
 from src.services.onebot_client import OneBotClient
 
 
@@ -129,25 +134,23 @@ def process_message(data: dict[str, Any]) -> None:
 
     if is_group:
         logger.info(
-            "Group message received group_id=%s user_id=%s self_id=%s message_id=%s require_group_at=%s raw=%r",
+            "Group message received group_id=%s user_id=%s self_id=%s message_id=%s require_group_at=%s",
             data.get("group_id"),
             uid,
             self_id,
             data.get("message_id"),
             config.require_group_at,
-            message_preview(raw_msg),
         )
 
     if is_group and config.require_group_at:
         mentioned, raw_msg = strip_bot_mention(raw_msg, self_id)
         logger.info(
-            "Group mention check group_id=%s user_id=%s self_id=%s message_id=%s mentioned=%s stripped=%r",
+            "Group mention check group_id=%s user_id=%s self_id=%s message_id=%s mentioned=%s",
             data.get("group_id"),
             uid,
             self_id,
             data.get("message_id"),
             mentioned,
-            message_preview(raw_msg),
         )
         if not mentioned:
             logger.info(
@@ -167,7 +170,14 @@ def process_message(data: dict[str, Any]) -> None:
             return
 
     try:
-        route = route_message(raw_msg)
+        parsed_message = parse_image_message(data, raw_msg)
+        route_text = parsed_message.text or (
+            "[图片]" if parsed_message.image_urls else ""
+        )
+        if not route_text:
+            return
+
+        route = route_message(route_text)
         logger.info(
             "Message routed session_key=%s is_group=%s handler=%s command=%s query=%r",
             session_key,
@@ -179,7 +189,7 @@ def process_message(data: dict[str, Any]) -> None:
         if route.handler == "command":
             result = handle_command(
                 route,
-                CommandContext(uid=uid, session_key=session_key, raw_message=raw_msg),
+                CommandContext(uid=uid, session_key=session_key, raw_message=route_text),
             )
             logger.info(
                 "Command handled session_key=%s command=%s handled=%s reply_chars=%s",
@@ -193,9 +203,16 @@ def process_message(data: dict[str, Any]) -> None:
             return
 
         logger.info("Generating chat reply session_key=%s is_group=%s", session_key, is_group)
-        reply = generate_reply(session_key, raw_msg)
+        image_data_urls = load_chat_images(parsed_message.image_urls)
+        reply = generate_reply(
+            session_key,
+            parsed_message.text,
+            image_data_urls=image_data_urls,
+        )
         logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
         send_reply(target_id, reply, is_group)
+    except ImageInputError as error:
+        send_reply(target_id, str(error), is_group)
     except RuntimeError as error:
         logger.exception("Configuration error")
         send_reply(target_id, f"配置还没好：{error}", is_group)
