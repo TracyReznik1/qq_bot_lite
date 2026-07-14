@@ -51,7 +51,9 @@
 `Config` 新增：
 
 ```python
-message_workers: int = max(env_int("MESSAGE_WORKERS", 8), 1)
+message_workers: int = field(
+    default_factory=lambda: max(env_int("MESSAGE_WORKERS", 8), 1)
+)
 ```
 
 规则如下：
