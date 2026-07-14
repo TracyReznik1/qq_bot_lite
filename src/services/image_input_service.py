@@ -58,7 +58,7 @@ def parse_image_message(data: dict[str, Any], raw_text: str) -> ParsedImageMessa
     cq_count, cq_urls = _cq_image_urls(raw_text)
     image_count, urls = (
         (structured_count, structured_urls)
-        if structured_count
+        if structured_urls
         else (cq_count, cq_urls)
     )
 

@@ -51,6 +51,40 @@ class ImageInputServiceTests(unittest.TestCase):
         self.assertEqual("", parsed.text)
         self.assertEqual(("https://img.example/a.png",), parsed.image_urls)
 
+    def test_falls_back_to_cq_url_when_structured_image_has_no_url(self):
+        service = self.service()
+        event = {"message": [{"type": "image", "data": {"file": "a.png"}}]}
+        try:
+            parsed = service.parse_image_message(
+                event, "[CQ:image,file=a.png,url=https://img.example/a.png]"
+            )
+        except service.ImageInputError as error:
+            self.fail(f"expected CQ URL fallback, got: {error}")
+        self.assertEqual("", parsed.text)
+        self.assertEqual(("https://img.example/a.png",), parsed.image_urls)
+
+    def test_cq_fallback_counts_duplicate_segments_before_deduplication(self):
+        service = self.service()
+        event = {"message": [{"type": "image", "data": {"file": "a.png"}}]}
+        raw_text = "".join(
+            "[CQ:image,file=a.png,url=https://img.example/a.png]" for _ in range(5)
+        )
+        with self.assertRaisesRegex(service.ImageInputError, "最多发送 4 张图片"):
+            service.parse_image_message(event, raw_text)
+
+    def test_cq_fallback_counts_segments_without_urls_before_filtering(self):
+        service = self.service()
+        event = {"message": [{"type": "image", "data": {"file": "a.png"}}]}
+        raw_text = (
+            "[CQ:image,file=a.png,url=https://img.example/a.png]"
+            "[CQ:image,file=b.png]"
+            "[CQ:image,file=c.png,url=https://img.example/c.png]"
+            "[CQ:image,file=d.png]"
+            "[CQ:image,file=e.png,url=https://img.example/e.png]"
+        )
+        with self.assertRaisesRegex(service.ImageInputError, "最多发送 4 张图片"):
+            service.parse_image_message(event, raw_text)
+
     def test_rejects_more_than_four_images(self):
         service = self.service()
         event = {
