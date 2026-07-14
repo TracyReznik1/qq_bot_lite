@@ -39,7 +39,8 @@
 - `tests/test_identity_configuration.py`: identity defaults, custom values, prompt content, and every-call coverage.
 - `tests/test_data_migration.py`: data merge, retention, backup, idempotence, and rollback behavior.
 - `tests/test_qqbot_branding.py`: callback compatibility, runtime branding, launcher, docs, and ATRI allowlist.
-- `.env.example`, `.env`, `README.md`, `启动qqbot.bat`: operator-facing identity configuration and branding.
+- `.env.example`, `README.md`, `启动qqbot.bat`: tracked operator-facing identity configuration and branding.
+- `.env`: controller-owned local configuration; update only from the main workspace after the isolated branch passes final review.
 
 ---
 
@@ -855,7 +856,6 @@ git commit -m "feat: migrate legacy ATRI data safely"
 - Modify: `src/main.py:233-251`
 - Modify: `src/services/url_fetch_service.py:1-240`
 - Modify: `.env.example`
-- Modify: `.env` (ignored; never stage)
 - Modify: `README.md`
 - Modify: `tests/test_user_facing_scope.py`
 
@@ -1055,31 +1055,16 @@ Update `README.md` with these exact content rules:
 - Local data path is `qqbot_data/`.
 - No README line contains `ATRI` or presents the legacy callback header.
 
-- [ ] **Step 7: Make the approved minimal `.env` change**
+- [ ] **Step 7: Verify the real `.env` is absent from the isolated task scope**
 
-Before editing, compute a hash of every non-target line without displaying values:
-
-```powershell
-$lines = Get-Content .env | Where-Object { $_ -notmatch '^(BOT_NAME|BOT_PERSONA|DATA_DIR)=' }
-$before = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))
-$before
-```
-
-The current `.env` has none of the three target keys. Use `apply_patch` to insert only these two lines at the start; do not add `DATA_DIR` because the code default already selects `qqbot_data`:
-
-```env
-BOT_NAME=qqbot
-BOT_PERSONA=你是一个自然、友好、简洁、可靠的 QQ 聊天助手。
-```
-
-Recompute the same non-target hash and assert it equals `$before`. Then run:
+Do not copy, open, or modify the main workspace `.env` from the isolated worktree. Run:
 
 ```powershell
-git status --short --ignored .env
+Test-Path .env
 git check-ignore -v .env
 ```
 
-Expected: `.env` is ignored and does not appear as a staged or tracked change. Never print the full `.env`.
+Expected: `.env` is absent in the isolated worktree and the ignore rule is reported. Record this in the task report. The controller performs the approved local edit after final branch review.
 
 - [ ] **Step 8: Run focused tests and close branding gaps**
 
@@ -1139,5 +1124,30 @@ Expected: Git records the launcher rename and planned source/docs/tests. `.env` 
 - [ ] Confirm all three task commits contain only their planned scope.
 - [ ] Run the full test, compile, AST, diff, and residual commands from Task 3 Step 9 again from a clean checkout.
 - [ ] Verify the real `atri_data/` has not been migrated merely by tests or imports; migration should occur only when the application startup guard runs.
-- [ ] Verify `.env` contains the two approved identity keys, its non-target-line hash is unchanged, and it is not tracked.
 - [ ] Perform a final code review from the pre-feature base to HEAD, fix all Critical and Important findings, and repeat verification.
+
+## Controller-Only Local `.env` Update
+
+After the isolated branch passes final code review, return to the main workspace. Do not print or copy `.env`. Compute a hash of every non-target line:
+
+```powershell
+$lines = Get-Content .env | Where-Object { $_ -notmatch '^(BOT_NAME|BOT_PERSONA|DATA_DIR)=' }
+$before = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))
+$before
+```
+
+The current main-workspace `.env` has none of the three target keys. Use `apply_patch` to insert only these two lines at the start; do not add `DATA_DIR` because the code default already selects `qqbot_data`:
+
+```env
+BOT_NAME=qqbot
+BOT_PERSONA=你是一个自然、友好、简洁、可靠的 QQ 聊天助手。
+```
+
+Recompute the same non-target hash and require it to equal `$before`. Then run:
+
+```powershell
+git status --short --ignored .env
+git check-ignore -v .env
+```
+
+Expected: `.env` is ignored, is not staged or tracked, and every non-target line is byte-for-byte unchanged.
