@@ -144,6 +144,13 @@ def _remove_tree(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _best_effort_cleanup(path: Path) -> None:
+    try:
+        _remove_tree(path)
+    except OSError:
+        logger.warning("Migration cleanup remains at %s", path)
+
+
 def _rollback_transaction(
     *,
     state: Path,
@@ -153,6 +160,7 @@ def _rollback_transaction(
     staging: Path,
     rollback: Path,
     failed: Path,
+    cleanup: Path,
     had_target: bool,
     installed_staging: bool,
 ) -> bool:
@@ -187,13 +195,15 @@ def _rollback_transaction(
         else not target.exists() and not rollback.exists()
     )
     if source.exists() and original_target_restored:
-        try:
-            _remove_tree(failed)
-        except Exception as error:
-            recovery_errors.append(error)
+        if failed.exists():
+            try:
+                failed.replace(cleanup)
+            except Exception as error:
+                recovery_errors.append(error)
 
     recovered = (
-        source.exists()
+        not recovery_errors
+        and source.exists()
         and not backup.exists()
         and original_target_restored
         and not staging.exists()
@@ -206,6 +216,8 @@ def _rollback_transaction(
         except Exception as error:
             recovery_errors.append(error)
             recovered = False
+        else:
+            _best_effort_cleanup(cleanup)
 
     for error in recovery_errors:
         logger.error("Data migration recovery step failed: %s", error)
@@ -238,6 +250,7 @@ def migrate_legacy_data(
     staging = target.with_name(f".{target.name}.migrating-{token}")
     rollback = target.with_name(f".{target.name}.rollback-{token}")
     failed = target.with_name(f".{target.name}.failed-{token}")
+    cleanup = target.with_name(f".{target.name}.cleanup-{token}")
     had_target = target.exists()
     installed_staging = False
     stamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -251,6 +264,7 @@ def migrate_legacy_data(
             "staging": str(staging),
             "rollback": str(rollback),
             "failed": str(failed),
+            "cleanup": str(cleanup),
             "backup": str(backup),
             "had_target": had_target,
         },
@@ -272,8 +286,6 @@ def migrate_legacy_data(
         staging.replace(target)
         installed_staging = True
         source.replace(backup)
-
-        _remove_tree(rollback)
     except Exception as error:
         recovered = _rollback_transaction(
             state=state,
@@ -283,6 +295,7 @@ def migrate_legacy_data(
             staging=staging,
             rollback=rollback,
             failed=failed,
+            cleanup=cleanup,
             had_target=had_target,
             installed_staging=installed_staging,
         )
@@ -292,6 +305,12 @@ def migrate_legacy_data(
                 state,
             )
         raise MigrationError("旧数据迁移失败，服务未启动。") from error
+
+    if rollback.exists():
+        try:
+            rollback.replace(cleanup)
+        except OSError as error:
+            raise MigrationError("无法提交数据迁移清理状态，服务未启动。") from error
 
     if (
         source.exists()
@@ -313,4 +332,5 @@ def migrate_legacy_data(
         target,
         backup,
     )
+    _best_effort_cleanup(cleanup)
     return backup

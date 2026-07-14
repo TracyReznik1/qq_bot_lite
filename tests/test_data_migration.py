@@ -160,18 +160,121 @@ class DataMigrationTests(unittest.TestCase):
         self.assertEqual("保持", marker.read_text(encoding="utf-8"))
 
     def test_source_to_backup_failure_restores_original_target_and_allows_clean_retry(self):
-        self.write_history_pair(self.source, self.target, had_target=True)
-
         from src.utils.data_migration import MigrationError
 
-        with self.patch_replace_failure(
-            lambda path, destination: path == self.source
-            and destination.name.startswith("atri_data.backup-")
+        for had_target in (True, False):
+            with self.subTest(had_target=had_target):
+                root = self.root / f"source-to-backup-{had_target}"
+                source = root / "atri_data"
+                target = root / "qqbot_data"
+                self.write_history_pair(source, target, had_target=had_target)
+
+                with self.patch_replace_failure(
+                    lambda path, destination: path == source
+                    and destination.name.startswith("atri_data.backup-")
+                ):
+                    with self.assertRaises(MigrationError):
+                        self.migrate(source, target)
+
+                self.assert_clean_retry(source, target, had_target=had_target)
+
+    def test_partial_failed_cleanup_after_recovery_does_not_keep_transaction_locked(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        source_only = self.source / "source-only.txt"
+        source_only.write_text("只在旧源", encoding="utf-8")
+
+        from src.utils import data_migration
+
+        original_rmtree = data_migration.shutil.rmtree
+        deleted_from = []
+
+        def partial_delete_then_fail(path, *args, **kwargs):
+            path = Path(path)
+            redundant_file = path / "source-only.txt"
+            if not deleted_from and redundant_file.exists():
+                redundant_file.unlink()
+                deleted_from.append(path.name)
+                raise OSError("injected partial failed cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with (
+            self.patch_replace_failure(
+                lambda path, destination: path == self.source
+                and destination.name.startswith("atri_data.backup-")
+            ),
+            patch.object(data_migration.shutil, "rmtree", side_effect=partial_delete_then_fail),
         ):
-            with self.assertRaises(MigrationError):
+            with self.assertRaises(data_migration.MigrationError):
                 self.migrate(self.source, self.target)
 
-        self.assert_clean_retry(self.source, self.target, had_target=True)
+        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["新消息"],
+            [
+                item["content"]
+                for item in read_json(self.target / "history" / "private_1.json")["messages"]
+            ],
+        )
+        self.assertEqual(1, len(deleted_from))
+        self.assertTrue(deleted_from[0].startswith(".qqbot_data.cleanup-"))
+        self.assertFalse(self.target.with_name(".qqbot_data.migration-state").exists())
+        cleanup = list(self.root.glob(".qqbot_data.cleanup-*"))
+        self.assertEqual(1, len(cleanup))
+
+        backup = self.migrate(self.source, self.target)
+
+        self.assertIsNotNone(backup)
+        self.assertEqual(
+            ["旧消息", "新消息"],
+            [
+                item["content"]
+                for item in read_json(self.target / "history" / "private_1.json")["messages"]
+            ],
+        )
+
+    def test_partial_staging_cleanup_failure_keeps_transaction_blocked(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        source_only = self.source / "source-only.txt"
+        target_only = self.target / "target-only.txt"
+        source_only.write_text("只在旧源", encoding="utf-8")
+        target_only.write_text("只在原目标", encoding="utf-8")
+
+        from src.utils import data_migration
+
+        original_rmtree = data_migration.shutil.rmtree
+        deleted_from = []
+
+        def partial_delete_then_fail(path, *args, **kwargs):
+            path = Path(path)
+            staged_file = path / "source-only.txt"
+            if path.name.startswith(".qqbot_data.migrating-") and staged_file.exists():
+                staged_file.unlink()
+                deleted_from.append(path.name)
+                raise OSError("injected partial staging cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with (
+            self.patch_replace_failure(
+                lambda path, destination: path.name.startswith(".qqbot_data.migrating-")
+                and destination == self.target
+            ),
+            patch.object(data_migration.shutil, "rmtree", side_effect=partial_delete_then_fail),
+        ):
+            with self.assertRaises(data_migration.MigrationError):
+                self.migrate(self.source, self.target)
+
+        state = self.target.with_name(".qqbot_data.migration-state")
+        staging = list(self.root.glob(".qqbot_data.migrating-*"))
+        self.assertEqual(1, len(deleted_from))
+        self.assertTrue(state.exists())
+        self.assertEqual(1, len(staging))
+        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
+        self.assertEqual("只在原目标", target_only.read_text(encoding="utf-8"))
+
+        with self.assertRaises(data_migration.MigrationError):
+            self.migrate(self.source, self.target)
+
+        self.assertTrue(state.exists())
 
     def test_target_to_rollback_failure_preserves_originals_and_allows_clean_retry(self):
         self.write_history_pair(self.source, self.target, had_target=True)
@@ -186,6 +289,116 @@ class DataMigrationTests(unittest.TestCase):
                 self.migrate(self.source, self.target)
 
         self.assert_clean_retry(self.source, self.target, had_target=True)
+
+    def test_partial_cleanup_failure_after_commit_keeps_active_target_complete(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        target_only = self.target / "target-only.txt"
+        target_only.write_text("只在原目标", encoding="utf-8")
+
+        from src.utils import data_migration
+
+        original_rmtree = data_migration.shutil.rmtree
+        deleted_from = []
+
+        def partial_delete_then_fail(path, *args, **kwargs):
+            path = Path(path)
+            redundant_file = path / "target-only.txt"
+            if not deleted_from and redundant_file.exists():
+                redundant_file.unlink()
+                deleted_from.append(path.name)
+                raise OSError("injected partial cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with patch.object(data_migration.shutil, "rmtree", side_effect=partial_delete_then_fail):
+            try:
+                backup = self.migrate(self.source, self.target)
+            except data_migration.MigrationError:
+                backup = None
+
+        self.assertIsNotNone(backup)
+        self.assertTrue(backup.is_dir())
+        self.assertFalse(self.source.exists())
+        self.assertEqual("只在原目标", target_only.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(deleted_from))
+        self.assertTrue(deleted_from[0].startswith(".qqbot_data.cleanup-"))
+        self.assertFalse(self.target.with_name(".qqbot_data.migration-state").exists())
+        cleanup = list(self.root.glob(".qqbot_data.cleanup-*"))
+        self.assertEqual(1, len(cleanup))
+        self.assertFalse((cleanup[0] / "target-only.txt").exists())
+        snapshot = (self.target / "history" / "private_1.json").read_text(encoding="utf-8")
+
+        self.assertIsNone(self.migrate(self.source, self.target))
+        self.assertEqual(snapshot, (self.target / "history" / "private_1.json").read_text(encoding="utf-8"))
+
+    def test_rollback_to_cleanup_rename_failure_keeps_committed_data_and_blocks(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        target_only = self.target / "target-only.txt"
+        target_only.write_text("只在原目标", encoding="utf-8")
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path.name.startswith(".qqbot_data.rollback-")
+            and destination.name.startswith(".qqbot_data.cleanup-")
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        state = self.target.with_name(".qqbot_data.migration-state")
+        backup = list(self.root.glob("atri_data.backup-*"))
+        rollback = list(self.root.glob(".qqbot_data.rollback-*"))
+        self.assertTrue(state.exists())
+        self.assertFalse(self.source.exists())
+        self.assertEqual(1, len(backup))
+        self.assertEqual(1, len(rollback))
+        self.assertEqual("只在原目标", target_only.read_text(encoding="utf-8"))
+        self.assertEqual("只在原目标", (rollback[0] / "target-only.txt").read_text(encoding="utf-8"))
+        target_snapshot = (self.target / "history" / "private_1.json").read_text(encoding="utf-8")
+
+        with self.assertRaises(MigrationError):
+            self.migrate(self.source, self.target)
+
+        self.assertEqual(target_snapshot, (self.target / "history" / "private_1.json").read_text(encoding="utf-8"))
+        self.assertTrue(state.exists())
+
+    def test_failed_to_cleanup_rename_failure_keeps_recovery_data_and_blocks(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        source_only = self.source / "source-only.txt"
+        source_only.write_text("只在旧源", encoding="utf-8")
+
+        from src.utils.data_migration import MigrationError
+
+        def fails_archive_and_failed_cleanup(path, destination):
+            return (
+                path == self.source and destination.name.startswith("atri_data.backup-")
+            ) or (
+                path.name.startswith(".qqbot_data.failed-")
+                and destination.name.startswith(".qqbot_data.cleanup-")
+            )
+
+        with self.patch_replace_failure(fails_archive_and_failed_cleanup):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        state = self.target.with_name(".qqbot_data.migration-state")
+        failed = list(self.root.glob(".qqbot_data.failed-*"))
+        self.assertTrue(state.exists())
+        self.assertTrue(self.source.exists())
+        self.assertEqual(1, len(failed))
+        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
+        self.assertEqual("只在旧源", (failed[0] / "source-only.txt").read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["新消息"],
+            [
+                item["content"]
+                for item in read_json(self.target / "history" / "private_1.json")["messages"]
+            ],
+        )
+
+        with self.assertRaises(MigrationError):
+            self.migrate(self.source, self.target)
+
+        self.assertTrue(state.exists())
 
     def test_staging_to_target_failure_with_original_target_allows_clean_retry(self):
         self.write_history_pair(self.source, self.target, had_target=True)
