@@ -71,7 +71,7 @@ python run_bot.py
 
 ## 最小 `.env` 配置
 
-先复制 `.env.example`，再选择一套模型。模板中的空密钥和令牌必须替换成你自己的值，下面的占位符不要照抄。
+先复制 `.env.example`，再选择一套模型。模型链实际使用的 Gemini / DeepSeek API Key 必须填写；`ONEBOT_ACCESS_TOKEN` 仅在 OneBot HTTP API 开启鉴权时填写；`CALLBACK_SECRET` 推荐设置，启用后必须与 OneBot 回调端保持一致。下面的占位符不要照抄。
 
 Gemini 示例：
 
@@ -221,7 +221,7 @@ CALLBACK_SECRET=
 
 默认数据位于 `qqbot_data/`：历史在 `qqbot_data/history/`，记忆在 `qqbot_data/memories/`。不要提交或公开这个目录。
 
-- **历史：**最近 `HISTORY_TURNS` 轮用户 / 助手消息。私聊按用户隔离，群聊按群号与用户共同隔离。`PERSIST_HISTORY=true` 时重启后可恢复；为假时只保留内存状态。
+- **历史：**最近 `HISTORY_TURNS` 轮用户 / 助手消息。私聊按 QQ 用户隔离，群聊按“群号 + QQ 用户”隔离。`PERSIST_HISTORY=true` 时重启后可恢复；为假时只保留内存状态。
 - **会话记忆：**绑定当前私聊或“群 + 用户”会话，优先级最高；`/reset` 会清除它。当前公开命令不会新增会话记忆。
 - **个人记忆：**`/remember` 写入，按 QQ 账号共享到该用户的不同会话；`/reset` 不删除。
 - **全局记忆：**`/globalremember` 写入，所有用户和会话可见；只有管理员能写，`/reset` 不删除。
@@ -240,11 +240,11 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 
 ## 常见问题
 
-### 启动时出现 `python-dotenv could not parse statement`
+### python-dotenv could not parse statement
 
 通常是 `.env` 中引号没有成对、把多行角色设定写成了多个裸行，或混入了不合法的赋值。对照 `.env.example`，让每项保持 `KEY=value`；多行 `BOT_PERSONA` 使用上文的成对双引号，然后重启。
 
-### OneBot 返回 `401 Unauthorized`
+### 401 Unauthorized
 
 这通常发生在 qqbot → OneBot 请求方向：`ONEBOT_ACCESS_TOKEN` 与 OneBot HTTP API 的令牌不一致，或 OneBot 要求令牌但本地留空。统一两边的值并重启。若是 OneBot → qqbot 的 `CALLBACK_SECRET` 不匹配，本项目回调入口返回 403，应检查回调请求头。
 
