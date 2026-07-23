@@ -6,7 +6,7 @@ from src.services.llm_types import ChatResponse
 
 
 class MultimodalChatTests(unittest.TestCase):
-    def test_builds_openai_compatible_multimodal_content(self):
+    def test_builds_provider_neutral_multimodal_content(self):
         content = chat_service.build_user_content(
             "这是什么？", ["data:image/png;base64,cG5n"]
         )

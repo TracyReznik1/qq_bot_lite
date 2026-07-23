@@ -300,6 +300,10 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "bot_name": config.bot_name,
+        "chat_models": [
+            {"provider": item.provider, "model": item.model}
+            for item in config.chat_models
+        ],
         "gemini_configured": bool(config.gemini_api_key),
         "deepseek_configured": bool(config.deepseek_api_key),
         "onebot_url": config.onebot_url,

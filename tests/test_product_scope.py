@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -9,6 +10,9 @@ from src.commands import COMMANDS
 from src.config import Config
 from src.services.onebot_client import OneBotClient
 from src.services.search_service import SearchResult
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProductScopeTests(unittest.TestCase):
@@ -88,6 +92,17 @@ class ProductScopeTests(unittest.TestCase):
 
         internal_fetch.assert_called_once_with("https://example.com/page")
         self.assertEqual("true", enriched[0]["page_fetch_ok"])
+
+    def test_gemini_runtime_uses_native_stateless_generate_content(self):
+        source = (
+            ROOT / "src" / "services" / "gemini_client.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(":generateContent", source)
+        self.assertIn("x-goog-api-key", source)
+        self.assertNotIn("/openai/chat/completions", source)
+        self.assertNotIn("previous_interaction_id", source)
+        self.assertNotIn("interactions.create", source)
 
 
 if __name__ == "__main__":
