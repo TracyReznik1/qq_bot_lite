@@ -28,12 +28,20 @@ class DeepSeekClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> ChatResponse:
-        if not self._cfg.deepseek_api_key:
-            raise RuntimeError("DEEPSEEK_API_KEY is not configured")
-
+        model_name = str(model or "").strip()
+        if not model_name:
+            raise RuntimeError("DeepSeek model is not configured")
+        clean_messages = [
+            {
+                key: value
+                for key, value in message.items()
+                if key != "_provider_context"
+            }
+            for message in messages
+        ]
         payload: dict[str, Any] = {
-            "model": model or self._cfg.deepseek_model,
-            "messages": messages,
+            "model": model_name,
+            "messages": clean_messages,
             "temperature": temperature,
         }
         if max_tokens is not None:

@@ -10,10 +10,11 @@ from typing import Any
 
 @dataclass
 class ChatResponse:
-    """Unified chat-completion response from any provider."""
+    """Unified response plus optional current-turn provider protocol state."""
 
     content: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    provider_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

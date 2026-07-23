@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -155,17 +156,35 @@ def normalize_tool_query(name: str, query: str, fallback: str) -> str:
     return fallback_normalized or str(query or fallback).strip()
 
 
-def build_tool_messages(tool_calls: list[dict[str, Any]], fallback_query: str) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {"role": "assistant", "content": None, "tool_calls": tool_calls}
-    ]
+def build_tool_messages(
+    tool_calls: list[dict[str, Any]],
+    fallback_query: str,
+    provider_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": tool_calls,
+    }
+    if provider_context is not None:
+        assistant_message["_provider_context"] = copy.deepcopy(
+            provider_context
+        )
+
+    messages: list[dict[str, Any]] = [assistant_message]
     for index, tool_call in enumerate(tool_calls, 1):
         name = tool_function_name(tool_call)
-        query = normalize_tool_query(name, tool_call_query(tool_call, ""), fallback_query)
+        query = normalize_tool_query(
+            name,
+            tool_call_query(tool_call, ""),
+            fallback_query,
+        )
         messages.append(
             {
                 "role": "tool",
-                "tool_call_id": str(tool_call.get("id") or f"{name}_{index}"),
+                "tool_call_id": str(
+                    tool_call.get("id") or f"{name}_{index}"
+                ),
                 "name": name,
                 "content": run_tool(name, query),
             }
@@ -291,7 +310,13 @@ def generate_reply(
             if not tool_calls:
                 needs_final_summary = False
                 break
-            messages.extend(build_tool_messages(tool_calls, text or "图片内容"))
+            messages.extend(
+                build_tool_messages(
+                    tool_calls,
+                    text or "图片内容",
+                    provider_context=response.provider_context,
+                )
+            )
             needs_final_summary = True
 
         if needs_final_summary:
