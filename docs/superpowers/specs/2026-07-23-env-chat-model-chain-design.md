@@ -247,7 +247,17 @@ x-goog-api-key: GEMINI_API_KEY
 - 内部 `tool_choice="auto"` 转换为 Gemini `toolConfig.functionCallingConfig.mode = "AUTO"`。
 - Gemini 返回的 `functionCall` Part 转换回项目现有 `ChatResponse.tool_calls` 结构。
 - 内部 assistant tool call 与 `role="tool"` 结果转换为 Gemini 的 `functionCall` 和 `functionResponse` Parts。
-- 如果 Gemini 原生函数调用没有项目内部需要的 call ID，适配器生成只在当前本地调用链内使用的稳定 ID；回传 Gemini 时按原生协议使用函数名和结果，不把该内部 ID 当作远端会话状态。
+- Gemini 返回的原始 model Content 会作为短生命周期 provider context 随工具调用保留，第二次 Gemini 请求必须原样回传其中的 Part 顺序、函数调用 ID 和 `thoughtSignature`。
+- `functionResponse` 使用 Gemini 返回的原始函数调用 ID；如果旧模型没有返回 ID，则只使用函数名关联。
+- 如果工具调用来自 DeepSeek，后续回退到 Gemini 时没有 Gemini `thoughtSignature`，适配器按 Google 官方跨模型上下文指导为重建的首个 `functionCall` 使用 `skip_thought_signature_validator` 哑签名。
+- provider context 只存在于当前 `generate_reply()` 工具循环，不写入聊天历史、记忆或 JSON 文件。
+
+Gemini 3 在函数调用时强制要求原样回传 thought signature，否则第二次请求会收到 4xx 校验错误。REST 适配器不能只保留函数名和参数，也不能合并带签名和不带签名的 Part。
+
+官方参考：
+
+- <https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures>
+- <https://ai.google.dev/gemini-api/docs/generate-content/function-calling>
 
 #### 生成参数和响应
 
@@ -258,7 +268,15 @@ x-goog-api-key: GEMINI_API_KEY
 - 安全拦截、空 Candidate、无文本且无函数调用等结构化异常转换为明确的运行时错误，使外层模型链可以继续回退。
 - HTTP 429、5xx、连接失败和超时继续使用现有回退判断。
 
-### 6.5 `run_bot.py`
+### 6.5 Provider-neutral tool context
+
+`ChatResponse` 新增可选的 `provider_context` 字段。它只承载当前工具调用回合所需的原生响应片段，不改变用户可见回答和持久化历史格式。
+
+`chat_service.build_tool_messages()` 将 provider context 放入临时 assistant 消息的私有字段。Gemini 客户端识别并原样恢复自己的原生 Content；DeepSeek 客户端在发送 OpenAI 兼容请求前移除该私有字段，避免把 Gemini 元数据发送给 DeepSeek。
+
+最终文本回复产生后，provider context 随本次局部 `messages` 列表释放。非函数调用文本 Part 上的 thought signature 不持久化；官方仅建议而不强制回传这类签名，项目继续以提供商无关的文本历史作为跨轮上下文。
+
+### 6.6 `run_bot.py`
 
 启动入口捕获 `ModelConfigurationError`：
 
@@ -269,7 +287,7 @@ x-goog-api-key: GEMINI_API_KEY
 
 由于当前全局 `Config` 在导入 `src.main` 时初始化，`run_bot.py` 需要在导入主模块的边界捕获该专用异常。
 
-### 6.6 健康检查
+### 6.7 健康检查
 
 `/health` 增加不含秘密的模型链信息，例如：
 
@@ -321,7 +339,7 @@ x-goog-api-key: GEMINI_API_KEY
 - `README.md`：更新最小配置、完整参数表、模型回退说明、Gemini 原生接口、错误排查和迁移示例。
 - 文档一致性测试：继续从运行时代码提取环境变量集合，不硬编码变量数量。
 
-README 当前存在用户尚未提交的修改。实施时必须保留并合并这些修改，不得整体覆盖该文件。
+Git 当前将 README 标为已修改，但其内容哈希与 `HEAD` 相同，属于元数据状态。实施前必须再次核对哈希；若内容已实际变化，应停止并询问如何保留用户修改，不得整体覆盖该文件。
 
 真实 `.env` 不在本设计阶段修改。后续实施也只有在用户明确授权后才能迁移真实 `.env`。
 
@@ -361,6 +379,10 @@ README 当前存在用户尚未提交的修改。实施时必须保留并合并�
 - `tool_choice` 正确转换为原生函数调用配置。
 - 原生 `functionCall` 正确转换为内部工具调用。
 - 内部工具结果正确转换为 `functionResponse`。
+- Gemini 原始函数调用 Part、ID 和 `thoughtSignature` 在工具结果请求中原样回传。
+- 并行函数调用保持原始 Part 顺序，不给每个 Part 错误复制签名。
+- DeepSeek 工具调用回退到 Gemini 时使用官方哑签名，不伪造真实签名。
+- DeepSeek 请求体不包含 Gemini provider context。
 - 多个文本 Part 和多个函数调用 Part 正确解析。
 - 安全拦截、空 Candidate 和损坏响应触发回退，不产生原始 Key 或请求体日志。
 - 请求体不再包含 OpenAI `messages`、`model` 或 `tools[].function` 结构。
@@ -394,6 +416,7 @@ README 当前存在用户尚未提交的修改。实施时必须保留并合并�
 - 日志和错误信息不泄露秘密。
 - 旧模型选择变量完全退出运行时和用户文档。
 - Gemini 使用原生 `generateContent` 请求、原生 API Key 请求头和原生消息/工具格式。
+- Gemini 函数调用往返完整保留强制的 thought signature 和原始函数调用 ID。
 - Gemini 与 DeepSeek 继续共享同一份本地权威历史，模型回退不依赖远端会话 ID。
 - 现有聊天、网页搜索、图片理解、记忆和多会话并发行为不回退。
 - `.env.example`、README 和运行时环境变量保持一致。
@@ -405,6 +428,7 @@ README 当前存在用户尚未提交的修改。实施时必须保留并合并�
 - 不让用户手工声明工具或图片能力。
 - 不使用 Gemini Interactions API、`previous_interaction_id` 或服务端会话状态。
 - 不新增 Google GenAI SDK 依赖。
+- 不把 Gemini thought signature 持久化为跨轮聊天历史；只在当前函数调用回合按协议原样回传。
 - 不加入流式输出、后台执行或托管 Agent。
 - 不增加运行时命令来动态切换模型。
 - 不提供旧模型变量的兼容层。
