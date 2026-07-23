@@ -28,6 +28,8 @@ class DeepSeekClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> ChatResponse:
+        if not self._cfg.deepseek_api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY is not configured")
         model_name = str(model or "").strip()
         if not model_name:
             raise RuntimeError("DeepSeek model is not configured")

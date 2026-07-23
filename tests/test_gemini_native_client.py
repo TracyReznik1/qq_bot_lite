@@ -543,5 +543,20 @@ class ProviderContextBoundaryTests(unittest.TestCase):
         )
 
 
+    def test_deepseek_rejects_empty_api_key(self):
+        cfg = SimpleNamespace(
+            deepseek_api_key="",
+            deepseek_url="https://api.deepseek.com/chat/completions",
+            proxies=None,
+            request_timeout=18,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            DeepSeekClient(cfg).chat(
+                [{"role": "user", "content": "hi"}],
+                model="deepseek-test",
+            )
+        self.assertIn("DEEPSEEK_API_KEY", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
