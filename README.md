@@ -71,15 +71,29 @@ python run_bot.py
 
 ## 最小 `.env` 配置
 
-先复制 `.env.example`，再选择一套模型。模型链实际使用的 Gemini / DeepSeek API Key 必须填写；`ONEBOT_ACCESS_TOKEN` 仅在 OneBot HTTP API 开启鉴权时填写；`CALLBACK_SECRET` 推荐设置，启用后必须与 OneBot 回调端保持一致。下面的占位符不要照抄。
+先复制 `.env.example`，再通过 `CHAT_MODELS` 配置模型链。模型链引用的每个提供商（`gemini` 或 `deepseek`）都必须填写对应 API Key；`ONEBOT_ACCESS_TOKEN` 仅在 OneBot HTTP API 开启鉴权时填写；`CALLBACK_SECRET` 推荐设置，启用后必须与 OneBot 回调端保持一致。下面的占位符不要照抄。
 
 Gemini 示例：
 
 ```dotenv
 BOT_NAME=qqbot
 BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
-GEMINI_API_KEY=替换为你的_Gemini_Key
-LLM_PRIMARY_PROVIDER=gemini
+CHAT_MODELS=gemini:填写账号可用的模型名
+GEMINI_API_KEY=填写你的_Gemini_Key
+GEMINI_URL=https://generativelanguage.googleapis.com/v1
+ONEBOT_API_URL=http://127.0.0.1:3000
+ONEBOT_ACCESS_TOKEN=
+CALLBACK_SECRET=
+```
+
+Gemini 带 DeepSeek 回退示例：
+
+```dotenv
+BOT_NAME=qqbot
+BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
+CHAT_MODELS=gemini:填写主模型名,deepseek:填写回退模型名
+GEMINI_API_KEY=填写你的_Gemini_Key
+DEEPSEEK_API_KEY=填写你的_DeepSeek_Key
 ONEBOT_API_URL=http://127.0.0.1:3000
 ONEBOT_ACCESS_TOKEN=
 CALLBACK_SECRET=
@@ -90,8 +104,8 @@ DeepSeek 示例：
 ```dotenv
 BOT_NAME=qqbot
 BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
-DEEPSEEK_API_KEY=替换为你的_DeepSeek_Key
-LLM_PRIMARY_PROVIDER=deepseek
+CHAT_MODELS=deepseek:填写账号可用的模型名
+DEEPSEEK_API_KEY=填写你的_DeepSeek_Key
 ONEBOT_API_URL=http://127.0.0.1:3000
 ONEBOT_ACCESS_TOKEN=
 CALLBACK_SECRET=
@@ -139,30 +153,20 @@ CALLBACK_SECRET=
 
 | 参数 | 必需性 | 源码默认值 | 作用与配置方法 |
 |---|---|---|---|
-| `GEMINI_API_KEY` | 条件必需 | 空 | Gemini 模型使用的 Bearer Key；模型链包含 Gemini 时应配置。 |
-| `GEMINI_MODEL` | 可选 | `gemini-3.1-flash-lite` | Gemini 默认模型；主模型未单独指定时使用。模型名必须是账号实际可用的名称。 |
-| `GEMINI_URL` | 可选 | `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions` | Gemini 的 OpenAI 兼容聊天端点。 |
-| `DEEPSEEK_API_KEY` | 条件必需 | 空 | DeepSeek API Key；模型链包含 DeepSeek 时应配置。 |
-| `DEEPSEEK_MODEL` | 可选 | `deepseek-v4-flash` | DeepSeek 默认模型；主模型未单独指定时使用。模型名必须与服务端一致。 |
+| `GEMINI_API_KEY` | 条件必需 | 空 | Gemini Developer API 密钥；模型链包含 Gemini 时必须配置。 |
+| `GEMINI_URL` | 可选 | `https://generativelanguage.googleapis.com/v1` | Gemini Developer API 基础地址；客户端会追加 `/models/{model}:generateContent`。不要填写旧 `/openai/chat/completions` 地址。 |
+| `DEEPSEEK_API_KEY` | 条件必需 | 空 | DeepSeek API Key；模型链包含 DeepSeek 时必须配置。 |
 | `DEEPSEEK_URL` | 可选 | `https://api.deepseek.com/chat/completions` | DeepSeek 的 OpenAI 兼容聊天端点。 |
-
-至少配置 `GEMINI_API_KEY` 或 `DEEPSEEK_API_KEY` 之一；若模型链还包含另一提供商但没有它的 Key，该项会被跳过。
 
 ### 模型链
 
 | 参数 | 必需性 | 源码默认值 | 作用与配置方法 |
 |---|---|---|---|
-| `LLM_PROVIDER` | 兼容项 | 空 | 仅当 `LLM_PRIMARY_PROVIDER` **缺失**时，为旧配置提供主提供商兜底。复制完整模板后应直接改后者。 |
-| `LLM_PRIMARY_PROVIDER` | 可选 | `gemini` | 主提供商，支持 `gemini` 或 `deepseek`。 |
-| `LLM_PRIMARY_MODEL` | 可选 | 空 | 主模型覆盖值；为空时按主提供商采用 `GEMINI_MODEL` 或 `DEEPSEEK_MODEL`。 |
-| `LLM_FALLBACK_1_PROVIDER` | 可选 | `gemini` | 第 1 回退提供商；设为空可禁用该槽位。 |
-| `LLM_FALLBACK_1_MODEL` | 可选 | `gemma-4-26b-a4b-it` | 第 1 回退模型。 |
-| `LLM_FALLBACK_2_PROVIDER` | 可选 | `deepseek` | 第 2 回退提供商；设为空可禁用该槽位。 |
-| `LLM_FALLBACK_2_MODEL` | 可选 | `deepseek-v4-flash` | 第 2 回退模型。 |
-| `LLM_FALLBACK_3_PROVIDER` | 可选 | `deepseek` | 第 3 回退提供商；设为空可禁用该槽位。 |
-| `LLM_FALLBACK_3_MODEL` | 可选 | `deepseek-v4-pro` | 第 3 回退模型。 |
+| `CHAT_MODELS` | 必需 | 无 | 对话模型链，格式为 `提供商:模型名`；第一个是主模型，后续依次回退。支持 `gemini` 和 `deepseek`，列出的每个提供商都必须配置对应 API Key。 |
 
-实际顺序是主模型 → fallback 1 → fallback 2 → fallback 3，相同的“提供商 + 模型”组合会保序去重。缺 Key、网络错误、限流、服务端错误、无效或空响应等会继续尝试下一项；全部失败时返回“所有模型暂时不可用”。
+模型按照 `CHAT_MODELS` 从左到右尝试。重复的“提供商 + 模型名”只保留第一次；格式错误、未知提供商或对应 Key 缺失时，机器人会在启动阶段停止并给出中文错误。模型名是否存在及是否支持工具或图片由实际 API 响应决定。
+
+Gemini 使用原生无状态 `generateContent` REST API，DeepSeek 继续使用 OpenAI 兼容端点，两者共享同一份本地会话历史。
 
 模型能力不会由配置自动补齐：普通聊天会向模型提供唯一工具 `search_web`，不支持工具调用的模型会在该轮跳过；当前默认明确把 `gemma-4-26b-a4b-it` 标为不支持工具。显式 `/search` 先搜索再让模型整理，不要求模型调用工具。图片请求会沿模型链尝试，但图片理解能力仍取决于模型和端点；全部不能处理时会提示当前模型无法识别图片。
 
@@ -244,6 +248,14 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 
 通常是 `.env` 中引号没有成对、把多行角色设定写成了多个裸行，或混入了不合法的赋值。对照 `.env.example`，让每项保持 `KEY=value`；多行 `BOT_PERSONA` 使用上文的成对双引号，然后重启。
 
+### `CHAT_MODELS` 配置错误
+
+确认使用英文逗号分隔模型，并使用第一个英文冒号分隔提供商和模型名，例如 `gemini:模型名,deepseek:模型名`。不支持 Gemini、DeepSeek 之外的提供商。
+
+### Gemini 返回 404 或模型不存在
+
+确认 `GEMINI_URL=https://generativelanguage.googleapis.com/v1`，并确认 `CHAT_MODELS` 中的 Gemini 模型名确实对当前账号开放。不要把旧 OpenAI 兼容端点填入 `GEMINI_URL`。
+
 ### 401 Unauthorized
 
 这通常发生在 qqbot → OneBot 请求方向：`ONEBOT_ACCESS_TOKEN` 与 OneBot HTTP API 的令牌不一致，或 OneBot 要求令牌但本地留空。统一两边的值并重启。若是 OneBot → qqbot 的 `CALLBACK_SECRET` 不匹配，本项目回调入口返回 403，应检查回调请求头。
@@ -283,8 +295,7 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 
 ```powershell
 # 全部 unittest
-$env:BOT_NAME='qqbot'
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -t . -v
 
 # 语法编译检查
 python -m compileall -q src tests run_bot.py

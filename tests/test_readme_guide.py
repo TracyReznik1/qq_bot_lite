@@ -147,6 +147,41 @@ class ReadmeGuideTests(unittest.TestCase):
         self.assertIn("### 401 Unauthorized", faq)
         self.assertIn("qqbot → OneBot 请求方向：`ONEBOT_ACCESS_TOKEN`", faq)
 
+    def test_readme_documents_chat_models_and_native_gemini(self):
+        reference = readme_section(
+            self.readme,
+            "完整 `.env` 参数参考",
+        )
+        self.assertIn("`CHAT_MODELS`", reference)
+        self.assertIn(
+            "https://generativelanguage.googleapis.com/v1",
+            self.readme,
+        )
+        self.assertIn("generateContent", self.readme)
+        self.assertIn(
+            "CHAT_MODELS=gemini:",
+            self.readme,
+        )
+
+    def test_operator_docs_remove_old_model_variables(self):
+        env_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        combined = self.readme + "\n" + env_example
+        for old_name in (
+            "GEMINI_MODEL",
+            "DEEPSEEK_MODEL",
+            "LLM_PROVIDER",
+            "LLM_PRIMARY_PROVIDER",
+            "LLM_PRIMARY_MODEL",
+            "LLM_FALLBACK_1_PROVIDER",
+            "LLM_FALLBACK_1_MODEL",
+            "LLM_FALLBACK_2_PROVIDER",
+            "LLM_FALLBACK_2_MODEL",
+            "LLM_FALLBACK_3_PROVIDER",
+            "LLM_FALLBACK_3_MODEL",
+        ):
+            with self.subTest(old_name=old_name):
+                self.assertNotIn(old_name, combined)
+
 
 if __name__ == "__main__":
     unittest.main()
