@@ -38,6 +38,8 @@ def _model_supports_tools(provider: str, model_name: str) -> bool:
     key = model_name.lower()
     if key in _MODEL_CAPABILITIES:
         return _MODEL_CAPABILITIES[key]
+    if "reasoner" in key or "r1" in key:
+        return False
     # For providers not in the deny-list we assume tool support.
     return True
 

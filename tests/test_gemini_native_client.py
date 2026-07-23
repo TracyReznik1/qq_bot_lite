@@ -557,6 +557,14 @@ class ProviderContextBoundaryTests(unittest.TestCase):
             )
         self.assertIn("DEEPSEEK_API_KEY", str(ctx.exception))
 
+    def test_model_supports_tools_filters_reasoner_and_r1_models(self):
+        from src.services.llm_client import _model_supports_tools
+        self.assertFalse(_model_supports_tools("deepseek", "deepseek-reasoner"))
+        self.assertFalse(_model_supports_tools("deepseek", "deepseek-r1"))
+        self.assertFalse(_model_supports_tools("gemini", "gemma-4-26b-a4b-it"))
+        self.assertTrue(_model_supports_tools("gemini", "gemini-3.1-flash-lite"))
+        self.assertTrue(_model_supports_tools("deepseek", "deepseek-v4-flash"))
+
 
 if __name__ == "__main__":
     unittest.main()
