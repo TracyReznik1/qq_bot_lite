@@ -5,6 +5,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+from src.model_config import (
+    ConfiguredModel,
+    parse_chat_models,
+    validate_model_configuration,
+)
+
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
@@ -60,37 +67,45 @@ class Config:
     bot_persona: str = field(
         default_factory=lambda: env_text("BOT_PERSONA", DEFAULT_BOT_PERSONA)
     )
-    # ── Gemini / Google AI Studio ──
-    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    gemini_url: str = os.getenv(
-        "GEMINI_URL",
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    # ── Gemini / Google AI Studio native API ──
+    gemini_api_key: str = field(
+        default_factory=lambda: os.getenv("GEMINI_API_KEY", "").strip()
+    )
+    gemini_url: str = field(
+        default_factory=lambda: os.getenv(
+            "GEMINI_URL",
+            "https://generativelanguage.googleapis.com/v1",
+        ).rstrip("/")
     )
 
     # ── DeepSeek ──
-    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
-    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-    deepseek_url: str = os.getenv(
-        "DEEPSEEK_URL", "https://api.deepseek.com/chat/completions"
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "").strip()
+    )
+    deepseek_url: str = field(
+        default_factory=lambda: os.getenv(
+            "DEEPSEEK_URL",
+            "https://api.deepseek.com/chat/completions",
+        ).strip()
     )
 
-    # ── LLM provider chain ──
-    # Backward compatibility: LLM_PROVIDER=deepseek  →  primary = deepseek
-    # If LLM_PROVIDER is set (non-empty), it overrides LLM_PRIMARY_PROVIDER.
-    _llm_provider_compat: str = os.getenv("LLM_PROVIDER", "").strip().lower()
-    llm_primary_provider: str = os.getenv(
-        "LLM_PRIMARY_PROVIDER",
-        _llm_provider_compat if _llm_provider_compat else "gemini",
-    ).strip().lower()
-    llm_primary_model: str = os.getenv("LLM_PRIMARY_MODEL", "").strip()
+    _chat_models_raw: str = field(
+        default_factory=lambda: os.getenv("CHAT_MODELS", ""),
+        repr=False,
+    )
+    chat_models: tuple[ConfiguredModel, ...] = field(init=False)
 
-    llm_fallback_1_provider: str = os.getenv("LLM_FALLBACK_1_PROVIDER", "gemini").strip().lower()
-    llm_fallback_1_model: str = os.getenv("LLM_FALLBACK_1_MODEL", "gemma-4-26b-a4b-it").strip()
-    llm_fallback_2_provider: str = os.getenv("LLM_FALLBACK_2_PROVIDER", "deepseek").strip().lower()
-    llm_fallback_2_model: str = os.getenv("LLM_FALLBACK_2_MODEL", "deepseek-v4-flash").strip()
-    llm_fallback_3_provider: str = os.getenv("LLM_FALLBACK_3_PROVIDER", "deepseek").strip().lower()
-    llm_fallback_3_model: str = os.getenv("LLM_FALLBACK_3_MODEL", "deepseek-v4-pro").strip()
+    def __post_init__(self) -> None:
+        models = parse_chat_models(self._chat_models_raw)
+        validate_model_configuration(
+            models,
+            provider_api_keys={
+                "gemini": self.gemini_api_key,
+                "deepseek": self.deepseek_api_key,
+            },
+            gemini_url=self.gemini_url,
+        )
+        object.__setattr__(self, "chat_models", models)
     onebot_url: str = os.getenv("ONEBOT_API_URL", "http://127.0.0.1:3000").rstrip("/")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
     callback_secret: str = os.getenv("CALLBACK_SECRET", "")

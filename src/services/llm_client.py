@@ -184,57 +184,20 @@ class FallbackLLMClient:
 # ── chain builder ──────────────────────────────────────────────────────
 
 def _build_chain(cfg=None) -> list[LLMModelSpec]:
-    """Build the ordered model chain from ``Config``."""
+    """Build the exact ordered chain validated by Config."""
     if cfg is None:
         cfg = config
-    chain: list[LLMModelSpec] = []
-
-    # Primary
-    primary_model = cfg.llm_primary_model
-    if not primary_model:
-        if cfg.llm_primary_provider == "gemini":
-            primary_model = cfg.gemini_model
-        elif cfg.llm_primary_provider == "deepseek":
-            primary_model = cfg.deepseek_model
-        else:
-            primary_model = cfg.gemini_model
-    chain.append(
+    return [
         LLMModelSpec(
-            provider=cfg.llm_primary_provider,
-            model=primary_model,
+            provider=item.provider,
+            model=item.model,
             supports_tools=_model_supports_tools(
-                cfg.llm_primary_provider, primary_model
+                item.provider,
+                item.model,
             ),
         )
-    )
-
-    # Fallback slots — only add when provider is non-empty
-    for fb_provider_attr, fb_model_attr in (
-        ("llm_fallback_1_provider", "llm_fallback_1_model"),
-        ("llm_fallback_2_provider", "llm_fallback_2_model"),
-        ("llm_fallback_3_provider", "llm_fallback_3_model"),
-    ):
-        provider = getattr(cfg, fb_provider_attr, "").strip()
-        model_name = getattr(cfg, fb_model_attr, "").strip()
-        if not provider:
-            continue
-        chain.append(
-            LLMModelSpec(
-                provider=provider,
-                model=model_name,
-                supports_tools=_model_supports_tools(provider, model_name),
-            )
-        )
-
-    # Deduplicate while preserving order
-    seen: set[tuple[str, str]] = set()
-    deduped: list[LLMModelSpec] = []
-    for spec in chain:
-        key = (spec.provider, spec.model)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(spec)
-    return deduped
+        for item in cfg.chat_models
+    ]
 
 
 # ── singleton accessor ─────────────────────────────────────────────────

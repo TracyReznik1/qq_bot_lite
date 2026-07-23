@@ -14,7 +14,12 @@ WAIT_TIMEOUT = 2
 
 
 def config_with(value: str | None) -> Config:
-    environment = {} if value is None else {"MESSAGE_WORKERS": value}
+    environment = {
+        "CHAT_MODELS": "gemini:test-gemini",
+        "GEMINI_API_KEY": "test-gemini-key",
+    }
+    if value is not None:
+        environment["MESSAGE_WORKERS"] = value
     with mock.patch.dict(os.environ, environment, clear=True):
         return Config()
 
