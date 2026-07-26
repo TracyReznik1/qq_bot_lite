@@ -42,6 +42,17 @@ def build_message_dedupe_key(data: dict[str, Any], message_id: Any) -> str:
     )
 
 
+_sequence_lock = Lock()
+_sequence_counter = 0
+
+
+def next_qqbot_sequence() -> int:
+    global _sequence_counter
+    with _sequence_lock:
+        _sequence_counter += 1
+        return _sequence_counter
+
+
 class MessageQueue:
     def __init__(self, max_workers: int = 4, max_processed_message_ids: int = 500):
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="qq-message")
@@ -74,6 +85,9 @@ class MessageQueue:
         session_key = get_event_session_key(data)
         if session_key is None:
             return
+
+        if "_qqbot_sequence" not in data:
+            data["_qqbot_sequence"] = next_qqbot_sequence()
 
         should_start_worker = False
         with self.session_queue_lock:

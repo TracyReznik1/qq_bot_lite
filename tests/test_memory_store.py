@@ -390,7 +390,7 @@ class MemoryStoreTests(unittest.TestCase):
         job_id, _ = self.store.create_job(event)
         job = self.store.get_job(job_id)
 
-        self.assertEqual("group:30003:10001", job.scope_key)
+        self.assertEqual("group:30003", job.scope_key)
         self.assertEqual(event.context, job.context)
         self.assertEqual(event.message_id, job.message_id)
         self.assertEqual(event.text, job.text)
@@ -438,10 +438,10 @@ class MemoryStoreTests(unittest.TestCase):
         self.store.mark_job_ready(first_id)
         self.store.mark_job_ready(second_id)
 
-        first = self.store.claim_next_job("group:30003:10001")
-        second = self.store.claim_next_job("group:30003:20002")
-
+        first = self.store.claim_next_job("group:30003")
         self.assertEqual(first_id, first.id)
+        self.store.complete_job(first_id)
+        second = self.store.claim_next_job("group:30003")
         self.assertEqual(second_id, second.id)
 
     def test_recovers_abandoned_running_jobs_after_reopen(self):

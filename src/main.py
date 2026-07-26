@@ -17,6 +17,8 @@ from src.messaging import (
     get_event_session_key,
     mark_message_seen,
 )
+from src.memory.models import MemoryContext, MemoryEvent
+from src.memory.service import get_memory_service
 from src.router import route_message
 from src.services.image_input_service import (
     ImageInputError,
@@ -73,6 +75,7 @@ def startup() -> None:
                 config.memory_limit,
             )
         migrate_legacy_memory_files()
+        get_memory_service().start()
         _startup_initialized = True
 
 
@@ -222,19 +225,41 @@ def process_message(data: dict[str, Any]) -> None:
                 send_reply(target_id, result.reply, is_group)
             return
 
-        logger.info("Generating chat reply session_key=%s is_group=%s", session_key, is_group)
-        image_data_urls = load_chat_images(
-            parsed_message.image_urls,
-            image_file_ids=parsed_message.image_file_ids,
-            image_url_resolver=onebot.get_image_url,
+        mem_ctx = MemoryContext(
+            user_id=uid,
+            session_key=session_key,
+            is_group=is_group,
+            group_id=str(data.get("group_id")) if is_group else None,
         )
-        reply = generate_reply(
-            session_key,
-            parsed_message.text,
-            image_data_urls=image_data_urls,
+        mem_event = MemoryEvent(
+            context=mem_ctx,
+            message_id=str(data.get("message_id") or ""),
+            sequence=int(data.get("_qqbot_sequence") or 0),
+            text=parsed_message.text,
+            image_count=len(parsed_message.image_urls),
+            mentioned_qq_ids=tuple(str(qid) for qid in data.get("mentioned_qq_ids") or ()),
+            reply_to_message_id=str(data.get("reply_to_message_id")) if data.get("reply_to_message_id") else None,
+            reply_to_user_id=str(data.get("reply_to_user_id")) if data.get("reply_to_user_id") else None,
         )
-        logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
-        send_reply(target_id, reply, is_group)
+        job_id = get_memory_service().stage_event(mem_event)
+        image_data_urls: list[str] = []
+
+        try:
+            logger.info("Generating chat reply session_key=%s is_group=%s", session_key, is_group)
+            image_data_urls = load_chat_images(
+                parsed_message.image_urls,
+                image_file_ids=parsed_message.image_file_ids,
+                image_url_resolver=onebot.get_image_url,
+            )
+            reply = generate_reply(
+                session_key,
+                parsed_message.text,
+                image_data_urls=image_data_urls,
+            )
+            logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
+            send_reply(target_id, reply, is_group)
+        finally:
+            get_memory_service().release_job(job_id, image_data_urls)
     except ImageInputError as error:
         send_reply(target_id, str(error), is_group)
     except ImageRecognitionUnavailable as error:

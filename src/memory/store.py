@@ -257,9 +257,26 @@ class MemoryStore:
             ).fetchone()
         return int(row["version"] or 0)
 
+    def integrity_check(self) -> str:
+        with self._connection() as connection:
+            row = connection.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row else "failed"
+
+    def cleanup_old_jobs_and_excerpts(self, days: int = 90) -> int:
+        cutoff = _utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET payload_json = '{}'
+                WHERE state = 'done'
+                """
+            )
+            return cursor.rowcount
+
     def create_job(self, event: MemoryEvent) -> tuple[int, bool]:
         scope_type, scope_id = event.context.primary_scope
-        scope_key = event.context.session_key
+        scope_key = f"{scope_type}:{scope_id}"
         dedupe_key = hashlib.sha256(
             f"{scope_type}:{scope_id}\0{event.message_id}".encode("utf-8")
         ).hexdigest()
@@ -320,15 +337,16 @@ class MemoryStore:
         return _job_from_row(row)
 
     def mark_job_ready(self, job_id: int) -> None:
-        self._transition_job(
-            job_id,
-            """
-            UPDATE memory_jobs
-            SET state = 'ready', retry_at = NULL, error_type = NULL,
-                updated_at = ?
-            WHERE id = ? AND state IN ('staged', 'retry')
-            """,
-        )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'ready', retry_at = NULL, error_type = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state IN ('staged', 'ready', 'retry')
+                """,
+                (_utc_now(), job_id),
+            )
 
     def claim_next_job(self, scope_key: str) -> MemoryJob | None:
         timestamp = _utc_now()
