@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 from src.memory.models import (
     MemoryClaim,
+    MemoryContext,
     MemoryEvidence,
     MemoryEvent,
     MemoryJob,
@@ -20,6 +21,7 @@ from src.memory.models import (
 
 SCHEMA_VERSION = 1
 MAX_SOURCE_EXCERPT_CHARS = 500
+PRIVACY_CHECKPOINT_TIMEOUT_MS = 250
 _DATA_URL_PATTERN = re.compile(
     r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+",
     re.IGNORECASE,
@@ -28,17 +30,60 @@ _BARE_IMAGE_BASE64_PATTERN = re.compile(
     r"(?:iVBORw0KGgo|/9j/|R0lGOD(?:lh|dh)|UklGR)[a-z0-9+/=\r\n]{12,}",
     re.IGNORECASE,
 )
-_SECRET_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|secret|access[_-]?token|password|passwd|credential)"
-    r"\b\s*[:=]\s*[^\s,;，；]+"
+_GENERIC_BASE64_PATTERN = re.compile(
+    r"(?<![a-z0-9+/])[a-z0-9+/]{48,}={0,2}(?![a-z0-9+/=])",
+    re.IGNORECASE,
 )
-_SECRET_TOKEN_PATTERN = re.compile(r"\bsk-[a-z0-9_-]{8,}\b", re.IGNORECASE)
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [^-\r\n]*PRIVATE KEY-----"
+    r".*?"
+    r"-----END [^-\r\n]*PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
+_BEARER_PATTERN = re.compile(
+    r"\bBearer\s+[a-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+_PAYMENT_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?:\b(?:payment[_ -]?(?:token|credential)|cvv|cvc)\b"
+    r"|支付凭据|支付密码|银行卡号)"
+    r"\s*(?:[:=：]|\bis\b|是|为)\s*[^\s,;，；]+"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?:\b(?:api[_ -]?key|secret|access[_ -]?token|token|password|"
+    r"passwd|credential|cookie|otp|verification[_ -]?code|authorization)\b"
+    r"|api\s*密钥|密钥|密码|口令|验证码|校验码)"
+    r"\s*(?:[:=：]|\bis\b|是|为)\s*[^\s,;，；]+"
+)
+_SECRET_TOKEN_PATTERN = re.compile(
+    r"\b(?:sk-[a-z0-9_-]{8,}|gh[pousr]_[a-z0-9]{20,}|AKIA[A-Z0-9]{16})\b",
+    re.IGNORECASE,
+)
 _PAYMENT_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _AUDIT_REASON_PATTERN = re.compile(r"[a-z][a-z0-9_.:-]{0,63}")
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _format_utc(datetime.now(timezone.utc))
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _normalize_retry_at(value: str) -> str:
+    candidate = value.strip()
+    if candidate.endswith(("Z", "z")):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        raise ValueError(
+            "retry_at must be a valid timezone-aware ISO timestamp"
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("retry_at must include a timezone offset")
+    return _format_utc(parsed)
 
 
 def _passes_luhn(value: str) -> bool:
@@ -57,10 +102,17 @@ def _passes_luhn(value: str) -> bool:
 
 
 def _redact_forbidden_payload_data(text: str) -> str:
+    text = _PRIVATE_KEY_PATTERN.sub("[redacted:credential]", text)
     text = _DATA_URL_PATTERN.sub("[redacted:image-data]", text)
     text = _BARE_IMAGE_BASE64_PATTERN.sub("[redacted:image-data]", text)
-    text = _SECRET_ASSIGNMENT_PATTERN.sub(
-        lambda match: f"{match.group(1)}=[redacted:credential]",
+    text = _GENERIC_BASE64_PATTERN.sub("[redacted:image-data]", text)
+    text = _BEARER_PATTERN.sub("[redacted:credential]", text)
+    text = _PAYMENT_ASSIGNMENT_PATTERN.sub(
+        "[redacted:payment-data]",
+        text,
+    )
+    text = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
+        "[redacted:credential]",
         text,
     )
     text = _SECRET_TOKEN_PATTERN.sub("[redacted:credential]", text)
@@ -100,12 +152,13 @@ class MemoryStore:
             connection.execute("BEGIN IMMEDIATE")
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            connection.execute(
-                """
-                INSERT INTO memory_fts(memory_fts, rank)
-                VALUES ('secure-delete', 1)
-                """
-            )
+            if sqlite3.sqlite_version_info >= (3, 42, 0):
+                connection.execute(
+                    """
+                    INSERT INTO memory_fts(memory_fts, rank)
+                    VALUES ('secure-delete', 1)
+                    """
+                )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO schema_version(version, applied_at)
@@ -134,11 +187,17 @@ class MemoryStore:
 
     def create_job(self, event: MemoryEvent) -> tuple[int, bool]:
         scope_type, scope_id = event.context.primary_scope
-        scope_key = f"{scope_type}:{scope_id}"
+        scope_key = event.context.session_key
         dedupe_key = hashlib.sha256(
-            f"{scope_key}\0{event.message_id}".encode("utf-8")
+            f"{scope_type}:{scope_id}\0{event.message_id}".encode("utf-8")
         ).hexdigest()
         payload = {
+            "context": {
+                "user_id": event.context.user_id,
+                "session_key": event.context.session_key,
+                "is_group": event.context.is_group,
+                "group_id": event.context.group_id,
+            },
             "message_id": event.message_id,
             "sequence": event.sequence,
             "text": _redact_forbidden_payload_data(event.text),
@@ -203,21 +262,35 @@ class MemoryStore:
         timestamp = _utc_now()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            running = connection.execute(
+                """
+                SELECT 1
+                FROM memory_jobs
+                WHERE scope_key = ? AND state = 'running'
+                LIMIT 1
+                """,
+                (scope_key,),
+            ).fetchone()
+            if running is not None:
+                return None
             row = connection.execute(
                 """
-                SELECT id
+                SELECT id, state, retry_at
                 FROM memory_jobs
                 WHERE scope_key = ?
-                  AND (
-                    state = 'ready'
-                    OR (state = 'retry' AND retry_at IS NOT NULL AND retry_at <= ?)
-                  )
+                  AND state NOT IN ('done', 'failed')
                 ORDER BY sequence, id
                 LIMIT 1
                 """,
-                (scope_key, timestamp),
+                (scope_key,),
             ).fetchone()
             if row is None:
+                return None
+            if row["state"] == "staged":
+                return None
+            if row["state"] == "retry" and (
+                row["retry_at"] is None or row["retry_at"] > timestamp
+            ):
                 return None
             job_id = int(row["id"])
             connection.execute(
@@ -252,7 +325,10 @@ class MemoryStore:
         error_type: str,
         retry_at: str | None,
     ) -> None:
-        state = "retry" if retry_at is not None else "failed"
+        normalized_retry_at = (
+            None if retry_at is None else _normalize_retry_at(retry_at)
+        )
+        state = "retry" if normalized_retry_at is not None else "failed"
         timestamp = _utc_now()
         with self._connection() as connection:
             cursor = connection.execute(
@@ -261,10 +337,29 @@ class MemoryStore:
                 SET state = ?, retry_at = ?, error_type = ?, updated_at = ?
                 WHERE id = ? AND state = 'running'
                 """,
-                (state, retry_at, error_type, timestamp, job_id),
+                (state, normalized_retry_at, error_type, timestamp, job_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"memory job {job_id} is not running")
+
+    def recover_running_jobs(self, scope_key: str | None = None) -> int:
+        timestamp = _utc_now()
+        clauses = ["state = 'running'"]
+        parameters: list[Any] = [timestamp, timestamp]
+        if scope_key is not None:
+            clauses.append("scope_key = ?")
+            parameters.append(scope_key)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE memory_jobs
+                SET state = 'retry', retry_at = ?, error_type = 'abandoned',
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                parameters,
+            )
+        return cursor.rowcount
 
     def _transition_job(self, job_id: int, statement: str) -> None:
         with self._connection() as connection:
@@ -394,6 +489,8 @@ class MemoryStore:
     def delete_claim_physically(self, claim_id: int, *, reason: str) -> bool:
         if _AUDIT_REASON_PATTERN.fullmatch(reason) is None:
             raise ValueError("deletion reason must be a body-free audit code")
+        deleted = False
+        needs_checkpoint = False
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             exists = connection.execute(
@@ -401,23 +498,55 @@ class MemoryStore:
                 (claim_id,),
             ).fetchone()
             if exists is None:
-                return False
+                needs_checkpoint = (
+                    connection.execute(
+                        """
+                        SELECT 1
+                        FROM memory_deletion_audit
+                        WHERE claim_id = ?
+                        LIMIT 1
+                        """,
+                        (claim_id,),
+                    ).fetchone()
+                    is not None
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO memory_deletion_audit(claim_id, reason, deleted_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (claim_id, reason, _utc_now()),
+                )
+                connection.execute(
+                    "DELETE FROM memory_fts WHERE rowid = ?",
+                    (claim_id,),
+                )
+                connection.execute(
+                    "DELETE FROM memory_claims WHERE id = ?",
+                    (claim_id,),
+                )
+                connection.execute(
+                    "INSERT INTO memory_fts(memory_fts) VALUES ('optimize')"
+                )
+                deleted = True
+                needs_checkpoint = True
+        if needs_checkpoint:
+            self._checkpoint_wal()
+        return deleted
+
+    def _checkpoint_wal(self) -> None:
+        with self._connection() as connection:
             connection.execute(
-                """
-                INSERT INTO memory_deletion_audit(claim_id, reason, deleted_at)
-                VALUES (?, ?, ?)
-                """,
-                (claim_id, reason, _utc_now()),
+                f"PRAGMA busy_timeout = {PRIVACY_CHECKPOINT_TIMEOUT_MS}"
             )
-            connection.execute(
-                "DELETE FROM memory_fts WHERE rowid = ?",
-                (claim_id,),
+            result = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+        if result is not None and int(result[0]) != 0:
+            raise RuntimeError(
+                "active readers prevent physical memory deletion checkpoint"
             )
-            connection.execute(
-                "DELETE FROM memory_claims WHERE id = ?",
-                (claim_id,),
-            )
-        return True
 
     def add_evidence(
         self,
@@ -592,7 +721,54 @@ def _claim_from_row(row: sqlite3.Row) -> MemoryClaim:
 
 
 def _job_from_row(row: sqlite3.Row) -> MemoryJob:
-    return MemoryJob(**{field: row[field] for field in MemoryJob.__dataclass_fields__})
+    payload = json.loads(row["payload_json"])
+    context_data = payload.get("context")
+    if context_data is None:
+        context = _legacy_job_context(str(row["scope_key"]))
+    else:
+        context = MemoryContext(
+            user_id=str(context_data["user_id"]),
+            session_key=str(context_data["session_key"]),
+            is_group=bool(context_data["is_group"]),
+            group_id=(
+                None
+                if context_data.get("group_id") is None
+                else str(context_data["group_id"])
+            ),
+        )
+    return MemoryJob(
+        id=int(row["id"]),
+        dedupe_key=str(row["dedupe_key"]),
+        scope_key=str(row["scope_key"]),
+        sequence=int(row["sequence"]),
+        payload_json=str(row["payload_json"]),
+        context=context,
+        message_id=str(payload["message_id"]),
+        text=str(payload["text"]),
+        image_count=int(payload.get("image_count", 0)),
+        mentioned_qq_ids=tuple(
+            str(value) for value in payload.get("mentioned_qq_ids", ())
+        ),
+        reply_to_message_id=payload.get("reply_to_message_id"),
+        reply_to_user_id=payload.get("reply_to_user_id"),
+        state=str(row["state"]),
+        attempts=int(row["attempts"]),
+        retry_at=row["retry_at"],
+        error_type=row["error_type"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _legacy_job_context(scope_key: str) -> MemoryContext:
+    parts = scope_key.split(":")
+    is_group = parts[0] == "group"
+    return MemoryContext(
+        user_id="" if is_group else (parts[-1] if len(parts) > 1 else ""),
+        session_key=scope_key,
+        is_group=is_group,
+        group_id=parts[1] if is_group and len(parts) > 1 else None,
+    )
 
 
 def _evidence_from_row(row: sqlite3.Row) -> MemoryEvidence:

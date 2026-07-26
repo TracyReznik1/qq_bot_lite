@@ -81,6 +81,13 @@ class MemoryJob:
     scope_key: str
     sequence: int
     payload_json: str
+    context: MemoryContext
+    message_id: str
+    text: str
+    image_count: int
+    mentioned_qq_ids: tuple[str, ...]
+    reply_to_message_id: str | None
+    reply_to_user_id: str | None
     state: str
     attempts: int
     retry_at: str | None

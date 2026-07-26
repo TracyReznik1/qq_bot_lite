@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -32,6 +33,30 @@ def private_event(
         mentioned_qq_ids=("20002",),
         reply_to_message_id="previous-message",
         reply_to_user_id="20002",
+    )
+
+
+def group_event(
+    *,
+    user_id: str,
+    message_id: str,
+    sequence: int,
+    text: str = "群消息",
+) -> MemoryEvent:
+    return MemoryEvent(
+        context=MemoryContext(
+            user_id=user_id,
+            session_key=f"group:30003:{user_id}",
+            is_group=True,
+            group_id="30003",
+        ),
+        message_id=message_id,
+        sequence=sequence,
+        text=text,
+        image_count=2,
+        mentioned_qq_ids=("90009",),
+        reply_to_message_id="group-previous",
+        reply_to_user_id="80008",
     )
 
 
@@ -132,6 +157,7 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(
             {
+                "context",
                 "message_id",
                 "sequence",
                 "text",
@@ -149,6 +175,169 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertNotIn(bare_image_base64.lower(), serialized)
         self.assertNotIn("sk-secret-value", serialized)
         self.assertNotIn("4111 1111 1111 1111", serialized)
+
+    def test_job_payload_redacts_all_explicitly_forbidden_secret_categories(self):
+        forbidden_values = (
+            "cookie-session-value",
+            "generic-token-value",
+            "654321",
+            "123",
+            "pay-credential-value",
+            "bearer-credential-value",
+            "ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "private-key-body-value",
+            "chinese-password-value",
+            "chinese-api-key-value",
+            "chinese-payment-value",
+            (
+                "Qk14eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+                "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"
+            ),
+        )
+        event = private_event(
+            message_id="forbidden-categories",
+            text=(
+                "Cookie=cookie-session-value；"
+                "token=generic-token-value；"
+                "验证码=654321；CVV=123；"
+                "payment_token=pay-credential-value；"
+                "Authorization: Bearer bearer-credential-value；"
+                "GitHub ghp_abcdefghijklmnopqrstuvwxyz123456；"
+                "-----BEGIN PRIVATE KEY-----\n"
+                "private-key-body-value\n"
+                "-----END PRIVATE KEY-----；"
+                "密码是chinese-password-value；"
+                "API 密钥：chinese-api-key-value；"
+                "支付凭据是chinese-payment-value；"
+                f"BMP {forbidden_values[-1]}"
+            ),
+        )
+
+        job_id, _ = self.store.create_job(event)
+        payload = self.store.get_job(job_id).payload_json.lower()
+
+        for forbidden in forbidden_values:
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden.lower(), payload)
+        self.assertIn("[redacted:credential]", payload)
+        self.assertIn("[redacted:payment-data]", payload)
+        self.assertIn("[redacted:image-data]", payload)
+
+    def test_group_job_preserves_attribution_context_and_structured_payload(self):
+        event = group_event(
+            user_id="10001",
+            message_id="group-message",
+            sequence=7,
+            text="我喜欢跑步",
+        )
+
+        job_id, _ = self.store.create_job(event)
+        job = self.store.get_job(job_id)
+
+        self.assertEqual("group:30003:10001", job.scope_key)
+        self.assertEqual(event.context, job.context)
+        self.assertEqual(event.message_id, job.message_id)
+        self.assertEqual(event.text, job.text)
+        self.assertEqual(2, job.image_count)
+        self.assertEqual(("90009",), job.mentioned_qq_ids)
+        self.assertEqual("group-previous", job.reply_to_message_id)
+        self.assertEqual("80008", job.reply_to_user_id)
+
+    def test_claim_next_job_preserves_scope_sequence_and_one_running_job(self):
+        first_id, _ = self.store.create_job(
+            private_event(message_id="first-blocker", sequence=1)
+        )
+        second_id, _ = self.store.create_job(
+            private_event(message_id="second-ready", sequence=2)
+        )
+        self.store.mark_job_ready(second_id)
+
+        self.assertIsNone(self.store.claim_next_job("private:10001"))
+
+        self.store.mark_job_ready(first_id)
+        first = self.store.claim_next_job("private:10001")
+        self.assertEqual(first_id, first.id)
+        self.assertIsNone(self.store.claim_next_job("private:10001"))
+
+        future_retry = (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat()
+        self.store.fail_job(first_id, "temporary", future_retry)
+        self.assertIsNone(self.store.claim_next_job("private:10001"))
+
+        self.store.mark_job_ready(first_id)
+        reclaimed = self.store.claim_next_job("private:10001")
+        self.assertEqual(first_id, reclaimed.id)
+        self.store.complete_job(first_id)
+        second = self.store.claim_next_job("private:10001")
+        self.assertEqual(second_id, second.id)
+
+    def test_group_users_have_independent_fifo_job_scopes(self):
+        first_id, _ = self.store.create_job(
+            group_event(user_id="10001", message_id="group-a", sequence=1)
+        )
+        second_id, _ = self.store.create_job(
+            group_event(user_id="20002", message_id="group-b", sequence=2)
+        )
+        self.store.mark_job_ready(first_id)
+        self.store.mark_job_ready(second_id)
+
+        first = self.store.claim_next_job("group:30003:10001")
+        second = self.store.claim_next_job("group:30003:20002")
+
+        self.assertEqual(first_id, first.id)
+        self.assertEqual(second_id, second.id)
+
+    def test_recovers_abandoned_running_jobs_after_reopen(self):
+        job_id, _ = self.store.create_job(
+            private_event(message_id="crash-recovery", sequence=1)
+        )
+        self.store.mark_job_ready(job_id)
+        running = self.store.claim_next_job("private:10001")
+        self.assertEqual("running", running.state)
+
+        reopened = MemoryStore(self.path)
+        reopened.initialize()
+        self.assertIsNone(reopened.claim_next_job("private:10001"))
+        self.assertEqual(1, reopened.recover_running_jobs())
+
+        recovered = reopened.get_job(job_id)
+        self.assertEqual("retry", recovered.state)
+        self.assertEqual("abandoned", recovered.error_type)
+        reclaimed = reopened.claim_next_job("private:10001")
+        self.assertEqual(job_id, reclaimed.id)
+        self.assertEqual(2, reclaimed.attempts)
+
+    def test_retry_time_is_validated_normalized_to_utc_and_compared_by_instant(self):
+        job_id, _ = self.store.create_job(
+            private_event(message_id="offset-retry", sequence=1)
+        )
+        self.store.mark_job_ready(job_id)
+        running = self.store.claim_next_job("private:10001")
+        retry_instant = datetime.now(timezone.utc) - timedelta(seconds=1)
+        retry_with_offset = retry_instant.astimezone(
+            timezone(timedelta(hours=8))
+        ).isoformat()
+
+        self.store.fail_job(running.id, "temporary", retry_with_offset)
+
+        normalized = self.store.get_job(job_id)
+        self.assertEqual(retry_instant.isoformat(), normalized.retry_at)
+        self.assertEqual(
+            job_id,
+            self.store.claim_next_job("private:10001").id,
+        )
+
+        second_id, _ = self.store.create_job(
+            private_event(message_id="invalid-retry", sequence=2)
+        )
+        self.store.mark_job_ready(second_id)
+        self.store.complete_job(job_id)
+        second = self.store.claim_next_job("private:10001")
+        with self.assertRaisesRegex(ValueError, "retry_at"):
+            self.store.fail_job(second.id, "temporary", "2026-07-26T10:00:00")
+        with self.assertRaisesRegex(ValueError, "retry_at"):
+            self.store.fail_job(second.id, "temporary", "not-a-timestamp")
 
     def test_job_state_machine_retries_and_survives_reopen(self):
         first_id, _ = self.store.create_job(
@@ -394,6 +583,169 @@ class MemoryStoreTests(unittest.TestCase):
             if database_file.exists():
                 with self.subTest(database_file=database_file.name):
                     self.assertNotIn(marker_bytes, database_file.read_bytes())
+
+    def test_physical_delete_waits_for_concurrent_reader_before_success(self):
+        marker = "CONCURRENT_PRIVATE_MARKER_93ad"
+        claim, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="likes",
+            value=marker,
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="concurrent-private-message",
+            source_excerpt=marker,
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="concurrent-private-claim",
+        )
+        reader = sqlite3.connect(self.path)
+        reader.execute("BEGIN")
+        self.assertEqual(
+            marker,
+            reader.execute(
+                "SELECT value FROM memory_claims WHERE id = ?",
+                (claim.id,),
+            ).fetchone()[0],
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            deletion = pool.submit(
+                self.store.delete_claim_physically,
+                claim.id,
+                reason="user_forget",
+            )
+            try:
+                deadline = time.monotonic() + 1.0
+                while self.store.get_claim(claim.id) is not None:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+
+                self.assertFalse(deletion.done())
+                self.assertEqual(
+                    marker,
+                    reader.execute(
+                        "SELECT value FROM memory_claims WHERE id = ?",
+                        (claim.id,),
+                    ).fetchone()[0],
+                )
+            finally:
+                reader.rollback()
+                reader.close()
+
+            self.assertTrue(deletion.result(timeout=2.0))
+
+        marker_bytes = marker.encode("utf-8")
+        for database_file in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            if database_file.exists():
+                self.assertNotIn(marker_bytes, database_file.read_bytes())
+
+    def test_old_sqlite_uses_physical_delete_fallback_without_fts_command(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "old-compatible.sqlite3"
+            store = MemoryStore(path)
+            with mock.patch.object(sqlite3, "sqlite_version_info", (3, 41, 2)):
+                store.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                secure_delete_config = connection.execute(
+                    """
+                    SELECT v
+                    FROM memory_fts_config
+                    WHERE k = 'secure-delete'
+                    """
+                ).fetchone()
+            self.assertIsNone(secure_delete_config)
+
+            marker = "OLD_SQLITE_PRIVATE_MARKER_14c8"
+            claim, _ = store.create_claim(
+                scope_type="private",
+                scope_id="10001",
+                speaker_qq="10001",
+                subject_type="qq_user",
+                subject_id="10001",
+                predicate="likes",
+                value=marker,
+                memory_type="preference",
+                modality="asserted",
+                source_kind="message",
+                source_message_id="old-sqlite-message",
+                source_excerpt=marker,
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="medium",
+                dedupe_key="old-sqlite-private-claim",
+            )
+            self.assertTrue(
+                store.delete_claim_physically(claim.id, reason="user_forget")
+            )
+            self.assertNotIn(marker.encode("utf-8"), path.read_bytes())
+
+    def test_physical_delete_fails_bounded_if_reader_never_releases(self):
+        marker = "BLOCKED_PRIVATE_MARKER_6d31"
+        claim, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="likes",
+            value=marker,
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="blocked-private-message",
+            source_excerpt=marker,
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="blocked-private-claim",
+        )
+        reader = sqlite3.connect(self.path)
+        reader.execute("BEGIN")
+        reader.execute(
+            "SELECT value FROM memory_claims WHERE id = ?",
+            (claim.id,),
+        ).fetchone()
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "active readers"):
+                self.store.delete_claim_physically(
+                    claim.id,
+                    reason="user_forget",
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertEqual(
+                marker,
+                reader.execute(
+                    "SELECT value FROM memory_claims WHERE id = ?",
+                    (claim.id,),
+                ).fetchone()[0],
+            )
+        finally:
+            reader.rollback()
+            reader.close()
+
+        self.assertFalse(
+            self.store.delete_claim_physically(claim.id, reason="user_forget")
+        )
+        marker_bytes = marker.encode("utf-8")
+        for database_file in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            if database_file.exists():
+                self.assertNotIn(marker_bytes, database_file.read_bytes())
 
 
 if __name__ == "__main__":
