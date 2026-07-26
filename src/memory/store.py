@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -29,15 +31,29 @@ _DATA_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _BARE_IMAGE_BASE64_PATTERN = re.compile(
-    r"(?:iVBORw0KGgo|/9j/|R0lGOD(?:lh|dh)|UklGR)[a-z0-9+/=\r\n]{12,}",
+    r"(?:iVBORw0KGgo|/9j/|R0lGOD(?:lh|dh)|UklGR)[a-z0-9+/=]{12,}",
     re.IGNORECASE,
 )
 _MIME_WRAPPED_BASE64_PATTERN = re.compile(
-    r"(?<![a-z0-9+/])"
-    r"(?:[a-z0-9+/]{16,}\r?\n)+"
-    r"[a-z0-9+/]{2,}={0,2}"
-    r"(?![a-z0-9+/=])",
+    r"(?<![a-z0-9+/=])"
+    r"[a-z0-9+/]{16,}={0,2}"
+    r"(?:\r?\n[a-z0-9+/]{2,}={0,2})+"
+    r"(?=$|[\r\n，；])",
     re.IGNORECASE,
+)
+_BINARY_BASE64_SIGNATURES = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"BM",
+    b"II*\x00",
+    b"MM\x00*",
+    b"PK\x03\x04",
+    b"%PDF-",
+    b"\x1f\x8b",
+    b"Rar!\x1a\x07",
+    b"7z\xbc\xaf'\x1c",
 )
 _GENERIC_BASE64_PATTERN = re.compile(
     r"(?<![a-z0-9+/])[a-z0-9+/]{48,}={0,2}(?![a-z0-9+/=])",
@@ -113,11 +129,46 @@ def _passes_luhn(value: str) -> bool:
     return checksum % 10 == 0
 
 
+def _redact_mime_wrapped_base64(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    lines = candidate.splitlines(keepends=True)
+    first_width = len(lines[0].rstrip("\r\n"))
+    prefix_line_count = 1
+    saw_short_line = False
+    for line in lines[1:]:
+        width = len(line.rstrip("\r\n"))
+        if not saw_short_line and width == first_width:
+            prefix_line_count += 1
+        elif not saw_short_line and width < first_width:
+            prefix_line_count += 1
+            saw_short_line = True
+        else:
+            break
+
+    prefix_end = sum(len(line) for line in lines[:prefix_line_count])
+    while prefix_end and candidate[prefix_end - 1] in "\r\n":
+        prefix_end -= 1
+    encoded = candidate[:prefix_end].replace("\r", "").replace("\n", "")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return candidate
+    if not (
+        decoded.startswith(_BINARY_BASE64_SIGNATURES)
+        or (decoded.startswith(b"RIFF") and decoded[8:12] == b"WEBP")
+    ):
+        return candidate
+    return "[redacted:image-data]" + candidate[prefix_end:]
+
+
 def _redact_forbidden_payload_data(text: str) -> str:
     text = _PRIVATE_KEY_PATTERN.sub("[redacted:credential]", text)
     text = _DATA_URL_PATTERN.sub("[redacted:image-data]", text)
+    text = _MIME_WRAPPED_BASE64_PATTERN.sub(
+        _redact_mime_wrapped_base64,
+        text,
+    )
     text = _BARE_IMAGE_BASE64_PATTERN.sub("[redacted:image-data]", text)
-    text = _MIME_WRAPPED_BASE64_PATTERN.sub("[redacted:image-data]", text)
     text = _GENERIC_BASE64_PATTERN.sub("[redacted:image-data]", text)
     text = _BEARER_PATTERN.sub("[redacted:credential]", text)
     text = _PAYMENT_ASSIGNMENT_PATTERN.sub(

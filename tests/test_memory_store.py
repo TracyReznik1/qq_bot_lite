@@ -255,6 +255,60 @@ class MemoryStoreTests(unittest.TestCase):
             stored_text.count("[redacted:image-data]"),
         )
 
+    def test_mime_base64_filter_does_not_consume_following_prose(self):
+        event = private_event(
+            message_id="mime-followed-by-prose",
+            text=(
+                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0NTY3ODkw\n"
+                "Keep this ordinary prose."
+            ),
+        )
+
+        job_id, _ = self.store.create_job(event)
+
+        self.assertIn(
+            "Keep this ordinary prose.",
+            self.store.get_job(job_id).text,
+        )
+
+    def test_short_base64_shaped_ordinary_lines_are_not_redacted(self):
+        samples = (
+            "abcdefghijklmnop\nordinary",
+            "abcdefghijklmnop\nqrstuvwxyzabcdef",
+        )
+
+        for index, sample in enumerate(samples):
+            with self.subTest(sample=sample):
+                event = private_event(
+                    message_id=f"ordinary-base64-lines-{index}",
+                    text=sample,
+                )
+                job_id, _ = self.store.create_job(event)
+                self.assertEqual(sample, self.store.get_job(job_id).text)
+
+    def test_mime_binary_redaction_stops_before_following_text(self):
+        encoded = base64.b64encode(
+            b"BM" + b"BMP_PRIVATE_BODY" + (b"x" * 96)
+        ).decode()
+        wrapped = "\r\n".join(
+            encoded[index : index + 40]
+            for index in range(0, len(encoded), 40)
+        )
+
+        for index, suffix in enumerate(
+            ("Keep this ordinary prose.", "ordinary")
+        ):
+            with self.subTest(suffix=suffix):
+                event = private_event(
+                    message_id=f"mime-binary-boundary-{index}",
+                    text=f"{wrapped}\r\n{suffix}",
+                )
+                job_id, _ = self.store.create_job(event)
+                stored_text = self.store.get_job(job_id).text
+                for line in wrapped.splitlines():
+                    self.assertNotIn(line, stored_text)
+                self.assertIn(suffix, stored_text)
+
     def test_job_payload_redacts_the_complete_cookie_header(self):
         event = private_event(
             message_id="multi-cookie",
