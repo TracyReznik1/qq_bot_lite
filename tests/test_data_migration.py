@@ -664,17 +664,13 @@ class StartupMigrationTests(unittest.TestCase):
         )
         start = threading.Barrier(3)
         call_lock = threading.Lock()
-        calls = {"directory": 0, "memory-layout": 0}
+        calls = {"directory": 0}
         errors = []
 
         def directory_migration(*args, **kwargs):
             with call_lock:
                 calls["directory"] += 1
             time.sleep(0.05)
-
-        def memory_layout_migration():
-            with call_lock:
-                calls["memory-layout"] += 1
 
         def worker():
             start.wait()
@@ -686,7 +682,6 @@ class StartupMigrationTests(unittest.TestCase):
         with (
             patch.object(main, "config", fake_config),
             patch.object(main, "migrate_legacy_data", side_effect=directory_migration),
-            patch.object(main, "migrate_legacy_memory_files", side_effect=memory_layout_migration),
         ):
             threads = [threading.Thread(target=worker) for _ in range(2)]
             for thread in threads:
@@ -697,7 +692,7 @@ class StartupMigrationTests(unittest.TestCase):
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual([], errors)
-        self.assertEqual({"directory": 1, "memory-layout": 1}, calls)
+        self.assertEqual({"directory": 1}, calls)
 
     def test_startup_migrates_default_data_before_legacy_memory_layout(self):
         from src import main
@@ -714,12 +709,11 @@ class StartupMigrationTests(unittest.TestCase):
         with (
             patch.object(main, "config", fake_config),
             patch.object(main, "migrate_legacy_data", side_effect=lambda *args, **kwargs: order.append("directory")),
-            patch.object(main, "migrate_legacy_memory_files", side_effect=lambda: order.append("memory-layout")),
         ):
             main.startup()
             main.startup()
 
-        self.assertEqual(["directory", "memory-layout"], order)
+        self.assertEqual(["directory"], order)
 
     def test_startup_does_not_migrate_atri_data_into_custom_data_directory(self):
         from src import main
@@ -735,7 +729,6 @@ class StartupMigrationTests(unittest.TestCase):
         with (
             patch.object(main, "config", fake_config),
             patch.object(main, "migrate_legacy_data") as migrate,
-            patch.object(main, "migrate_legacy_memory_files"),
         ):
             main.startup()
 

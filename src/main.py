@@ -7,7 +7,6 @@ from typing import Any
 from flask import Flask, request
 
 from src.chat.chat_service import generate_reply
-from src.chat.memory import migrate_legacy_memory_files
 from src.commands import CommandContext, handle_command
 from src.config import BASE_DIR, config
 from src.persona import get_persona
@@ -74,7 +73,6 @@ def startup() -> None:
                 config.history_turns,
                 config.memory_limit,
             )
-        migrate_legacy_memory_files()
         get_memory_service().start()
         _startup_initialized = True
 
