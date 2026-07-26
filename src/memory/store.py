@@ -132,18 +132,25 @@ def _passes_luhn(value: str) -> bool:
 def _redact_mime_wrapped_base64(match: re.Match[str]) -> str:
     candidate = match.group(0)
     lines = candidate.splitlines(keepends=True)
-    first_width = len(lines[0].rstrip("\r\n"))
+    first_line = lines[0].rstrip("\r\n")
+    first_width = len(first_line)
     prefix_line_count = 1
-    saw_short_line = False
-    for line in lines[1:]:
-        width = len(line.rstrip("\r\n"))
-        if not saw_short_line and width == first_width:
-            prefix_line_count += 1
-        elif not saw_short_line and width < first_width:
-            prefix_line_count += 1
-            saw_short_line = True
-        else:
-            break
+    full_width_line_count = 1
+    if not first_line.endswith("="):
+        for line in lines[1:]:
+            content = line.rstrip("\r\n")
+            width = len(content)
+            if content.endswith("="):
+                prefix_line_count += 1
+                break
+            if width == first_width:
+                prefix_line_count += 1
+                full_width_line_count += 1
+            elif width < first_width and full_width_line_count >= 2:
+                prefix_line_count += 1
+                break
+            else:
+                break
 
     prefix_end = sum(len(line) for line in lines[:prefix_line_count])
     while prefix_end and candidate[prefix_end - 1] in "\r\n":

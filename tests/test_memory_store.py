@@ -309,6 +309,58 @@ class MemoryStoreTests(unittest.TestCase):
                     self.assertNotIn(line, stored_text)
                 self.assertIn(suffix, stored_text)
 
+    def test_ambiguous_unpadded_short_line_is_not_consumed_as_binary_tail(self):
+        first_line = base64.b64encode(b"BM" + (b"A" * 96)).decode()[:16]
+
+        for index, newline in enumerate(("\n", "\r\n")):
+            with self.subTest(newline=repr(newline)):
+                event = private_event(
+                    message_id=f"ambiguous-short-tail-{index}",
+                    text=f"{first_line}{newline}ordinary",
+                )
+                job_id, _ = self.store.create_job(event)
+                self.assertEqual(
+                    f"[redacted:image-data]{newline}ordinary",
+                    self.store.get_job(job_id).text,
+                )
+
+    def test_structured_wrapped_binary_keeps_unpadded_and_padded_boundaries(self):
+        payloads = (
+            ("bmp-unpadded", b"BM" + (b"A" * 37), False),
+            ("bmp-padded", b"BM" + (b"A" * 32), True),
+            ("tiff-unpadded", b"II*\x00" + (b"A" * 35), False),
+            ("tiff-padded", b"II*\x00" + (b"A" * 33), True),
+        )
+
+        for payload_name, payload, expects_padding in payloads:
+            encoded = base64.b64encode(payload).decode()
+            self.assertEqual(expects_padding, encoded.endswith("=="))
+            wrapped_lines = [
+                encoded[index : index + 16]
+                for index in range(0, len(encoded), 16)
+            ]
+            self.assertGreaterEqual(
+                sum(len(line) == 16 for line in wrapped_lines),
+                2,
+            )
+            for newline_index, newline in enumerate(("\n", "\r\n")):
+                with self.subTest(
+                    payload=payload_name,
+                    newline=repr(newline),
+                ):
+                    wrapped = newline.join(wrapped_lines)
+                    event = private_event(
+                        message_id=(
+                            f"structured-binary-{payload_name}-{newline_index}"
+                        ),
+                        text=f"{wrapped}{newline}ordinary",
+                    )
+                    job_id, _ = self.store.create_job(event)
+                    stored_text = self.store.get_job(job_id).text
+                    for line in wrapped_lines:
+                        self.assertNotIn(line, stored_text)
+                    self.assertIn("ordinary", stored_text)
+
     def test_job_payload_redacts_the_complete_cookie_header(self):
         event = private_event(
             message_id="multi-cookie",
