@@ -217,10 +217,11 @@ class FallbackLLMClient:
 
 # ── chain builder ──────────────────────────────────────────────────────
 
-def _build_chain(cfg=None) -> list[LLMModelSpec]:
+def _build_chain(cfg=None, models=None) -> list[LLMModelSpec]:
     """Build the exact ordered chain validated by Config."""
     if cfg is None:
         cfg = config
+    selected = tuple(models or cfg.chat_models)
     return [
         LLMModelSpec(
             provider=item.provider,
@@ -230,13 +231,14 @@ def _build_chain(cfg=None) -> list[LLMModelSpec]:
                 item.model,
             ),
         )
-        for item in cfg.chat_models
+        for item in selected
     ]
 
 
 # ── singleton accessor ─────────────────────────────────────────────────
 
 _llm_client: FallbackLLMClient | None = None
+_memory_llm_client: FallbackLLMClient | None = None
 
 
 def get_llm_client() -> FallbackLLMClient:
@@ -245,3 +247,13 @@ def get_llm_client() -> FallbackLLMClient:
     if _llm_client is None:
         _llm_client = FallbackLLMClient(_build_chain())
     return _llm_client
+
+
+def get_memory_llm_client() -> FallbackLLMClient:
+    """Return the memory-extraction client with its own fallback chain."""
+    global _memory_llm_client
+    if _memory_llm_client is None:
+        _memory_llm_client = FallbackLLMClient(
+            _build_chain(models=config.memory_models)
+        )
+    return _memory_llm_client

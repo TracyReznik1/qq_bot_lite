@@ -22,10 +22,13 @@ class ConfiguredModel:
     model: str
 
 
-def parse_chat_models(value: str | None) -> tuple[ConfiguredModel, ...]:
+def parse_model_chain(
+    value: str | None,
+    setting_name: str,
+) -> tuple[ConfiguredModel, ...]:
     raw = str(value or "")
     if not raw.strip():
-        raise ModelConfigurationError("CHAT_MODELS 不能为空")
+        raise ModelConfigurationError(f"{setting_name} 不能为空")
 
     parsed: list[ConfiguredModel] = []
     seen: set[tuple[str, str]] = set()
@@ -33,11 +36,11 @@ def parse_chat_models(value: str | None) -> tuple[ConfiguredModel, ...]:
         stripped = item.strip()
         if not stripped:
             raise ModelConfigurationError(
-                f"CHAT_MODELS 第 {index} 项为空"
+                f"{setting_name} 第 {index} 项为空"
             )
         if ":" not in stripped:
             raise ModelConfigurationError(
-                f"CHAT_MODELS 第 {index} 项缺少英文冒号"
+                f"{setting_name} 第 {index} 项缺少英文冒号"
             )
 
         provider_text, model_text = stripped.split(":", 1)
@@ -45,15 +48,15 @@ def parse_chat_models(value: str | None) -> tuple[ConfiguredModel, ...]:
         model = model_text.strip()
         if not provider:
             raise ModelConfigurationError(
-                f"CHAT_MODELS 第 {index} 项缺少提供商"
+                f"{setting_name} 第 {index} 项缺少提供商"
             )
         if not model:
             raise ModelConfigurationError(
-                f"CHAT_MODELS 第 {index} 项缺少模型名"
+                f"{setting_name} 第 {index} 项缺少模型名"
             )
         if provider not in SUPPORTED_PROVIDERS:
             raise ModelConfigurationError(
-                f"CHAT_MODELS 第 {index} 项提供商仅支持 gemini 或 deepseek"
+                f"{setting_name} 第 {index} 项提供商仅支持 gemini 或 deepseek"
             )
 
         key = (provider, model)
@@ -65,18 +68,23 @@ def parse_chat_models(value: str | None) -> tuple[ConfiguredModel, ...]:
     return tuple(parsed)
 
 
+def parse_chat_models(value: str | None) -> tuple[ConfiguredModel, ...]:
+    return parse_model_chain(value, "CHAT_MODELS")
+
+
 def validate_model_configuration(
     models: Sequence[ConfiguredModel],
     *,
     provider_api_keys: Mapping[str, str],
     gemini_url: str,
+    setting_name: str = "CHAT_MODELS",
 ) -> None:
     referenced = {model.provider for model in models}
     for provider in sorted(referenced):
         if not str(provider_api_keys.get(provider, "")).strip():
             variable = PROVIDER_KEY_VARIABLES[provider]
             raise ModelConfigurationError(
-                f"CHAT_MODELS 使用 {provider}，但 {variable} 未配置"
+                f"{setting_name} 使用 {provider}，但 {variable} 未配置"
             )
 
     if "gemini" not in referenced:

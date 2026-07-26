@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 from src.model_config import (
     ConfiguredModel,
+    parse_model_chain,
     parse_chat_models,
     validate_model_configuration,
 )
@@ -82,19 +83,39 @@ class Config:
         default_factory=lambda: os.getenv("CHAT_MODELS", ""),
         repr=False,
     )
+    _memory_models_raw: str = field(
+        default_factory=lambda: os.getenv("MEMORY_MODELS", ""),
+        repr=False,
+    )
     chat_models: tuple[ConfiguredModel, ...] = field(init=False)
+    memory_models: tuple[ConfiguredModel, ...] = field(init=False)
 
     def __post_init__(self) -> None:
-        models = parse_chat_models(self._chat_models_raw)
+        chat_models = parse_chat_models(self._chat_models_raw)
+        provider_api_keys = {
+            "gemini": self.gemini_api_key,
+            "deepseek": self.deepseek_api_key,
+        }
         validate_model_configuration(
-            models,
-            provider_api_keys={
-                "gemini": self.gemini_api_key,
-                "deepseek": self.deepseek_api_key,
-            },
+            chat_models,
+            provider_api_keys=provider_api_keys,
             gemini_url=self.gemini_url,
         )
-        object.__setattr__(self, "chat_models", models)
+        if str(self._memory_models_raw or "").strip():
+            memory_models = parse_model_chain(
+                self._memory_models_raw,
+                "MEMORY_MODELS",
+            )
+            validate_model_configuration(
+                memory_models,
+                provider_api_keys=provider_api_keys,
+                gemini_url=self.gemini_url,
+                setting_name="MEMORY_MODELS",
+            )
+        else:
+            memory_models = chat_models
+        object.__setattr__(self, "chat_models", chat_models)
+        object.__setattr__(self, "memory_models", memory_models)
     onebot_url: str = os.getenv("ONEBOT_API_URL", "http://127.0.0.1:3000").rstrip("/")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
     callback_secret: str = os.getenv("CALLBACK_SECRET", "")
