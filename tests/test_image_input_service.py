@@ -403,6 +403,96 @@ class ImageInputServiceTests(unittest.TestCase):
             timeout=3,
         )
 
+    def test_onebot_client_resolves_reply_message_author(self):
+        cfg = SimpleNamespace(
+            onebot_url="http://127.0.0.1:3000",
+            onebot_access_token="",
+            request_timeout=3,
+        )
+        response = SimpleNamespace(
+            raise_for_status=mock.Mock(),
+            json=mock.Mock(
+                return_value={
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {"sender": {"user_id": 456}},
+                }
+            ),
+        )
+        with mock.patch(
+            "src.services.onebot_client.requests.post",
+            return_value=response,
+        ) as post:
+            author = OneBotClient(cfg).get_message_author("reply-1")
+
+        self.assertEqual("456", author)
+        post.assert_called_once_with(
+            "http://127.0.0.1:3000/get_msg",
+            json={"message_id": "reply-1"},
+            headers={"Content-Type": "application/json"},
+            timeout=3,
+        )
+
+    def test_onebot_reply_author_failure_returns_none_without_logging_payload(self):
+        cfg = SimpleNamespace(
+            onebot_url="http://127.0.0.1:3000",
+            onebot_access_token="",
+            request_timeout=3,
+        )
+        with (
+            mock.patch(
+                "src.services.onebot_client.requests.post",
+                side_effect=RuntimeError("response included secret body"),
+            ),
+            mock.patch(
+                "src.services.onebot_client.logger.warning"
+            ) as warning,
+        ):
+            author = OneBotClient(cfg).get_message_author("reply-2")
+
+        self.assertIsNone(author)
+        logged = repr(warning.call_args_list)
+        self.assertIn("reply-2", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("response included secret body", logged)
+
+    def test_onebot_invalid_reply_author_logs_only_id_and_error_type(self):
+        cfg = SimpleNamespace(
+            onebot_url="http://127.0.0.1:3000",
+            onebot_access_token="",
+            request_timeout=3,
+        )
+        response = SimpleNamespace(
+            raise_for_status=mock.Mock(),
+            json=mock.Mock(
+                return_value={
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "sender": {
+                            "nickname": "must-not-be-logged",
+                        }
+                    },
+                }
+            ),
+        )
+        with (
+            mock.patch(
+                "src.services.onebot_client.requests.post",
+                return_value=response,
+            ),
+            mock.patch(
+                "src.services.onebot_client.logger.warning"
+            ) as warning,
+        ):
+            author = OneBotClient(cfg).get_message_author("reply-3")
+
+        self.assertIsNone(author)
+        logged = repr(warning.call_args_list)
+        self.assertIn("reply-3", logged)
+        self.assertIn("InvalidAuthorData", logged)
+        self.assertNotIn("must-not-be-logged", logged)
+
     def test_rejects_non_public_ipv4_and_ipv6_targets_before_downloading(self):
         service = self.service()
         unsafe_targets = (

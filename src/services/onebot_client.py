@@ -33,6 +33,44 @@ class OneBotClient:
             raise RuntimeError("OneBot could not resolve the received image")
         return url
 
+    def get_message_author(self, message_id: str) -> str | None:
+        try:
+            response = requests.post(
+                f"{self.cfg.onebot_url}/get_msg",
+                json={"message_id": message_id},
+                headers=self._headers(),
+                timeout=self.cfg.request_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            sender = data.get("sender") if isinstance(data, dict) else None
+            user_id = (
+                sender.get("user_id")
+                if isinstance(sender, dict)
+                else None
+            )
+            author = str(user_id or "").strip()
+            if (
+                not isinstance(payload, dict)
+                or payload.get("retcode") != 0
+                or not author.isdigit()
+            ):
+                logger.warning(
+                    "OneBot get message author failed message_id=%s error_type=%s",
+                    message_id,
+                    "InvalidAuthorData",
+                )
+                return None
+            return author
+        except Exception as error:
+            logger.warning(
+                "OneBot get message author failed message_id=%s error_type=%s",
+                message_id,
+                type(error).__name__,
+            )
+            return None
+
     def send_msg(self, target_id: Any, message: str, is_group: bool = False) -> None:
         message = (message or "").strip()
         if not message:
