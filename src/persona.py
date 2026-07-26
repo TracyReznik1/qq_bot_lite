@@ -22,7 +22,10 @@ class Persona:
 def load_persona(path: Path) -> Persona:
     if not path.is_file():
         raise PersonaConfigurationError(f"角色文件不存在：{path}")
-    content = path.read_text(encoding="utf-8").strip()
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise PersonaConfigurationError(f"角色文件无法读取：{path}（{error}）") from error
     if not content:
         raise PersonaConfigurationError(f"角色文件为空：{path}")
     match = NAME_PATTERN.search(content)

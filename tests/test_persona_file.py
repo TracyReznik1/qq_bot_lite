@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.persona import PersonaConfigurationError, load_persona
 
@@ -35,6 +36,22 @@ class PersonaFileTests(unittest.TestCase):
         nameless.write_text("# 角色\n\n只有描述", encoding="utf-8")
         with self.assertRaisesRegex(PersonaConfigurationError, "名字"):
             load_persona(nameless)
+
+    def test_wraps_unreadable_persona_file_errors(self):
+        path = self.root / "persona.md"
+        path.write_text("- 名字：ATRI", encoding="utf-8")
+        errors = (
+            PermissionError("拒绝访问"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        )
+
+        for error in errors:
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(Path, "read_text", side_effect=error),
+                self.assertRaisesRegex(PersonaConfigurationError, "无法读取"),
+            ):
+                load_persona(path)
 
 
 if __name__ == "__main__":
