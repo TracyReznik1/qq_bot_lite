@@ -74,6 +74,31 @@ def _is_retryable_error(exc: BaseException) -> bool:
     return isinstance(exc, (requests.ConnectionError, requests.Timeout))
 
 
+def _tool_affinity(
+    messages: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    for message in reversed(messages):
+        if (
+            not isinstance(message, dict)
+            or message.get("role") != "assistant"
+            or not message.get("tool_calls")
+        ):
+            continue
+        context = message.get("_provider_context")
+        if not isinstance(context, dict):
+            continue
+        provider = context.get("provider")
+        model = context.get("model")
+        if (
+            isinstance(provider, str)
+            and provider
+            and isinstance(model, str)
+            and model
+        ):
+            return provider, model
+    return None
+
+
 class FallbackLLMClient:
     """Unified client that tries models from *chain* in order.
 
@@ -101,8 +126,11 @@ class FallbackLLMClient:
     ) -> ChatResponse:
         has_tools = bool(tools)
         has_images = _messages_have_images(messages)
+        affinity = _tool_affinity(messages)
 
         for spec in self._chain:
+            if affinity is not None and affinity != (spec.provider, spec.model):
+                continue
             if has_tools and not spec.supports_tools:
                 logger.info(
                     "LLM skipping model (no tool support) provider=%s model=%s",
@@ -132,6 +160,12 @@ class FallbackLLMClient:
                     )
                     continue
 
+                if result.tool_calls:
+                    result.provider_context = {
+                        **(result.provider_context or {}),
+                        "provider": spec.provider,
+                        "model": spec.model,
+                    }
                 return result
             except RuntimeError as exc:
                 # Missing API key → do NOT retry; log and skip this model.

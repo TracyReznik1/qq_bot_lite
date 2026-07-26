@@ -24,6 +24,12 @@ def _clean_messages(
             for key, value in message.items()
             if key != "_provider_context"
         }
+        if (
+            message.get("role") == "assistant"
+            and message.get("tool_calls")
+            and clean_message.get("content") is None
+        ):
+            clean_message["content"] = ""
         provider_context = message.get("_provider_context")
         if (
             message.get("role") == "assistant"
@@ -66,10 +72,8 @@ class DeepSeekClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if tools is not None:
+        if tools and tool_choice != "none":
             payload["tools"] = tools
-        if tool_choice is not None:
-            payload["tool_choice"] = tool_choice
 
         response = try_proxied_post(
             self._cfg.deepseek_url,
