@@ -19,15 +19,19 @@ _JOKE_PATTERN = re.compile(
     r"(?:开玩笑|逗你的|骗你的|说着玩|玩笑而已|假的啦|just kidding)",
     re.IGNORECASE,
 )
-_QUOTED_TEXT_PATTERN = re.compile(
-    r"(?:"
-    r"“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"
-    r"《[^》]*》|〈[^〉]*〉|【[^】]*】|"
-    r'"[^"]*"|\'[^\']*\'|```.*?```|`[^`]*`'
-    r")",
-    re.DOTALL,
-)
-_BLOCK_QUOTE_PATTERN = re.compile(r"(?m)^\s*>.*$")
+_QUOTE_DELIMITERS = {
+    "“": "”",
+    "「": "」",
+    "『": "』",
+    "‘": "’",
+    "《": "》",
+    "〈": "〉",
+    "【": "】",
+    '"': '"',
+    "'": "'",
+    "`": "`",
+}
+_BLOCK_QUOTE_START_PATTERN = re.compile(r"^\s*>")
 _FIRST_PERSON_PATTERN = re.compile(r"(?:我们|我|本人|俺|咱们|咱)")
 _CORRECTION_PATTERN = re.compile(
     r"(?:纠正|更正|改口|说错|其实|以前.*现在|"
@@ -36,9 +40,15 @@ _CORRECTION_PATTERN = re.compile(
 _WITHDRAWAL_PATTERN = re.compile(
     r"(?:收回|撤回|作废|不算数|取消.*(?:说法|观点))"
 )
-_EXPLICIT_CORRECTION_PATTERN = re.compile(r"(?:纠正|更正|改口|说错)")
 _CLAUSE_BREAK_PATTERN = re.compile(r"[。.!！？?；;\r\n]+")
 _SUBCLAUSE_BREAK_PATTERN = re.compile(r"[，,]+")
+_PARALLEL_CLAUSE_BREAK_PATTERN = re.compile(r"(?:同时|另外|此外|并且|而且|以及)")
+_STANDALONE_CORRECTION_LEAD_PATTERN = re.compile(
+    r"^\s*(?:我\s*)?(?:纠正|更正|改口|说错)(?:了)?"
+    r"(?:一下|下)?"
+    r"(?:(?:前面|刚才|之前)(?:的)?(?:说法|内容|话))?"
+    r"\s*[:：]?\s*$"
+)
 _NEGATION_PATTERN = re.compile(
     r"(?:不再|不喜欢|不是|没有|从不|并非|没(?:有)?)"
 )
@@ -250,8 +260,6 @@ class MemoryPolicy:
         if match is None:
             return None
         qq_id = match.group(1)
-        if qq_id == str(event.context.user_id):
-            return _ResolvedSubject("qq_user", qq_id, "speaker", "high")
         if qq_id in event.mentioned_qq_ids:
             return _ResolvedSubject("qq_user", qq_id, "mention", "high")
         if _has_explicit_qq_marker(event.text, qq_id):
@@ -261,6 +269,15 @@ class MemoryPolicy:
                 "explicit_qq",
                 "high",
             )
+        if qq_id == str(event.context.user_id):
+            if _has_unquoted_first_person(event.text):
+                return _ResolvedSubject(
+                    "qq_user",
+                    qq_id,
+                    "speaker",
+                    "high",
+                )
+            return None
         if self._has_unique_scoped_alias(event, qq_id, ledger=ledger):
             return _ResolvedSubject(
                 "qq_user",
@@ -369,7 +386,41 @@ class MemoryPolicy:
             and candidate.memory_type != "preferred_name"
             and candidate.predicate != "preferred_name"
         ):
-            if exact_same_speaker is None:
+            archived_matches = ledger.find_claims_exact(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                statuses=("archived",),
+                subject_type=subject.subject_type,
+                subject_id=subject.subject_id,
+                predicates=(candidate.predicate,),
+                value=candidate.value,
+                speaker_qq=str(event.context.user_id),
+            )
+            exact_archived = next(
+                (
+                    claim
+                    for claim in archived_matches
+                    if claim.modality == candidate.modality
+                    and claim.valid_from == candidate.valid_from
+                    and claim.valid_to == candidate.valid_to
+                ),
+                None,
+            )
+            if exact_archived is not None:
+                ledger.add_evidence(
+                    exact_archived.id,
+                    source_kind=f"message:{subject.source}",
+                    source_message_id=event.message_id,
+                    source_excerpt=event.text,
+                )
+                archived = exact_archived
+            elif (
+                exact_same_speaker is None
+                or not _claim_can_close_at(
+                    exact_same_speaker,
+                    candidate.valid_to,
+                )
+            ):
                 archived = self._create_claim(
                     event,
                     candidate,
@@ -432,23 +483,24 @@ class MemoryPolicy:
 
         superseded_targets: tuple[MemoryClaim, ...] = ()
         if candidate.operation == "supersede" and same_speaker:
-            if len(same_speaker) == 1:
+            correction_clauses = _bound_operation_clauses(
+                event,
+                candidate,
+                _CORRECTION_PATTERN,
+                allow_explicit_lead=True,
+            )
+            named_targets = tuple(
+                claim
+                for claim in same_speaker
+                if any(
+                    claim.value in clause
+                    for clause in correction_clauses
+                )
+            )
+            if named_targets:
+                superseded_targets = named_targets
+            elif len(same_speaker) == 1:
                 superseded_targets = same_speaker
-            else:
-                correction_clauses = _bound_operation_clauses(
-                    event,
-                    candidate,
-                    _CORRECTION_PATTERN,
-                    allow_explicit_lead=True,
-                )
-                superseded_targets = tuple(
-                    claim
-                    for claim in same_speaker
-                    if any(
-                        claim.value in clause
-                        for clause in correction_clauses
-                    )
-                )
 
         conflicting_other = tuple(
             claim
@@ -580,7 +632,7 @@ class MemoryPolicy:
             or not isinstance(candidate.confidence, str)
             or not isinstance(candidate.operation, str)
         ):
-            return False
+            return None
         if (
             _PREDICATE_PATTERN.fullmatch(candidate.predicate) is None
             or not candidate.value.strip()
@@ -779,6 +831,18 @@ def _confidence_rank(value: str) -> int:
     return {"low": 0, "medium": 1, "high": 2}.get(value, 0)
 
 
+def _claim_can_close_at(claim: MemoryClaim, valid_to: str) -> bool:
+    if claim.valid_from is None:
+        return True
+    try:
+        normalized_start = _normalize_temporal(claim.valid_from)
+    except ValueError:
+        return False
+    return datetime.fromisoformat(normalized_start) <= datetime.fromisoformat(
+        valid_to
+    )
+
+
 def _passes_luhn(value: str) -> bool:
     digits = [int(character) for character in value if character.isdigit()]
     if not 13 <= len(digits) <= 19:
@@ -795,8 +859,44 @@ def _passes_luhn(value: str) -> bool:
 
 
 def _unquoted_text(value: str) -> str:
-    without_blocks = _BLOCK_QUOTE_PATTERN.sub(" ", value)
-    return _QUOTED_TEXT_PATTERN.sub(" ", without_blocks)
+    lines: list[str] = []
+    in_block_quote = False
+    for line in value.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        newline = line[len(content):]
+        if _BLOCK_QUOTE_START_PATTERN.search(content):
+            in_block_quote = True
+            lines.append(newline or " ")
+        elif in_block_quote and content.strip():
+            lines.append(newline or " ")
+        else:
+            if not content.strip():
+                in_block_quote = False
+            lines.append(line)
+    unblocked = "".join(lines)
+
+    unquoted: list[str] = []
+    index = 0
+    while index < len(unblocked):
+        if unblocked.startswith("```", index):
+            closing = unblocked.find("```", index + 3)
+            if closing < 0:
+                break
+            unquoted.append(" ")
+            index = closing + 3
+            continue
+        opener = unblocked[index]
+        closer = _QUOTE_DELIMITERS.get(opener)
+        if closer is None:
+            unquoted.append(opener)
+            index += 1
+            continue
+        closing = unblocked.find(closer, index + 1)
+        if closing < 0:
+            break
+        unquoted.append(" ")
+        index = closing + 1
+    return "".join(unquoted)
 
 
 def _has_unquoted_first_person(value: str) -> bool:
@@ -808,7 +908,7 @@ def _has_explicit_qq_marker(value: str, qq_id: str) -> bool:
         re.search(
             rf"(?i)(?<![a-z0-9])(?:qq(?:号|号码)?\s*(?:[:：#]\s*)?|@)"
             rf"{re.escape(qq_id)}(?!\d)",
-            value,
+            _unquoted_text(value),
         )
         is not None
     )
@@ -816,10 +916,11 @@ def _has_explicit_qq_marker(value: str, qq_id: str) -> bool:
 
 def _message_subclauses(value: str) -> tuple[str, ...]:
     return tuple(
-        subclause.strip()
+        segment.strip()
         for clause in _CLAUSE_BREAK_PATTERN.split(value)
         for subclause in _SUBCLAUSE_BREAK_PATTERN.split(clause)
-        if subclause.strip()
+        for segment in _PARALLEL_CLAUSE_BREAK_PATTERN.split(subclause)
+        if segment.strip()
     )
 
 
@@ -856,7 +957,7 @@ def _bound_operation_clauses(
             matched.append(clause)
         elif (
             allow_explicit_lead
-            and _EXPLICIT_CORRECTION_PATTERN.search(clause)
+            and _is_standalone_correction_lead(clause)
             and index + 1 < len(clauses)
             and _clause_supports_candidate(
                 event,
@@ -866,6 +967,12 @@ def _bound_operation_clauses(
         ):
             matched.append(clauses[index + 1])
     return tuple(dict.fromkeys(matched))
+
+
+def _is_standalone_correction_lead(clause: str) -> bool:
+    return _STANDALONE_CORRECTION_LEAD_PATTERN.fullmatch(
+        _unquoted_text(clause)
+    ) is not None
 
 
 def _clause_supports_candidate(

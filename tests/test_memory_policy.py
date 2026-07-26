@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
@@ -226,6 +227,84 @@ class MemoryPolicyTests(unittest.TestCase):
             archived.valid_to,
         )
         self.assertEqual(1, len(self.store.list_evidence(old.id)))
+
+    def test_earlier_history_stays_separate_from_later_active_claim(self):
+        current = self.policy.apply(
+            event("我从七月底开始喜欢跑步", message_id="later-current"),
+            (
+                candidate(
+                    valid_from="2026-07-27T00:00:00+00:00",
+                ),
+            ),
+        )[0].claim
+        historical_candidate = candidate(
+            valid_from="2025-01-01T00:00:00+00:00",
+            valid_to="2026-07-26T00:00:00+00:00",
+        )
+
+        first_history = self.policy.apply(
+            event("我以前喜欢跑步", message_id="earlier-history"),
+            (historical_candidate,),
+        )[0]
+        repeated_history = self.policy.apply(
+            event("我以前确实喜欢跑步", message_id="repeat-earlier-history"),
+            (historical_candidate,),
+        )[0]
+
+        unchanged_current = self.store.get_claim(current.id)
+        self.assertEqual("active", unchanged_current.status)
+        self.assertEqual(
+            "2026-07-27T00:00:00+00:00",
+            unchanged_current.valid_from,
+        )
+        self.assertNotEqual(current.id, first_history.claim.id)
+        self.assertEqual(first_history.claim.id, repeated_history.claim.id)
+        self.assertEqual("archived", first_history.claim.status)
+        self.assertEqual(
+            "2025-01-01T00:00:00+00:00",
+            first_history.claim.valid_from,
+        )
+        self.assertEqual(
+            "2026-07-26T00:00:00+00:00",
+            first_history.claim.valid_to,
+        )
+        self.assertEqual(2, len(self.rows()))
+        self.assertEqual(
+            1,
+            len(self.store.list_evidence(first_history.claim.id)),
+        )
+
+    def test_compatible_active_interval_is_archived_in_place(self):
+        current = self.policy.apply(
+            event("我从七月开始喜欢跑步", message_id="compatible-current"),
+            (
+                candidate(
+                    valid_from="2026-07-01T00:00:00+00:00",
+                ),
+            ),
+        )[0].claim
+
+        historical = self.policy.apply(
+            event("我七月喜欢过跑步", message_id="compatible-history"),
+            (
+                candidate(
+                    valid_from="2026-07-01T00:00:00+00:00",
+                    valid_to="2026-07-26T00:00:00+00:00",
+                ),
+            ),
+        )[0].claim
+
+        self.assertEqual(current.id, historical.id)
+        self.assertEqual("archived", historical.status)
+        self.assertEqual(
+            "2026-07-01T00:00:00+00:00",
+            historical.valid_from,
+        )
+        self.assertEqual(
+            "2026-07-26T00:00:00+00:00",
+            historical.valid_to,
+        )
+        self.assertEqual(1, len(self.rows()))
 
     def test_policy_matrix_rejects_hard_secret(self):
         decisions = self.policy.apply(
@@ -760,6 +839,63 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertNotEqual("superseded", decision.action)
         self.assertEqual("active", self.store.get_claim(old.claim.id).status)
 
+    def test_parallel_unrelated_correction_cannot_supersede_name(self):
+        old = self.policy.apply(
+            event("我叫安安", message_id="parallel-old-name"),
+            (
+                candidate(
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+
+        decision = self.policy.apply(
+            event(
+                "我纠正天气预报同时我叫小夏",
+                message_id="parallel-unrelated-correction",
+            ),
+            (
+                candidate(
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertNotEqual("superseded", decision.action)
+        self.assertEqual("active", self.store.get_claim(old.id).status)
+
+    def test_natural_correction_still_closes_one_current_name(self):
+        old = self.policy.apply(
+            event("我叫安安", message_id="natural-old-name"),
+            (
+                candidate(
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+
+        decision = self.policy.apply(
+            event("其实我叫小夏", message_id="natural-correction"),
+            (
+                candidate(
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertEqual("superseded", decision.action)
+        self.assertEqual("superseded", self.store.get_claim(old.id).status)
+
     def test_correction_must_bind_subject_predicate_and_value_clause(self):
         old = self.policy.apply(
             event(
@@ -817,6 +953,28 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual((), decisions)
         self.assertEqual("active", self.store.get_claim(old.claim.id).status)
+
+    def test_parallel_unrelated_withdrawal_cannot_retract_preference(self):
+        old = self.policy.apply(
+            event("我喜欢跑步", message_id="parallel-old-like"),
+            (candidate(),),
+        )[0].claim
+
+        decisions = self.policy.apply(
+            event(
+                "我收回天气预报同时我喜欢跑步",
+                message_id="parallel-unrelated-withdrawal",
+            ),
+            (
+                candidate(
+                    modality="negated",
+                    operation="retract",
+                ),
+            ),
+        )
+
+        self.assertEqual((), decisions)
+        self.assertEqual("active", self.store.get_claim(old.id).status)
 
     def test_same_claim_confirms_and_independent_speaker_supports(self):
         first = self.policy.apply(
@@ -1028,6 +1186,38 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual([], self.rows())
 
+    def test_non_string_candidate_fields_are_rejected_without_side_effects(self):
+        invalid_fields = (
+            ("subject_ref", 10001),
+            ("predicate", ["likes"]),
+            ("value", {"text": "跑步"}),
+            ("memory_type", None),
+            ("modality", 1),
+            ("confidence", False),
+            ("operation", ("add",)),
+            ("valid_from", 1721952000),
+            ("valid_to", []),
+        )
+
+        for index, (field, invalid_value) in enumerate(invalid_fields):
+            with self.subTest(field=field):
+                malformed = replace(
+                    candidate(),
+                    **{field: invalid_value},
+                )
+                self.assertEqual(
+                    (),
+                    self.policy.apply(
+                        event(
+                            "我喜欢跑步",
+                            message_id=f"invalid-type-{index}",
+                        ),
+                        (malformed,),
+                    ),
+                )
+
+        self.assertEqual([], self.rows())
+
     def test_temporal_values_require_aware_ordered_timestamps_and_normalize_utc(
         self,
     ):
@@ -1096,6 +1286,86 @@ class MemoryPolicyTests(unittest.TestCase):
             (candidate(value="游泳"),),
         )
         self.assertEqual(1, len(unquoted))
+
+    def test_unclosed_quote_or_code_boundary_keeps_following_text_quoted(self):
+        quoted_or_unattributed = (
+            "小明说：“我叫小夏",
+            '小明说："我叫小夏',
+            "小明说：‘我叫小夏",
+            "小明写道《我叫小夏",
+            "`我叫小夏",
+            "```text\n我叫小夏",
+            "> 小明说：\n我叫小夏",
+        )
+        for index, text in enumerate(quoted_or_unattributed):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    (),
+                    self.policy.apply(
+                        event(text, message_id=f"unclosed-quote-{index}"),
+                        (
+                            candidate(
+                                predicate="name",
+                                value="小夏",
+                                memory_type="identity",
+                            ),
+                        ),
+                    ),
+                )
+
+        own_statement = self.policy.apply(
+            event(
+                "小明说：“我叫小夏”，但我叫小冬",
+                message_id="closed-then-own",
+            ),
+            (
+                candidate(
+                    predicate="name",
+                    value="小冬",
+                    memory_type="identity",
+                ),
+            ),
+        )
+        self.assertEqual(1, len(own_statement))
+
+    def test_qq_sender_requires_marker_or_first_person_speaker_evidence(self):
+        rejected = self.policy.apply(
+            event("小明叫小夏", message_id="unmarked-current-sender"),
+            (
+                candidate(
+                    subject_ref="qq:10001",
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                ),
+            ),
+        )
+        marked = self.policy.apply(
+            event("QQ 10001 叫小夏", message_id="marked-current-sender"),
+            (
+                candidate(
+                    subject_ref="qq:10001",
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                ),
+            ),
+        )
+        first_person = self.policy.apply(
+            event("我叫小冬", message_id="speaker-current-sender"),
+            (
+                candidate(
+                    subject_ref="qq:10001",
+                    predicate="name",
+                    value="小冬",
+                    memory_type="identity",
+                ),
+            ),
+        )
+
+        self.assertEqual((), rejected)
+        self.assertEqual(("explicit_qq",), tuple(d.attribution_source for d in marked))
+        self.assertEqual(("speaker",), tuple(d.attribution_source for d in first_person))
 
     def test_policy_rejects_over_limit_candidate_batches_and_long_qq_refs(self):
         too_many = tuple(
