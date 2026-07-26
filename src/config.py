@@ -131,6 +131,11 @@ class Config:
             DEFAULT_DATA_DIR_NAME,
         )
     )
+
+    @property
+    def memory_database_path(self) -> Path:
+        return self.data_dir / "memory.sqlite3"
+
     search_max_results: int = env_int("SEARCH_MAX_RESULTS", 4)
     history_turns: int = env_int("HISTORY_TURNS", 8)
     memory_limit: int = env_int("MEMORY_LIMIT", 30)
