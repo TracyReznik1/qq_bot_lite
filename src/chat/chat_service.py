@@ -6,7 +6,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from src.chat.prompt import build_system_prompt, build_untrusted_context
+from src.chat.prompt import _ensure_context, build_system_prompt, build_untrusted_context
+from src.memory.models import MemoryContext
 from src.services.search_service import web_search as search_web
 from src.services.search_service import normalize_search_query
 from src.services.search_service import search_query_specificity_score
@@ -270,16 +271,18 @@ def history_user_text(text: str, image_count: int) -> str:
 
 
 def generate_reply(
-    session_key: str,
+    context: MemoryContext | str,
     text: str,
     tool_context: str = "",
     image_data_urls: list[str] | None = None,
 ) -> str:
+    mem_ctx = _ensure_context(context)
+    session_key = mem_ctx.session_key
     images = list(image_data_urls or [])
     _ensure_history_loaded(session_key)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(session_key, tool_context)},
-        {"role": "user", "content": build_untrusted_context(session_key, tool_context)},
+        {"role": "system", "content": build_system_prompt(mem_ctx, tool_context)},
+        {"role": "user", "content": build_untrusted_context(mem_ctx, query=text, tool_context=tool_context)},
     ]
     with chat_history_lock:
         messages.extend(chat_history.get(session_key, []).copy())

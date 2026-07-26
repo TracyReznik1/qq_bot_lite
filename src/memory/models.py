@@ -72,6 +72,7 @@ class RetrievedMemory:
     score: float
     evidence_excerpts: tuple[str, ...] = ()
     relation_types: tuple[str, ...] = ()
+    usage: str = "evidence"
 
 
 @dataclass(frozen=True)
