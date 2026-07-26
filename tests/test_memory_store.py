@@ -1,3 +1,4 @@
+import base64
 import json
 import sqlite3
 import tempfile
@@ -222,6 +223,55 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIn("[redacted:credential]", payload)
         self.assertIn("[redacted:payment-data]", payload)
         self.assertIn("[redacted:image-data]", payload)
+
+    def test_job_payload_redacts_mime_wrapped_binary_base64(self):
+        encoded_values = []
+        for prefix, marker in (
+            (b"BM", b"BMP_PRIVATE_BODY"),
+            (b"II*\x00", b"TIFF_PRIVATE_BODY"),
+            (b"PK\x03\x04", b"ATTACHMENT_PRIVATE_BODY"),
+        ):
+            encoded = base64.b64encode(prefix + marker + (b"x" * 96)).decode()
+            encoded_values.append(
+                "\r\n".join(
+                    encoded[index : index + 40]
+                    for index in range(0, len(encoded), 40)
+                )
+            )
+        event = private_event(
+            message_id="mime-base64",
+            text="；".join(encoded_values),
+        )
+
+        job_id, _ = self.store.create_job(event)
+        stored_text = self.store.get_job(job_id).text
+
+        for encoded in encoded_values:
+            for line in encoded.splitlines():
+                with self.subTest(line=line):
+                    self.assertNotIn(line, stored_text)
+        self.assertEqual(
+            3,
+            stored_text.count("[redacted:image-data]"),
+        )
+
+    def test_job_payload_redacts_the_complete_cookie_header(self):
+        event = private_event(
+            message_id="multi-cookie",
+            text=(
+                "Cookie: session=alpha-secret; csrf=beta-secret; theme=dark\n"
+                "仍需保留这句话"
+            ),
+        )
+
+        job_id, _ = self.store.create_job(event)
+        stored_text = self.store.get_job(job_id).text
+
+        self.assertNotIn("alpha-secret", stored_text)
+        self.assertNotIn("beta-secret", stored_text)
+        self.assertNotIn("theme=dark", stored_text)
+        self.assertIn("[redacted:credential]", stored_text)
+        self.assertIn("仍需保留这句话", stored_text)
 
     def test_group_job_preserves_attribution_context_and_structured_payload(self):
         event = group_event(
@@ -689,6 +739,114 @@ class MemoryStoreTests(unittest.TestCase):
                 store.delete_claim_physically(claim.id, reason="user_forget")
             )
             self.assertNotIn(marker.encode("utf-8"), path.read_bytes())
+
+    def test_modern_sqlite_delete_does_not_run_full_fts_optimize(self):
+        claim, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="likes",
+            value="modern secure delete",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="modern-delete-message",
+            source_excerpt="modern secure delete",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="modern-delete-claim",
+        )
+        statements = []
+        original_connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        with mock.patch.object(sqlite3, "connect", side_effect=traced_connect):
+            self.assertTrue(
+                self.store.delete_claim_physically(
+                    claim.id,
+                    reason="user_forget",
+                )
+            )
+
+        optimize = [
+            statement
+            for statement in statements
+            if "values ('optimize')" in statement.lower()
+        ]
+        self.assertEqual([], optimize)
+
+    def test_old_sqlite_runs_fts_optimize_after_delete_transaction_commits(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "old-cleanup.sqlite3"
+            store = MemoryStore(path)
+            with mock.patch.object(sqlite3, "sqlite_version_info", (3, 41, 2)):
+                store.initialize()
+            claim, _ = store.create_claim(
+                scope_type="private",
+                scope_id="10001",
+                speaker_qq="10001",
+                subject_type="qq_user",
+                subject_id="10001",
+                predicate="likes",
+                value="old fallback cleanup",
+                memory_type="preference",
+                modality="asserted",
+                source_kind="message",
+                source_message_id="old-cleanup-message",
+                source_excerpt="old fallback cleanup",
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="medium",
+                dedupe_key="old-cleanup-claim",
+            )
+            statements = []
+            connection_number = 0
+            original_connect = sqlite3.connect
+
+            def traced_connect(*args, **kwargs):
+                nonlocal connection_number
+                connection = original_connect(*args, **kwargs)
+                connection_number += 1
+                current = connection_number
+                connection.set_trace_callback(
+                    lambda statement: statements.append((current, statement))
+                )
+                return connection
+
+            with mock.patch.object(
+                sqlite3,
+                "connect",
+                side_effect=traced_connect,
+            ):
+                self.assertTrue(
+                    store.delete_claim_physically(
+                        claim.id,
+                        reason="user_forget",
+                    )
+                )
+
+        delete_transaction_connections = {
+            number
+            for number, statement in statements
+            if statement.strip().lower() == "begin immediate"
+        }
+        optimize_connections = {
+            number
+            for number, statement in statements
+            if "values ('optimize')" in statement.lower()
+        }
+        self.assertEqual(1, len(delete_transaction_connections))
+        self.assertEqual(1, len(optimize_connections))
+        self.assertTrue(
+            delete_transaction_connections.isdisjoint(optimize_connections)
+        )
 
     def test_physical_delete_fails_bounded_if_reader_never_releases(self):
         marker = "BLOCKED_PRIVATE_MARKER_6d31"

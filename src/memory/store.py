@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,12 +23,20 @@ from src.memory.models import (
 SCHEMA_VERSION = 1
 MAX_SOURCE_EXCERPT_CHARS = 500
 PRIVACY_CHECKPOINT_TIMEOUT_MS = 250
+PRIVACY_OPTIMIZE_TIMEOUT_MS = 250
 _DATA_URL_PATTERN = re.compile(
     r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+",
     re.IGNORECASE,
 )
 _BARE_IMAGE_BASE64_PATTERN = re.compile(
     r"(?:iVBORw0KGgo|/9j/|R0lGOD(?:lh|dh)|UklGR)[a-z0-9+/=\r\n]{12,}",
+    re.IGNORECASE,
+)
+_MIME_WRAPPED_BASE64_PATTERN = re.compile(
+    r"(?<![a-z0-9+/])"
+    r"(?:[a-z0-9+/]{16,}\r?\n)+"
+    r"[a-z0-9+/]{2,}={0,2}"
+    r"(?![a-z0-9+/=])",
     re.IGNORECASE,
 )
 _GENERIC_BASE64_PATTERN = re.compile(
@@ -48,6 +57,9 @@ _PAYMENT_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?:\b(?:payment[_ -]?(?:token|credential)|cvv|cvc)\b"
     r"|支付凭据|支付密码|银行卡号)"
     r"\s*(?:[:=：]|\bis\b|是|为)\s*[^\s,;，；]+"
+)
+_COOKIE_HEADER_PATTERN = re.compile(
+    r"(?im)\b(?:cookie|set-cookie)\s*[:=]\s*[^\r\n，；]+"
 )
 _CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)(?:\b(?:api[_ -]?key|secret|access[_ -]?token|token|password|"
@@ -105,12 +117,14 @@ def _redact_forbidden_payload_data(text: str) -> str:
     text = _PRIVATE_KEY_PATTERN.sub("[redacted:credential]", text)
     text = _DATA_URL_PATTERN.sub("[redacted:image-data]", text)
     text = _BARE_IMAGE_BASE64_PATTERN.sub("[redacted:image-data]", text)
+    text = _MIME_WRAPPED_BASE64_PATTERN.sub("[redacted:image-data]", text)
     text = _GENERIC_BASE64_PATTERN.sub("[redacted:image-data]", text)
     text = _BEARER_PATTERN.sub("[redacted:credential]", text)
     text = _PAYMENT_ASSIGNMENT_PATTERN.sub(
         "[redacted:payment-data]",
         text,
     )
+    text = _COOKIE_HEADER_PATTERN.sub("[redacted:credential]", text)
     text = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
         "[redacted:credential]",
         text,
@@ -491,8 +505,10 @@ class MemoryStore:
             raise ValueError("deletion reason must be a body-free audit code")
         deleted = False
         needs_checkpoint = False
+        needs_fts_optimize = False
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            needs_fts_optimize = not _fts_secure_delete_enabled(connection)
             exists = connection.execute(
                 "SELECT 1 FROM memory_claims WHERE id = ?",
                 (claim_id,),
@@ -526,14 +542,36 @@ class MemoryStore:
                     "DELETE FROM memory_claims WHERE id = ?",
                     (claim_id,),
                 )
-                connection.execute(
-                    "INSERT INTO memory_fts(memory_fts) VALUES ('optimize')"
-                )
                 deleted = True
                 needs_checkpoint = True
         if needs_checkpoint:
+            if needs_fts_optimize:
+                self._optimize_fts_for_privacy()
             self._checkpoint_wal()
         return deleted
+
+    def _optimize_fts_for_privacy(self) -> None:
+        deadline = time.monotonic() + PRIVACY_OPTIMIZE_TIMEOUT_MS / 1000
+        with self._connection() as connection:
+            connection.execute(
+                f"PRAGMA busy_timeout = {PRIVACY_OPTIMIZE_TIMEOUT_MS}"
+            )
+            connection.set_progress_handler(
+                lambda: int(time.monotonic() >= deadline),
+                1000,
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO memory_fts(memory_fts) VALUES ('optimize')"
+                )
+            except sqlite3.OperationalError as error:
+                if "interrupt" not in str(error).lower():
+                    raise
+                raise RuntimeError(
+                    "FTS privacy cleanup exceeded time limit"
+                ) from error
+            finally:
+                connection.set_progress_handler(None, 0)
 
     def _checkpoint_wal(self) -> None:
         with self._connection() as connection:
@@ -695,6 +733,17 @@ class MemoryStore:
 
 def _fts_phrase(value: str) -> str:
     return '"' + value.strip().replace('"', '""') + '"'
+
+
+def _fts_secure_delete_enabled(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT v
+        FROM memory_fts_config
+        WHERE k = 'secure-delete'
+        """
+    ).fetchone()
+    return row is not None and int(row["v"]) == 1
 
 
 def _insert_fts_row(
