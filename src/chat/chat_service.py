@@ -321,7 +321,12 @@ def generate_reply(
 
         if needs_final_summary:
             reply = normalize_chat_response(
-                llm.chat(messages, temperature=0.75, tools=tools)
+                llm.chat(
+                    messages,
+                    temperature=0.75,
+                    tools=tools,
+                    tool_choice="none",
+                )
             ).content
             if not reply.strip():
                 reply = TOOL_CALL_LIMIT_FALLBACK

@@ -8,7 +8,7 @@ from unittest import mock
 import run_bot
 from src.config import Config
 from src.model_config import ConfiguredModel, ModelConfigurationError
-from src.services.llm_client import _build_chain
+from src.services.llm_client import _build_chain, _model_supports_tools
 
 
 VALID_ENV = {
@@ -20,6 +20,26 @@ VALID_ENV = {
 
 
 class ConfiguredChainTests(unittest.TestCase):
+    def test_tool_support_is_not_inferred_from_model_name_substrings(self):
+        self.assertTrue(
+            _model_supports_tools(
+                "deepseek",
+                "custom-reasoner-with-tools",
+            )
+        )
+        self.assertTrue(
+            _model_supports_tools(
+                "deepseek",
+                "custom-r1-with-tools",
+            )
+        )
+        self.assertFalse(
+            _model_supports_tools(
+                "gemini",
+                "gemma-4-26b-a4b-it",
+            )
+        )
+
     def test_config_exposes_only_the_new_model_chain(self):
         with mock.patch.dict(os.environ, VALID_ENV, clear=True):
             current = Config()
