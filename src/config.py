@@ -16,13 +16,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 
-DEFAULT_BOT_NAME = "qqbot"
-DEFAULT_BOT_PERSONA = "你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
 DEFAULT_DATA_DIR_NAME = "qqbot_data"
-
-
-def env_text(name: str, default: str) -> str:
-    return os.getenv(name, "").strip() or default
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -61,12 +55,7 @@ def resolve_path(value: str, default: str) -> Path:
 
 @dataclass(frozen=True)
 class Config:
-    bot_name: str = field(
-        default_factory=lambda: env_text("BOT_NAME", DEFAULT_BOT_NAME)
-    )
-    bot_persona: str = field(
-        default_factory=lambda: env_text("BOT_PERSONA", DEFAULT_BOT_PERSONA)
-    )
+    persona_path: Path = field(default_factory=lambda: BASE_DIR / "config" / "persona.md")
     # ── Gemini / Google AI Studio native API ──
     gemini_api_key: str = field(
         default_factory=lambda: os.getenv("GEMINI_API_KEY", "").strip()

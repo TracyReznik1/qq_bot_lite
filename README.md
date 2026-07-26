@@ -67,17 +67,15 @@ python run_bot.py
 
 推荐让两个服务都只监听本机。如果它们位于不同机器，需改为可达地址、放行防火墙，并使用反向代理 / TLS；不要直接把未鉴权的开发服务器暴露到公网。
 
-群聊默认 `REQUIRE_GROUP_AT=true`，只有 OneBot 事件中确实包含对机器人账号的 `@` 才处理；仅 `@` 而没有正文也不会回复。设为 `false` 后，机器人会处理群内每条有效消息。`BOT_NAME` 只控制显示身份，不决定 OneBot 的 `@` 检测。
+群聊默认 `REQUIRE_GROUP_AT=true`，只有 OneBot 事件中确实包含对机器人账号的 `@` 才处理；仅 `@` 而没有正文也不会回复。设为 `false` 后，机器人会处理群内每条有效消息。机器人显示身份来自 `config/persona.md` 中的名字字段，不决定 OneBot 的 `@` 检测。
 
 ## 最小 `.env` 配置
 
-先复制 `.env.example`，再通过 `CHAT_MODELS` 配置模型链。模型链引用的每个提供商（`gemini` 或 `deepseek`）都必须填写对应 API Key；`ONEBOT_ACCESS_TOKEN` 仅在 OneBot HTTP API 开启鉴权时填写；`CALLBACK_SECRET` 推荐设置，启用后必须与 OneBot 回调端保持一致。下面的占位符不要照抄。
+先复制 `.env.example`，再通过 `CHAT_MODELS` 配置模型链。模型链引用的每个提供商（`gemini` 或 `deepseek`）都必须填写对应 API Key；`ONEBOT_ACCESS_TOKEN` 仅在 OneBot HTTP API 开启鉴权时填写；`CALLBACK_SECRET` 推荐设置，启用后必须与 OneBot 回调端保持一致。机器人身份和完整角色设定保存在 `config/persona.md`，可参考 `config/persona.example.md` 修改。下面的占位符不要照抄。
 
 Gemini 示例：
 
 ```dotenv
-BOT_NAME=qqbot
-BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
 CHAT_MODELS=gemini:填写账号可用的模型名
 GEMINI_API_KEY=填写你的_Gemini_Key
 GEMINI_URL=https://generativelanguage.googleapis.com/v1
@@ -89,8 +87,6 @@ CALLBACK_SECRET=
 Gemini 带 DeepSeek 回退示例：
 
 ```dotenv
-BOT_NAME=qqbot
-BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
 CHAT_MODELS=gemini:填写主模型名,deepseek:填写回退模型名
 GEMINI_API_KEY=填写你的_Gemini_Key
 DEEPSEEK_API_KEY=填写你的_DeepSeek_Key
@@ -102,8 +98,6 @@ CALLBACK_SECRET=
 DeepSeek 示例：
 
 ```dotenv
-BOT_NAME=qqbot
-BOT_PERSONA="你是一个自然、友好、简洁、可靠的 QQ 聊天助手。"
 CHAT_MODELS=deepseek:填写账号可用的模型名
 DEEPSEEK_API_KEY=填写你的_DeepSeek_Key
 ONEBOT_API_URL=http://127.0.0.1:3000
@@ -114,12 +108,7 @@ CALLBACK_SECRET=
 ## `.env` 格式规则
 
 - 一行一个 `KEY=value`；注释用单独一行的 `#` 开头。密钥通常不需要引号，但包含空格、`#` 或换行的文本应使用成对引号。
-- 多行 `BOT_PERSONA` 必须有成对双引号。以下是可由 python-dotenv 解析的合法写法：
-
-  ```dotenv
-  BOT_PERSONA="你是一个简洁可靠的 QQ 助手。
-  回答时先给结论，再补充必要说明。"
-  ```
+- 角色设定不写入 `.env`。编辑 `config/persona.md` 时必须保留非空的 `- 名字：...` 行；需要新建角色时可复制 `config/persona.example.md`。
 
 - 布尔项不区分大小写；`1`、`true`、`yes`、`y`、`on` 表示真，其他已填写的值表示假。完全缺失时使用源码默认值。
 - `ADMIN_QQ_IDS` 是列表，多个 QQ 号可用英文逗号或分号分隔，项目会去除首尾空白和重复项。
@@ -130,12 +119,10 @@ CALLBACK_SECRET=
 
 “默认值”均来自 `src/config.py`。空表示源码默认空字符串；“条件必需”表示启用对应能力时必须配置。
 
-### 身份与服务
+### 服务
 
 | 参数 | 必需性 | 源码默认值 | 作用与配置方法 |
 |---|---|---|---|
-| `BOT_NAME` | 可选 | `qqbot` | 机器人显示身份；空白也回退为默认值。 |
-| `BOT_PERSONA` | 可选 | `你是一个自然、友好、简洁、可靠的 QQ 聊天助手。` | 只影响语气与角色风格，不能扩大能力边界；多行值使用成对双引号。 |
 | `BOT_HOST` | 可选 | `127.0.0.1` | Flask 监听地址。只有明确理解风险时才改为 `0.0.0.0`。 |
 | `BOT_PORT` | 可选 | `5000` | Flask 监听端口，必须与 OneBot 回调地址一致。 |
 | `CALLBACK_SECRET` | 推荐 | 空 | 验证 OneBot → qqbot 回调；设置后使用 Bearer 头或 `X-QQBOT-Callback-Secret`。 |
@@ -246,7 +233,7 @@ Invoke-RestMethod http://127.0.0.1:5000/health
 
 ### python-dotenv could not parse statement
 
-通常是 `.env` 中引号没有成对、把多行角色设定写成了多个裸行，或混入了不合法的赋值。对照 `.env.example`，让每项保持 `KEY=value`；多行 `BOT_PERSONA` 使用上文的成对双引号，然后重启。
+通常是 `.env` 中引号没有成对，或混入了不合法的赋值。对照 `.env.example`，让每项保持 `KEY=value`，然后重启。角色设定应保存在 `config/persona.md`，不要作为 `.env` 多行值填写。
 
 ### `CHAT_MODELS` 配置错误
 

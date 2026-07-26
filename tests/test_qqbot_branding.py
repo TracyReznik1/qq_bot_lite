@@ -43,13 +43,17 @@ class QqbotBrandingTests(unittest.TestCase):
         self.assertIn("Starting qqbot", launcher)
         self.assertNotIn("ATRI", launcher)
 
-    def test_operator_files_describe_configurable_qqbot_identity(self):
+    def test_operator_files_describe_persona_file_identity(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        persona = (ROOT / "config" / "persona.md").read_text(encoding="utf-8")
+        template = (ROOT / "config" / "persona.example.md").read_text(encoding="utf-8")
 
         self.assertTrue(readme.startswith("# qqbot — qqbot_lite"))
-        self.assertIn("BOT_NAME=qqbot", env_example)
-        self.assertIn("BOT_PERSONA=你是一个自然、友好、简洁、可靠的 QQ 聊天助手。", env_example)
+        self.assertNotIn("BOT_NAME", env_example)
+        self.assertNotIn("BOT_PERSONA", env_example)
+        self.assertIn("- 名字：ATRI", persona)
+        self.assertIn("- 名字：[机器人名称]", template)
         self.assertIn("qqbot_data/", readme)
         self.assertNotIn("启动ATRI", readme)
         self.assertNotIn("@ATRI", readme)

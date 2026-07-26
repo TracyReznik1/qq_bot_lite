@@ -10,6 +10,7 @@ from src.chat.chat_service import generate_reply
 from src.chat.memory import migrate_legacy_memory_files
 from src.commands import CommandContext, handle_command
 from src.config import BASE_DIR, config
+from src.persona import get_persona
 from src.messaging import (
     MessageQueue,
     enqueue_message,
@@ -62,6 +63,7 @@ def startup() -> None:
         if _startup_initialized:
             return
 
+        get_persona()
         default_data_dir = (BASE_DIR / "qqbot_data").resolve()
         if config.data_dir.resolve() == default_data_dir:
             migrate_legacy_data(
@@ -297,9 +299,10 @@ def onebot_event() -> dict[str, str] | tuple[dict[str, str], int]:
 
 @app.route("/health", methods=["GET"])
 def health() -> dict[str, Any]:
+    persona = get_persona()
     return {
         "status": "ok",
-        "bot_name": config.bot_name,
+        "bot_name": persona.name,
         "chat_models": [
             {"provider": item.provider, "model": item.model}
             for item in config.chat_models
@@ -313,7 +316,7 @@ def health() -> dict[str, Any]:
 
 def run() -> None:
     startup()
-    logger.info("Starting %s on %s:%s", config.bot_name, config.host, config.port)
+    logger.info("Starting %s on %s:%s", get_persona().name, config.host, config.port)
     app.run(host=config.host, port=config.port)
 
 

@@ -1,9 +1,10 @@
-from src.config import config
+from src.persona import get_persona
 
 
 def help_text() -> str:
+    persona = get_persona()
     return (
-        f"我是 {config.bot_name}（qqbot_lite 严格版），默认先聊天，必要时才会联网搜索。\n"
+        f"我是 {persona.name}（qqbot_lite 严格版），默认先聊天，必要时才会联网搜索。\n"
         "用法示例：\n"
         "你好\n"
         "kskbl 是什么意思\n"
