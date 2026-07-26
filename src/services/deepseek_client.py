@@ -14,6 +14,31 @@ from src.util import try_proxied_post
 logger = logging.getLogger("qq-bot")
 
 
+def _clean_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for message in messages:
+        clean_message = {
+            key: value
+            for key, value in message.items()
+            if key != "_provider_context"
+        }
+        provider_context = message.get("_provider_context")
+        if (
+            message.get("role") == "assistant"
+            and isinstance(provider_context, dict)
+            and provider_context.get("provider") == "deepseek"
+        ):
+            reasoning_content = provider_context.get(
+                "reasoning_content"
+            )
+            if isinstance(reasoning_content, str):
+                clean_message["reasoning_content"] = reasoning_content
+        cleaned.append(clean_message)
+    return cleaned
+
+
 class DeepSeekClient:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
@@ -33,14 +58,7 @@ class DeepSeekClient:
         model_name = str(model or "").strip()
         if not model_name:
             raise RuntimeError("DeepSeek model is not configured")
-        clean_messages = [
-            {
-                key: value
-                for key, value in message.items()
-                if key != "_provider_context"
-            }
-            for message in messages
-        ]
+        clean_messages = _clean_messages(messages)
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": clean_messages,
@@ -69,8 +87,16 @@ class DeepSeekClient:
         raw_tool_calls = message.get("tool_calls") or []
         if not isinstance(raw_tool_calls, list):
             raw_tool_calls = []
+        reasoning_content = message.get("reasoning_content")
+        provider_context = None
+        if raw_tool_calls and isinstance(reasoning_content, str):
+            provider_context = {
+                "provider": "deepseek",
+                "reasoning_content": reasoning_content,
+            }
 
         return ChatResponse(
             content=(message.get("content") or "").strip(),
             tool_calls=raw_tool_calls,
+            provider_context=provider_context,
         )
