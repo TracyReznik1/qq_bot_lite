@@ -64,6 +64,40 @@ def candidate(
     )
 
 
+def seed_claim(
+    store: MemoryStore,
+    *,
+    dedupe_key: str,
+    scope_type: str = "group",
+    scope_id: str = "900",
+    speaker_qq: str = "101",
+    subject_id: str = "999",
+    predicate: str = "likes",
+    value: str = "跑步",
+    modality: str = "asserted",
+    status: str = "active",
+):
+    return store.create_claim(
+        scope_type=scope_type,
+        scope_id=scope_id,
+        speaker_qq=speaker_qq,
+        subject_type="qq_user",
+        subject_id=subject_id,
+        predicate=predicate,
+        value=value,
+        memory_type="fact",
+        modality=modality,
+        source_kind="message:speaker",
+        source_message_id=dedupe_key,
+        source_excerpt=value,
+        extraction_confidence="high",
+        attribution_confidence="high",
+        truth_confidence="high",
+        dedupe_key=dedupe_key,
+        status=status,
+    )[0]
+
+
 class MemoryPolicyTests(unittest.TestCase):
     def setUp(self):
         try:
@@ -159,6 +193,40 @@ class MemoryPolicyTests(unittest.TestCase):
             rows[0]["valid_to"],
         )
 
+    def test_historical_candidate_closes_existing_claim_and_adds_evidence(self):
+        old = self.policy.apply(
+            event("我喜欢跑步", message_id="historical-old"),
+            (candidate(),),
+        )[0].claim
+
+        decisions = self.policy.apply(
+            event(
+                "我以前喜欢跑步，现在喜欢游泳",
+                message_id="historical-replacement",
+            ),
+            (
+                candidate(
+                    value="跑步",
+                    valid_to="2026-07-26T00:00:00+00:00",
+                ),
+                candidate(
+                    value="游泳",
+                    valid_from="2026-07-26T00:00:00+00:00",
+                ),
+            ),
+        )
+
+        self.assertEqual(("archived", "created"), tuple(d.action for d in decisions))
+        self.assertEqual(old.id, decisions[0].claim.id)
+        self.assertEqual(2, len(self.rows()))
+        archived = self.store.get_claim(old.id)
+        self.assertEqual("archived", archived.status)
+        self.assertEqual(
+            "2026-07-26T00:00:00+00:00",
+            archived.valid_to,
+        )
+        self.assertEqual(1, len(self.store.list_evidence(old.id)))
+
     def test_policy_matrix_rejects_hard_secret(self):
         decisions = self.policy.apply(
             event("我的密钥需要记住"),
@@ -238,6 +306,21 @@ class MemoryPolicyTests(unittest.TestCase):
             ),
         )
 
+    def test_bare_number_is_not_an_explicit_qq_marker(self):
+        decisions = self.policy.apply(
+            event("我有123个苹果"),
+            (
+                candidate(
+                    subject_ref="qq:123",
+                    predicate="owns_count",
+                    value="123个苹果",
+                    memory_type="fact",
+                ),
+            ),
+        )
+
+        self.assertEqual((), decisions)
+
     def test_unique_scoped_alias_resolves_and_ambiguous_alias_is_rejected(self):
         self.policy.apply(
             event(
@@ -299,6 +382,65 @@ class MemoryPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual((), ambiguous)
+
+    def test_exact_active_claim_after_fts_limit_is_still_confirmed(self):
+        for index in range(512):
+            seed_claim(
+                self.store,
+                dedupe_key=f"filler-active-{index}",
+                subject_id=f"filler-{index}",
+                value=f"值{index}",
+            )
+        target = seed_claim(
+            self.store,
+            dedupe_key="target-after-limit",
+        )
+
+        decision = self.policy.apply(
+            event(
+                "QQ 999 喜欢跑步",
+                user_id="101",
+                message_id="confirm-after-limit",
+                group_id="900",
+            ),
+            (candidate(subject_ref="qq:999"),),
+        )[0]
+
+        self.assertEqual("confirmed", decision.action)
+        self.assertEqual(target.id, decision.claim.id)
+        self.assertEqual(513, len(self.rows()))
+
+    def test_alias_ambiguity_after_fts_limit_is_not_falsely_unique(self):
+        for index in range(512):
+            seed_claim(
+                self.store,
+                dedupe_key=f"same-alias-{index}",
+                speaker_qq=f"speaker-{index}",
+                subject_id="999",
+                predicate="preferred_name",
+                value="安安",
+            )
+        seed_claim(
+            self.store,
+            dedupe_key="conflicting-alias-after-limit",
+            speaker_qq="other-speaker",
+            subject_id="888",
+            predicate="preferred_name",
+            value="安安",
+        )
+
+        decisions = self.policy.apply(
+            event(
+                "安安喜欢跑步",
+                user_id="777",
+                message_id="ambiguous-after-limit",
+                group_id="900",
+            ),
+            (candidate(subject_ref="qq:999"),),
+        )
+
+        self.assertEqual((), decisions)
+        self.assertEqual(513, len(self.rows()))
 
     def test_reply_target_resolves_from_background_supplied_user_id(self):
         decisions = self.policy.apply(
@@ -427,6 +569,102 @@ class MemoryPolicyTests(unittest.TestCase):
             self.store.list_relations(new.claim.id)[0].relation_type,
         )
 
+    def test_supersede_targets_only_claim_bound_to_correction_clause(self):
+        running = self.policy.apply(
+            event("我喜欢跑步", message_id="target-running"),
+            (candidate(value="跑步"),),
+        )[0].claim
+        swimming = self.policy.apply(
+            event("我喜欢游泳", message_id="target-swimming"),
+            (candidate(value="游泳"),),
+        )[0].claim
+
+        decision = self.policy.apply(
+            event(
+                "纠正一下，我不是游泳而是喜欢骑行",
+                message_id="targeted-correction",
+            ),
+            (
+                candidate(
+                    value="骑行",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertEqual("superseded", decision.action)
+        self.assertEqual("active", self.store.get_claim(running.id).status)
+        self.assertEqual(
+            "superseded",
+            self.store.get_claim(swimming.id).status,
+        )
+
+    def test_supersede_without_unique_or_named_target_does_not_close_claims(self):
+        running = self.policy.apply(
+            event("我喜欢跑步", message_id="ambiguous-running"),
+            (candidate(value="跑步"),),
+        )[0].claim
+        swimming = self.policy.apply(
+            event("我喜欢游泳", message_id="ambiguous-swimming"),
+            (candidate(value="游泳"),),
+        )[0].claim
+
+        decision = self.policy.apply(
+            event("纠正一下，我喜欢骑行", message_id="ambiguous-target"),
+            (
+                candidate(
+                    value="骑行",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertNotEqual("superseded", decision.action)
+        self.assertEqual("active", self.store.get_claim(running.id).status)
+        self.assertEqual("active", self.store.get_claim(swimming.id).status)
+
+    def test_reconciliation_failure_rolls_back_claim_updates_and_fts(self):
+        old = self.policy.apply(
+            event("我叫安安", message_id="atomic-old"),
+            (
+                candidate(
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER fail_memory_relation
+                BEFORE INSERT ON memory_relations
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected relation failure');
+                END
+                """
+            )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.policy.apply(
+                event("纠正一下，我叫小夏", message_id="atomic-new"),
+                (
+                    candidate(
+                        predicate="name",
+                        value="小夏",
+                        memory_type="identity",
+                        operation="supersede",
+                    ),
+                ),
+            )
+
+        self.assertEqual(1, len(self.rows()))
+        unchanged = self.store.get_claim(old.id)
+        self.assertEqual("active", unchanged.status)
+        self.assertIsNone(unchanged.valid_to)
+        self.assertEqual((), self.store.search_claims("小夏"))
+        self.assertEqual((), self.store.list_relations(old.id))
+
     def test_same_speaker_explicit_retraction_retracts_old_claim(self):
         old = self.policy.apply(
             event("我喜欢跑步", message_id="old"),
@@ -485,6 +723,90 @@ class MemoryPolicyTests(unittest.TestCase):
         )[0]
         decisions = self.policy.apply(
             event("我喜欢跑步", message_id="unverified"),
+            (
+                candidate(
+                    modality="negated",
+                    operation="retract",
+                ),
+            ),
+        )
+
+        self.assertEqual((), decisions)
+        self.assertEqual("active", self.store.get_claim(old.claim.id).status)
+
+    def test_unrelated_correction_clause_cannot_supersede_a_candidate(self):
+        old = self.policy.apply(
+            event("我叫安安", message_id="old-name"),
+            (
+                candidate(
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0]
+        decision = self.policy.apply(
+            event("其实天气很好；我叫小夏", message_id="unrelated-correction"),
+            (
+                candidate(
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertNotEqual("superseded", decision.action)
+        self.assertEqual("active", self.store.get_claim(old.claim.id).status)
+
+    def test_correction_must_bind_subject_predicate_and_value_clause(self):
+        old = self.policy.apply(
+            event(
+                "QQ 999 的名字是安安",
+                user_id="101",
+                message_id="old-other-name",
+                group_id="900",
+                mentioned_qq_ids=("999",),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0]
+        decision = self.policy.apply(
+            event(
+                "其实 QQ 888 喜欢小夏；QQ 999 的名字是小夏",
+                user_id="101",
+                message_id="wrong-correction-clause",
+                group_id="900",
+                mentioned_qq_ids=("888", "999"),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        self.assertNotEqual("superseded", decision.action)
+        self.assertEqual("active", self.store.get_claim(old.claim.id).status)
+
+    def test_unrelated_withdrawal_clause_cannot_retract_a_candidate(self):
+        old = self.policy.apply(
+            event("我喜欢跑步", message_id="old-like"),
+            (candidate(),),
+        )[0]
+        decisions = self.policy.apply(
+            event("我收回天气预报；我喜欢跑步", message_id="wrong-withdrawal"),
             (
                 candidate(
                     modality="negated",
@@ -559,6 +881,101 @@ class MemoryPolicyTests(unittest.TestCase):
             self.store.list_relations(supported.claim.id)[0].relation_type,
         )
 
+    def test_support_supersession_and_contradiction_are_all_reconciled(self):
+        old_same_speaker = self.policy.apply(
+            event(
+                "QQ 999 的名字是安安",
+                user_id="101",
+                message_id="mixed-old",
+                group_id="900",
+                mentioned_qq_ids=("999",),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="安安",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+        exact_other = self.policy.apply(
+            event(
+                "QQ 999 的名字是小夏",
+                user_id="102",
+                message_id="mixed-support",
+                group_id="900",
+                mentioned_qq_ids=("999",),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+        conflicting_other = self.policy.apply(
+            event(
+                "QQ 999 的名字是小王",
+                user_id="103",
+                message_id="mixed-conflict",
+                group_id="900",
+                mentioned_qq_ids=("999",),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="小王",
+                    memory_type="identity",
+                ),
+            ),
+        )[0].claim
+
+        mixed = self.policy.apply(
+            event(
+                "纠正一下，QQ 999 不是安安而是名字叫小夏",
+                user_id="101",
+                message_id="mixed-new",
+                group_id="900",
+                mentioned_qq_ids=("999",),
+            ),
+            (
+                candidate(
+                    subject_ref="qq:999",
+                    predicate="name",
+                    value="小夏",
+                    memory_type="identity",
+                    operation="supersede",
+                ),
+            ),
+        )[0]
+
+        outgoing = {
+            (relation.target_claim_id, relation.relation_type)
+            for relation in self.store.list_relations(mixed.claim.id)
+            if relation.source_claim_id == mixed.claim.id
+        }
+        self.assertEqual(
+            {
+                (old_same_speaker.id, "supersedes"),
+                (exact_other.id, "supports"),
+                (conflicting_other.id, "contradicts"),
+            },
+            outgoing,
+        )
+        self.assertEqual("disputed", mixed.action)
+        self.assertEqual(
+            "superseded",
+            self.store.get_claim(old_same_speaker.id).status,
+        )
+        self.assertEqual(
+            "disputed",
+            self.store.get_claim(conflicting_other.id).status,
+        )
+
     def test_lifecycle_rules_keep_preferred_names_and_preference_floor(self):
         preferred = self.policy.apply(
             event("请一直叫我安安", message_id="preferred"),
@@ -611,6 +1028,39 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual([], self.rows())
 
+    def test_temporal_values_require_aware_ordered_timestamps_and_normalize_utc(
+        self,
+    ):
+        invalid_candidates = (
+            candidate(valid_from="2026-07-26"),
+            candidate(valid_from="2026-07-26T08:00:00"),
+            candidate(
+                valid_from="2026-07-27T00:00:00+00:00",
+                valid_to="2026-07-26T00:00:00+00:00",
+            ),
+        )
+        for index, invalid in enumerate(invalid_candidates):
+            with self.subTest(candidate=invalid):
+                self.assertEqual(
+                    (),
+                    self.policy.apply(
+                        event("我喜欢跑步", message_id=f"bad-time-{index}"),
+                        (invalid,),
+                    ),
+                )
+
+        normalized = self.policy.apply(
+            event("我以前喜欢跑步", message_id="normalized-time"),
+            (
+                candidate(
+                    valid_from="2026-07-26T08:00:00+08:00",
+                    valid_to="2026-07-27T08:00:00+08:00",
+                ),
+            ),
+        )[0].claim
+        self.assertEqual("2026-07-26T00:00:00+00:00", normalized.valid_from)
+        self.assertEqual("2026-07-27T00:00:00+00:00", normalized.valid_to)
+
     def test_quoted_first_person_is_not_attributed_to_real_sender(self):
         decisions = self.policy.apply(
             event("小明说：“我喜欢跑步”"),
@@ -619,6 +1069,60 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual((), decisions)
         self.assertEqual([], self.rows())
+
+    def test_speaker_requires_unquoted_first_person_across_quote_styles(self):
+        quoted_or_unattributed = (
+            "小明说：‘我喜欢跑步’",
+            "小明写道《我喜欢跑步》",
+            "`我喜欢跑步`",
+            "> 我喜欢跑步",
+            "喜欢跑步",
+        )
+        for index, text in enumerate(quoted_or_unattributed):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    (),
+                    self.policy.apply(
+                        event(text, message_id=f"quoted-style-{index}"),
+                        (candidate(),),
+                    ),
+                )
+
+        unquoted = self.policy.apply(
+            event(
+                "小明说“我喜欢跑步”，但我喜欢游泳",
+                message_id="quoted-and-own",
+            ),
+            (candidate(value="游泳"),),
+        )
+        self.assertEqual(1, len(unquoted))
+
+    def test_policy_rejects_over_limit_candidate_batches_and_long_qq_refs(self):
+        too_many = tuple(
+            candidate(
+                predicate=f"fact_{index}",
+                value=f"值{index}",
+                memory_type="fact",
+            )
+            for index in range(17)
+        )
+        self.assertEqual(
+            (),
+            self.policy.apply(
+                event("我陈述很多事实", message_id="too-many"),
+                too_many,
+            ),
+        )
+        self.assertEqual(
+            (),
+            self.policy.apply(
+                event(
+                    "QQ 1234567890123 喜欢跑步",
+                    message_id="long-qq",
+                ),
+                (candidate(subject_ref="qq:1234567890123"),),
+            ),
+        )
 
     def test_sensitive_group_claim_and_image_only_ownership_are_rejected(self):
         group_sensitive = self.policy.apply(

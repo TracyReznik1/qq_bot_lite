@@ -439,6 +439,12 @@ class MemoryStore:
             if cursor.rowcount != 1:
                 raise ValueError(f"invalid state transition for memory job {job_id}")
 
+    @contextmanager
+    def reconciliation(self) -> Iterator["_MemoryReconciliation"]:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            yield _MemoryReconciliation(connection)
+
     def create_claim(
         self,
         *,
@@ -463,56 +469,30 @@ class MemoryStore:
         valid_to: str | None = None,
         last_confirmed_at: str | None = None,
     ) -> tuple[MemoryClaim, bool]:
-        timestamp = _utc_now()
-        source_excerpt = source_excerpt[:MAX_SOURCE_EXCERPT_CHARS]
         with self._connection() as connection:
-            parameters = (
-                scope_type,
-                scope_id,
-                speaker_qq,
-                subject_type,
-                subject_id,
-                predicate,
-                value,
-                memory_type,
-                modality,
-                source_kind,
-                source_message_id,
-                source_excerpt,
-                extraction_confidence,
-                attribution_confidence,
-                truth_confidence,
-                status,
-                timestamp,
-                valid_from,
-                valid_to,
-                last_confirmed_at,
-                dedupe_key,
+            return _create_claim_in_connection(
+                connection,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                speaker_qq=speaker_qq,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                predicate=predicate,
+                value=value,
+                memory_type=memory_type,
+                modality=modality,
+                source_kind=source_kind,
+                source_message_id=source_message_id,
+                source_excerpt=source_excerpt,
+                extraction_confidence=extraction_confidence,
+                attribution_confidence=attribution_confidence,
+                truth_confidence=truth_confidence,
+                dedupe_key=dedupe_key,
+                status=status,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                last_confirmed_at=last_confirmed_at,
             )
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_claims(
-                    scope_type, scope_id, speaker_qq, subject_type, subject_id,
-                    predicate, value, memory_type, modality, source_kind,
-                    source_message_id, source_excerpt, extraction_confidence,
-                    attribution_confidence, truth_confidence, status,
-                    created_at, valid_from, valid_to, last_confirmed_at,
-                    dedupe_key
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                ON CONFLICT(dedupe_key) DO NOTHING
-                """,
-                parameters,
-            )
-            created = cursor.rowcount == 1
-            row = connection.execute(
-                "SELECT * FROM memory_claims WHERE dedupe_key = ?",
-                (dedupe_key,),
-            ).fetchone()
-            if created:
-                _insert_fts_row(connection, row)
-        return _claim_from_row(row), created
 
     def get_claim(self, claim_id: int) -> MemoryClaim | None:
         with self._connection() as connection:
@@ -523,40 +503,8 @@ class MemoryStore:
         return None if row is None else _claim_from_row(row)
 
     def update_claim(self, claim_id: int, **changes: Any) -> MemoryClaim:
-        if not changes:
-            existing = self.get_claim(claim_id)
-            if existing is None:
-                raise KeyError(f"memory claim {claim_id} does not exist")
-            return existing
-        invalid = set(changes) - _MUTABLE_CLAIM_FIELDS
-        if invalid:
-            raise ValueError(
-                f"unsupported memory claim fields: {', '.join(sorted(invalid))}"
-            )
-        if "source_excerpt" in changes:
-            changes["source_excerpt"] = str(changes["source_excerpt"])[
-                :MAX_SOURCE_EXCERPT_CHARS
-            ]
-        assignments = ", ".join(f"{name} = ?" for name in changes)
-        parameters = [changes[name] for name in changes]
-        parameters.append(claim_id)
         with self._connection() as connection:
-            cursor = connection.execute(
-                f"UPDATE memory_claims SET {assignments} WHERE id = ?",
-                parameters,
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"memory claim {claim_id} does not exist")
-            row = connection.execute(
-                "SELECT * FROM memory_claims WHERE id = ?",
-                (claim_id,),
-            ).fetchone()
-            connection.execute(
-                "DELETE FROM memory_fts WHERE rowid = ?",
-                (claim_id,),
-            )
-            _insert_fts_row(connection, row)
-        return _claim_from_row(row)
+            return _update_claim_in_connection(connection, claim_id, **changes)
 
     def delete_claim_physically(self, claim_id: int, *, reason: str) -> bool:
         if _AUDIT_REASON_PATTERN.fullmatch(reason) is None:
@@ -652,34 +600,14 @@ class MemoryStore:
         source_message_id: str,
         source_excerpt: str,
     ) -> tuple[int, bool]:
-        source_excerpt = source_excerpt[:MAX_SOURCE_EXCERPT_CHARS]
         with self._connection() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_evidence(
-                    claim_id, source_kind, source_message_id,
-                    source_excerpt, created_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(claim_id, source_kind, source_message_id) DO NOTHING
-                """,
-                (
-                    claim_id,
-                    source_kind,
-                    source_message_id,
-                    source_excerpt,
-                    _utc_now(),
-                ),
+            return _add_evidence_in_connection(
+                connection,
+                claim_id,
+                source_kind=source_kind,
+                source_message_id=source_message_id,
+                source_excerpt=source_excerpt,
             )
-            created = cursor.rowcount == 1
-            row = connection.execute(
-                """
-                SELECT id
-                FROM memory_evidence
-                WHERE claim_id = ? AND source_kind = ? AND source_message_id = ?
-                """,
-                (claim_id, source_kind, source_message_id),
-            ).fetchone()
-        return int(row["id"]), created
 
     def list_evidence(self, claim_id: int) -> tuple[MemoryEvidence, ...]:
         with self._connection() as connection:
@@ -709,23 +637,12 @@ class MemoryStore:
         relation_type: str,
     ) -> bool:
         with self._connection() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO memory_relations(
-                    source_claim_id, target_claim_id, relation_type, created_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(
-                    source_claim_id, target_claim_id, relation_type
-                ) DO NOTHING
-                """,
-                (
-                    source_claim_id,
-                    target_claim_id,
-                    relation_type,
-                    _utc_now(),
-                ),
+            return _add_relation_in_connection(
+                connection,
+                source_claim_id,
+                target_claim_id,
+                relation_type,
             )
-        return cursor.rowcount == 1
 
     def list_relations(self, claim_id: int) -> tuple[MemoryRelation, ...]:
         with self._connection() as connection:
@@ -739,6 +656,31 @@ class MemoryStore:
                 (claim_id, claim_id),
             ).fetchall()
         return tuple(_relation_from_row(row) for row in rows)
+
+    def find_claims_exact(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        statuses: tuple[str, ...] = (),
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        predicates: tuple[str, ...] = (),
+        value: str | None = None,
+        speaker_qq: str | None = None,
+    ) -> tuple[MemoryClaim, ...]:
+        with self._connection() as connection:
+            return _find_claims_exact(
+                connection,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                statuses=statuses,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                predicates=predicates,
+                value=value,
+                speaker_qq=speaker_qq,
+            )
 
     def delete_relation(
         self,
@@ -789,8 +731,262 @@ class MemoryStore:
         return tuple(_claim_from_row(row) for row in rows)
 
 
+class _MemoryReconciliation:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    def create_claim(self, **fields: Any) -> tuple[MemoryClaim, bool]:
+        return _create_claim_in_connection(self.connection, **fields)
+
+    def update_claim(self, claim_id: int, **changes: Any) -> MemoryClaim:
+        return _update_claim_in_connection(
+            self.connection,
+            claim_id,
+            **changes,
+        )
+
+    def add_evidence(
+        self,
+        claim_id: int,
+        *,
+        source_kind: str,
+        source_message_id: str,
+        source_excerpt: str,
+    ) -> tuple[int, bool]:
+        return _add_evidence_in_connection(
+            self.connection,
+            claim_id,
+            source_kind=source_kind,
+            source_message_id=source_message_id,
+            source_excerpt=source_excerpt,
+        )
+
+    def add_relation(
+        self,
+        source_claim_id: int,
+        target_claim_id: int,
+        relation_type: str,
+    ) -> bool:
+        return _add_relation_in_connection(
+            self.connection,
+            source_claim_id,
+            target_claim_id,
+            relation_type,
+        )
+
+    def find_claims_exact(self, **filters: Any) -> tuple[MemoryClaim, ...]:
+        return _find_claims_exact(self.connection, **filters)
+
+
+def _create_claim_in_connection(
+    connection: sqlite3.Connection,
+    **fields: Any,
+) -> tuple[MemoryClaim, bool]:
+    fields.setdefault("status", "active")
+    fields.setdefault("valid_from", None)
+    fields.setdefault("valid_to", None)
+    fields.setdefault("last_confirmed_at", None)
+    fields["source_excerpt"] = str(fields["source_excerpt"])[
+        :MAX_SOURCE_EXCERPT_CHARS
+    ]
+    columns = (
+        "scope_type",
+        "scope_id",
+        "speaker_qq",
+        "subject_type",
+        "subject_id",
+        "predicate",
+        "value",
+        "memory_type",
+        "modality",
+        "source_kind",
+        "source_message_id",
+        "source_excerpt",
+        "extraction_confidence",
+        "attribution_confidence",
+        "truth_confidence",
+        "status",
+        "created_at",
+        "valid_from",
+        "valid_to",
+        "last_confirmed_at",
+        "dedupe_key",
+    )
+    fields["created_at"] = _utc_now()
+    parameters = tuple(fields[column] for column in columns)
+    cursor = connection.execute(
+        """
+        INSERT INTO memory_claims(
+            scope_type, scope_id, speaker_qq, subject_type, subject_id,
+            predicate, value, memory_type, modality, source_kind,
+            source_message_id, source_excerpt, extraction_confidence,
+            attribution_confidence, truth_confidence, status,
+            created_at, valid_from, valid_to, last_confirmed_at,
+            dedupe_key
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON CONFLICT(dedupe_key) DO NOTHING
+        """,
+        parameters,
+    )
+    created = cursor.rowcount == 1
+    row = connection.execute(
+        "SELECT * FROM memory_claims WHERE dedupe_key = ?",
+        (fields["dedupe_key"],),
+    ).fetchone()
+    if created:
+        _insert_fts_row(connection, row)
+    return _claim_from_row(row), created
+
+
+def _update_claim_in_connection(
+    connection: sqlite3.Connection,
+    claim_id: int,
+    **changes: Any,
+) -> MemoryClaim:
+    if not changes:
+        row = connection.execute(
+            "SELECT * FROM memory_claims WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"memory claim {claim_id} does not exist")
+        return _claim_from_row(row)
+    invalid = set(changes) - _MUTABLE_CLAIM_FIELDS
+    if invalid:
+        raise ValueError(
+            f"unsupported memory claim fields: {', '.join(sorted(invalid))}"
+        )
+    if "source_excerpt" in changes:
+        changes["source_excerpt"] = str(changes["source_excerpt"])[
+            :MAX_SOURCE_EXCERPT_CHARS
+        ]
+    assignments = ", ".join(f"{name} = ?" for name in changes)
+    parameters = [changes[name] for name in changes]
+    parameters.append(claim_id)
+    cursor = connection.execute(
+        f"UPDATE memory_claims SET {assignments} WHERE id = ?",
+        parameters,
+    )
+    if cursor.rowcount != 1:
+        raise KeyError(f"memory claim {claim_id} does not exist")
+    row = connection.execute(
+        "SELECT * FROM memory_claims WHERE id = ?",
+        (claim_id,),
+    ).fetchone()
+    connection.execute(
+        "DELETE FROM memory_fts WHERE rowid = ?",
+        (claim_id,),
+    )
+    _insert_fts_row(connection, row)
+    return _claim_from_row(row)
+
+
+def _add_evidence_in_connection(
+    connection: sqlite3.Connection,
+    claim_id: int,
+    *,
+    source_kind: str,
+    source_message_id: str,
+    source_excerpt: str,
+) -> tuple[int, bool]:
+    source_excerpt = source_excerpt[:MAX_SOURCE_EXCERPT_CHARS]
+    cursor = connection.execute(
+        """
+        INSERT INTO memory_evidence(
+            claim_id, source_kind, source_message_id,
+            source_excerpt, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(claim_id, source_kind, source_message_id) DO NOTHING
+        """,
+        (
+            claim_id,
+            source_kind,
+            source_message_id,
+            source_excerpt,
+            _utc_now(),
+        ),
+    )
+    created = cursor.rowcount == 1
+    row = connection.execute(
+        """
+        SELECT id
+        FROM memory_evidence
+        WHERE claim_id = ? AND source_kind = ? AND source_message_id = ?
+        """,
+        (claim_id, source_kind, source_message_id),
+    ).fetchone()
+    return int(row["id"]), created
+
+
+def _add_relation_in_connection(
+    connection: sqlite3.Connection,
+    source_claim_id: int,
+    target_claim_id: int,
+    relation_type: str,
+) -> bool:
+    cursor = connection.execute(
+        """
+        INSERT INTO memory_relations(
+            source_claim_id, target_claim_id, relation_type, created_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(
+            source_claim_id, target_claim_id, relation_type
+        ) DO NOTHING
+        """,
+        (
+            source_claim_id,
+            target_claim_id,
+            relation_type,
+            _utc_now(),
+        ),
+    )
+    return cursor.rowcount == 1
+
+
 def _fts_phrase(value: str) -> str:
     return '"' + value.strip().replace('"', '""') + '"'
+
+
+def _find_claims_exact(
+    connection: sqlite3.Connection,
+    *,
+    scope_type: str,
+    scope_id: str,
+    statuses: tuple[str, ...] = (),
+    subject_type: str | None = None,
+    subject_id: str | None = None,
+    predicates: tuple[str, ...] = (),
+    value: str | None = None,
+    speaker_qq: str | None = None,
+) -> tuple[MemoryClaim, ...]:
+    clauses = ["scope_type = ?", "scope_id = ?"]
+    parameters: list[Any] = [scope_type, scope_id]
+    for column, column_value in (
+        ("subject_type", subject_type),
+        ("subject_id", subject_id),
+        ("value", value),
+        ("speaker_qq", speaker_qq),
+    ):
+        if column_value is not None:
+            clauses.append(f"{column} = ?")
+            parameters.append(column_value)
+    for column, values in (("status", statuses), ("predicate", predicates)):
+        if values:
+            placeholders = ", ".join("?" for _ in values)
+            clauses.append(f"{column} IN ({placeholders})")
+            parameters.extend(values)
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM memory_claims
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id
+        """,
+        parameters,
+    ).fetchall()
+    return tuple(_claim_from_row(row) for row in rows)
 
 
 def _fts_secure_delete_enabled(connection: sqlite3.Connection) -> bool:

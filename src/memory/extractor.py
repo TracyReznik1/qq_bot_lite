@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from src.memory.models import CandidateClaim, MemoryEvent
@@ -12,7 +12,7 @@ from src.services.llm_client import get_memory_llm_client
 
 
 _SUBJECT_REF_PATTERN = re.compile(
-    r"(?:speaker|bot|reply_target|unknown|qq:[0-9]+)"
+    r"(?:speaker|bot|reply_target|unknown|qq:[0-9]{1,12})"
 )
 _PREDICATE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _FENCE_PATTERN = re.compile(
@@ -48,6 +48,7 @@ _REQUIRED_CLAIM_FIELDS = frozenset(
     }
 )
 _OPTIONAL_CLAIM_FIELDS = frozenset({"valid_from", "valid_to"})
+MAX_CLAIMS_PER_MESSAGE = 16
 
 EXTRACTION_SYSTEM_PROMPT = """\
 You extract untrusted candidate memories from one QQ message.
@@ -194,6 +195,10 @@ def _parse_candidates(content: str) -> tuple[CandidateClaim, ...]:
     raw_claims = payload["claims"]
     if not isinstance(raw_claims, list):
         raise _OutputValidationError("claims must be an array")
+    if len(raw_claims) > MAX_CLAIMS_PER_MESSAGE:
+        raise _OutputValidationError(
+            f"claims must contain at most {MAX_CLAIMS_PER_MESSAGE} items"
+        )
 
     claims: list[CandidateClaim] = []
     for index, raw_claim in enumerate(raw_claims):
@@ -241,14 +246,16 @@ def _parse_claim(raw_claim: Any, index: int) -> CandidateClaim:
     _require_enum(modality, _MODALITIES, "modality", index)
     _require_enum(confidence, _CONFIDENCES, "confidence", index)
     _require_enum(operation, _OPERATIONS, "operation", index)
-    for field, temporal_value in (
-        ("valid_from", valid_from),
-        ("valid_to", valid_to),
+    valid_from = _normalize_temporal(valid_from, "valid_from", index)
+    valid_to = _normalize_temporal(valid_to, "valid_to", index)
+    if (
+        valid_from is not None
+        and valid_to is not None
+        and datetime.fromisoformat(valid_from) > datetime.fromisoformat(valid_to)
     ):
-        if temporal_value is not None and not _is_iso_temporal(temporal_value):
-            raise _OutputValidationError(
-                f"claims[{index}].{field} must be ISO-8601"
-            )
+        raise _OutputValidationError(
+            f"claims[{index}] valid_from must not exceed valid_to"
+        )
     return CandidateClaim(
         subject_ref=subject_ref,
         predicate=predicate,
@@ -317,14 +324,22 @@ def _raise_invalid_constant(value: str):
     raise _OutputValidationError(f"invalid JSON constant: {value}")
 
 
-def _is_iso_temporal(value: str) -> bool:
+def _normalize_temporal(
+    value: str | None,
+    field: str,
+    index: int,
+) -> str | None:
+    if value is None:
+        return None
     candidate = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
     try:
-        datetime.fromisoformat(candidate)
-        return True
+        parsed = datetime.fromisoformat(candidate)
     except ValueError:
-        try:
-            date.fromisoformat(candidate)
-            return True
-        except ValueError:
-            return False
+        raise _OutputValidationError(
+            f"claims[{index}].{field} must be a timezone-aware ISO timestamp"
+        ) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _OutputValidationError(
+            f"claims[{index}].{field} must be a timezone-aware ISO timestamp"
+        )
+    return parsed.astimezone(timezone.utc).isoformat()

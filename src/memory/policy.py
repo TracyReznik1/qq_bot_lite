@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from src.memory.models import CandidateClaim, MemoryClaim, MemoryEvent
 from src.memory.store import MemoryStore
 
 
-_QQ_REF_PATTERN = re.compile(r"qq:([0-9]+)")
+_QQ_REF_PATTERN = re.compile(r"qq:([0-9]{1,12})")
 _QUESTION_PATTERN = re.compile(
     r"(?:[?？]\s*$|^\s*(?:我是谁|谁是|什么是|是不是|是否|为何|为什么|怎么))"
 )
@@ -19,9 +19,16 @@ _JOKE_PATTERN = re.compile(
     r"(?:开玩笑|逗你的|骗你的|说着玩|玩笑而已|假的啦|just kidding)",
     re.IGNORECASE,
 )
-_QUOTED_FIRST_PERSON_PATTERN = re.compile(
-    r"[“\"「『][^”\"」』]*(?:我|我们)[^”\"」』]*[”\"」』]"
+_QUOTED_TEXT_PATTERN = re.compile(
+    r"(?:"
+    r"“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"
+    r"《[^》]*》|〈[^〉]*〉|【[^】]*】|"
+    r'"[^"]*"|\'[^\']*\'|```.*?```|`[^`]*`'
+    r")",
+    re.DOTALL,
 )
+_BLOCK_QUOTE_PATTERN = re.compile(r"(?m)^\s*>.*$")
+_FIRST_PERSON_PATTERN = re.compile(r"(?:我们|我|本人|俺|咱们|咱)")
 _CORRECTION_PATTERN = re.compile(
     r"(?:纠正|更正|改口|说错|其实|以前.*现在|"
     r"不是.*(?:而是|我叫|是))"
@@ -29,6 +36,9 @@ _CORRECTION_PATTERN = re.compile(
 _WITHDRAWAL_PATTERN = re.compile(
     r"(?:收回|撤回|作废|不算数|取消.*(?:说法|观点))"
 )
+_EXPLICIT_CORRECTION_PATTERN = re.compile(r"(?:纠正|更正|改口|说错)")
+_CLAUSE_BREAK_PATTERN = re.compile(r"[。.!！？?；;\r\n]+")
+_SUBCLAUSE_BREAK_PATTERN = re.compile(r"[，,]+")
 _NEGATION_PATTERN = re.compile(
     r"(?:不再|不喜欢|不是|没有|从不|并非|没(?:有)?)"
 )
@@ -117,6 +127,21 @@ _MODALITIES = frozenset(
 )
 _CONFIDENCES = frozenset({"low", "medium", "high"})
 _OPERATIONS = frozenset({"add", "confirm", "supersede", "retract"})
+MAX_CLAIMS_PER_MESSAGE = 16
+_PREDICATE_TEXT_MARKERS = {
+    "name": ("名字", "姓名", "叫"),
+    "preferred_name": ("叫我", "称呼", "昵称"),
+    "likes": ("喜欢", "爱好"),
+    "owns": ("拥有", "我的", "属于"),
+    "age": ("年龄", "岁"),
+    "birthday": ("生日", "出生"),
+    "birth_date": ("生日", "出生"),
+    "occupation": ("职业", "工作"),
+    "employer": ("公司", "雇主", "工作"),
+    "school": ("学校", "就读"),
+    "current_city": ("现居", "住在", "城市"),
+    "home_city": ("家乡", "老家"),
+}
 
 
 @dataclass(frozen=True)
@@ -148,46 +173,62 @@ class MemoryPolicy:
         event: MemoryEvent,
         candidates: tuple[CandidateClaim, ...],
     ) -> tuple[PolicyDecision, ...]:
-        if self._reject_whole_message(event):
+        if (
+            len(candidates) > MAX_CLAIMS_PER_MESSAGE
+            or self._reject_whole_message(event)
+        ):
             return ()
         decisions: list[PolicyDecision] = []
-        for candidate in candidates:
-            if candidate.confidence == "low":
-                continue
-            if not self._candidate_is_well_formed(candidate):
-                continue
-            candidate = self._authorized_candidate(event, candidate)
-            if candidate is None:
-                continue
-            if (
-                candidate.subject_ref == "speaker"
-                and _QUOTED_FIRST_PERSON_PATTERN.search(event.text)
-            ):
-                continue
-            subject = self.resolve_subject(event, candidate.subject_ref)
-            if subject is None:
-                continue
-            if self.contains_hard_secret(candidate.value):
-                continue
-            scope_type, scope_id = event.context.primary_scope
-            if event.context.is_group and self.is_sensitive_personal(candidate):
-                continue
-            decision = self.decide_against_existing(
-                event,
-                candidate,
-                subject,
-                scope_type,
-                scope_id,
-            )
-            if decision is not None:
-                decisions.append(decision)
+        with self.store.reconciliation() as transaction:
+            for candidate in candidates:
+                if candidate.confidence == "low":
+                    continue
+                candidate = self._validated_candidate(candidate)
+                if candidate is None:
+                    continue
+                candidate = self._authorized_candidate(event, candidate)
+                if candidate is None:
+                    continue
+                if (
+                    candidate.subject_ref == "speaker"
+                    and not _has_unquoted_first_person(event.text)
+                ):
+                    continue
+                subject = self.resolve_subject(
+                    event,
+                    candidate.subject_ref,
+                    ledger=transaction,
+                )
+                if subject is None:
+                    continue
+                if self.contains_hard_secret(candidate.value):
+                    continue
+                scope_type, scope_id = event.context.primary_scope
+                if (
+                    event.context.is_group
+                    and self.is_sensitive_personal(candidate)
+                ):
+                    continue
+                decision = self.decide_against_existing(
+                    event,
+                    candidate,
+                    subject,
+                    scope_type,
+                    scope_id,
+                    ledger=transaction,
+                )
+                if decision is not None:
+                    decisions.append(decision)
         return tuple(decisions)
 
     def resolve_subject(
         self,
         event: MemoryEvent,
         subject_ref: str,
+        *,
+        ledger=None,
     ) -> _ResolvedSubject | None:
+        ledger = self.store if ledger is None else ledger
         if subject_ref == "speaker":
             speaker = str(event.context.user_id or "").strip()
             if not speaker:
@@ -213,14 +254,14 @@ class MemoryPolicy:
             return _ResolvedSubject("qq_user", qq_id, "speaker", "high")
         if qq_id in event.mentioned_qq_ids:
             return _ResolvedSubject("qq_user", qq_id, "mention", "high")
-        if re.search(rf"(?<!\d){re.escape(qq_id)}(?!\d)", event.text):
+        if _has_explicit_qq_marker(event.text, qq_id):
             return _ResolvedSubject(
                 "qq_user",
                 qq_id,
                 "explicit_qq",
                 "high",
             )
-        if self._has_unique_scoped_alias(event, qq_id):
+        if self._has_unique_scoped_alias(event, qq_id, ledger=ledger):
             return _ResolvedSubject(
                 "qq_user",
                 qq_id,
@@ -253,13 +294,17 @@ class MemoryPolicy:
         subject: _ResolvedSubject,
         scope_type: str,
         scope_id: str,
+        *,
+        ledger=None,
     ) -> PolicyDecision | None:
+        ledger = self.store if ledger is None else ledger
         existing = self._active_claims(
             scope_type,
             scope_id,
             subject.subject_type,
             subject.subject_id,
             candidate.predicate,
+            ledger=ledger,
         )
         same_speaker = tuple(
             claim
@@ -299,14 +344,15 @@ class MemoryPolicy:
                 scope_type,
                 scope_id,
                 status="retracted",
+                ledger=ledger,
             )
             closed_at = candidate.valid_to or _utc_now()
-            self.store.update_claim(
+            ledger.update_claim(
                 target.id,
                 status="retracted",
                 valid_to=closed_at,
             )
-            self.store.add_relation(
+            ledger.add_relation(
                 retraction.id,
                 target.id,
                 "retracts",
@@ -323,14 +369,32 @@ class MemoryPolicy:
             and candidate.memory_type != "preferred_name"
             and candidate.predicate != "preferred_name"
         ):
-            archived = self._create_claim(
-                event,
-                candidate,
-                subject,
-                scope_type,
-                scope_id,
-                status="archived",
-            )
+            if exact_same_speaker is None:
+                archived = self._create_claim(
+                    event,
+                    candidate,
+                    subject,
+                    scope_type,
+                    scope_id,
+                    status="archived",
+                    ledger=ledger,
+                )
+            else:
+                ledger.add_evidence(
+                    exact_same_speaker.id,
+                    source_kind=f"message:{subject.source}",
+                    source_message_id=event.message_id,
+                    source_excerpt=event.text,
+                )
+                archived = ledger.update_claim(
+                    exact_same_speaker.id,
+                    status="archived",
+                    valid_from=(
+                        exact_same_speaker.valid_from
+                        or candidate.valid_from
+                    ),
+                    valid_to=candidate.valid_to,
+                )
             return PolicyDecision(
                 "archived",
                 archived,
@@ -338,13 +402,13 @@ class MemoryPolicy:
             )
 
         if exact_same_speaker is not None:
-            self.store.add_evidence(
+            ledger.add_evidence(
                 exact_same_speaker.id,
                 source_kind=f"message:{subject.source}",
                 source_message_id=event.message_id,
                 source_excerpt=event.text,
             )
-            confirmed = self.store.update_claim(
+            confirmed = ledger.update_claim(
                 exact_same_speaker.id,
                 last_confirmed_at=_utc_now(),
                 truth_confidence=max(
@@ -365,39 +429,26 @@ class MemoryPolicy:
             if claim.value == candidate.value
             and claim.modality == candidate.modality
         )
-        if exact_other:
-            supporting = self._create_claim(
-                event,
-                candidate,
-                subject,
-                scope_type,
-                scope_id,
-            )
-            for claim in exact_other:
-                self.store.add_relation(
-                    supporting.id,
-                    claim.id,
-                    "supports",
-                )
-                if (
-                    supporting.modality == "asserted"
-                    and claim.modality == "asserted"
-                    and candidate.confidence == "high"
-                ):
-                    self.store.update_claim(
-                        claim.id,
-                        truth_confidence="high",
-                    )
-            return PolicyDecision(
-                "supported",
-                supporting,
-                subject.source,
-                tuple(claim.id for claim in exact_other),
-            )
 
         superseded_targets: tuple[MemoryClaim, ...] = ()
         if candidate.operation == "supersede" and same_speaker:
-            superseded_targets = same_speaker
+            if len(same_speaker) == 1:
+                superseded_targets = same_speaker
+            else:
+                correction_clauses = _bound_operation_clauses(
+                    event,
+                    candidate,
+                    _CORRECTION_PATTERN,
+                    allow_explicit_lead=True,
+                )
+                superseded_targets = tuple(
+                    claim
+                    for claim in same_speaker
+                    if any(
+                        claim.value in clause
+                        for clause in correction_clauses
+                    )
+                )
 
         conflicting_other = tuple(
             claim
@@ -412,23 +463,40 @@ class MemoryPolicy:
             scope_type,
             scope_id,
             status=status,
+            ledger=ledger,
         )
 
+        for claim in exact_other:
+            ledger.add_relation(
+                created.id,
+                claim.id,
+                "supports",
+            )
+            if (
+                created.modality == "asserted"
+                and claim.modality == "asserted"
+                and candidate.confidence == "high"
+            ):
+                ledger.update_claim(
+                    claim.id,
+                    truth_confidence="high",
+                )
+
         for claim in superseded_targets:
-            self.store.update_claim(
+            ledger.update_claim(
                 claim.id,
                 status="superseded",
                 valid_to=candidate.valid_from or _utc_now(),
             )
-            self.store.add_relation(
+            ledger.add_relation(
                 created.id,
                 claim.id,
                 "supersedes",
             )
 
         for claim in conflicting_other:
-            self.store.update_claim(claim.id, status="disputed")
-            self.store.add_relation(
+            ledger.update_claim(claim.id, status="disputed")
+            ledger.add_relation(
                 created.id,
                 claim.id,
                 "contradicts",
@@ -436,13 +504,23 @@ class MemoryPolicy:
 
         if conflicting_other:
             action = "disputed"
-            related = tuple(claim.id for claim in conflicting_other)
         elif superseded_targets:
             action = "superseded"
-            related = tuple(claim.id for claim in superseded_targets)
+        elif exact_other:
+            action = "supported"
         else:
             action = "created"
-            related = ()
+        related = tuple(
+            dict.fromkeys(
+                claim.id
+                for claims in (
+                    exact_other,
+                    superseded_targets,
+                    conflicting_other,
+                )
+                for claim in claims
+            )
+        )
         return PolicyDecision(action, created, subject.source, related)
 
     def _reject_whole_message(self, event: MemoryEvent) -> bool:
@@ -463,24 +541,36 @@ class MemoryPolicy:
         text = event.text
         if (
             candidate.operation == "retract"
-            and _WITHDRAWAL_PATTERN.search(text) is None
+            and not _has_bound_operation_clause(
+                event,
+                candidate,
+                _WITHDRAWAL_PATTERN,
+            )
         ):
             return None
+        correction_is_bound = _has_bound_operation_clause(
+            event,
+            candidate,
+            _CORRECTION_PATTERN,
+            allow_explicit_lead=True,
+        )
         if (
             candidate.modality == "asserted"
             and _NEGATION_PATTERN.search(text)
-            and _CORRECTION_PATTERN.search(text) is None
+            and not correction_is_bound
         ):
             return None
         if (
             candidate.operation == "supersede"
-            and _CORRECTION_PATTERN.search(text) is None
+            and not correction_is_bound
         ):
             return replace(candidate, operation="add")
         return candidate
 
     @staticmethod
-    def _candidate_is_well_formed(candidate: CandidateClaim) -> bool:
+    def _validated_candidate(
+        candidate: CandidateClaim,
+    ) -> CandidateClaim | None:
         if (
             not isinstance(candidate.subject_ref, str)
             or not isinstance(candidate.predicate, str)
@@ -500,15 +590,23 @@ class MemoryPolicy:
             or candidate.confidence not in _CONFIDENCES
             or candidate.operation not in _OPERATIONS
         ):
-            return False
-        return all(
-            value is None
-            or (
-                isinstance(value, str)
-                and len(value) <= 64
-                and _is_iso_temporal(value)
-            )
-            for value in (candidate.valid_from, candidate.valid_to)
+            return None
+        try:
+            valid_from = _normalize_temporal(candidate.valid_from)
+            valid_to = _normalize_temporal(candidate.valid_to)
+        except ValueError:
+            return None
+        if (
+            valid_from is not None
+            and valid_to is not None
+            and datetime.fromisoformat(valid_from)
+            > datetime.fromisoformat(valid_to)
+        ):
+            return None
+        return replace(
+            candidate,
+            valid_from=valid_from,
+            valid_to=valid_to,
         )
 
     def _active_claims(
@@ -518,27 +616,27 @@ class MemoryPolicy:
         subject_type: str,
         subject_id: str,
         predicate: str,
+        *,
+        ledger=None,
     ) -> tuple[MemoryClaim, ...]:
-        candidates = self.store.search_claims(
-            predicate,
+        ledger = self.store if ledger is None else ledger
+        return ledger.find_claims_exact(
             scope_type=scope_type,
             scope_id=scope_id,
-            limit=512,
-        )
-        return tuple(
-            claim
-            for claim in candidates
-            if claim.status in {"active", "disputed"}
-            and claim.subject_type == subject_type
-            and claim.subject_id == subject_id
-            and claim.predicate == predicate
+            statuses=("active", "disputed"),
+            subject_type=subject_type,
+            subject_id=subject_id,
+            predicates=(predicate,),
         )
 
     def _has_unique_scoped_alias(
         self,
         event: MemoryEvent,
         qq_id: str,
+        *,
+        ledger=None,
     ) -> bool:
+        ledger = self.store if ledger is None else ledger
         scope_type, scope_id = event.context.primary_scope
         aliases: set[str] = set()
         for predicate in ("name", "preferred_name"):
@@ -550,23 +648,22 @@ class MemoryPolicy:
                     "qq_user",
                     qq_id,
                     predicate,
+                    ledger=ledger,
                 )
                 if claim.value and claim.value in event.text
             )
         for alias in aliases:
-            matches = self.store.search_claims(
-                alias,
+            matches = ledger.find_claims_exact(
                 scope_type=scope_type,
                 scope_id=scope_id,
-                limit=512,
+                statuses=("active", "disputed"),
+                subject_type="qq_user",
+                predicates=("name", "preferred_name"),
+                value=alias,
             )
             subject_ids = {
                 claim.subject_id
                 for claim in matches
-                if claim.status in {"active", "disputed"}
-                and claim.subject_type == "qq_user"
-                and claim.predicate in {"name", "preferred_name"}
-                and claim.value == alias
             }
             if subject_ids == {qq_id}:
                 return True
@@ -581,7 +678,9 @@ class MemoryPolicy:
         scope_id: str,
         *,
         status: str = "active",
+        ledger=None,
     ) -> MemoryClaim:
+        ledger = self.store if ledger is None else ledger
         memory_type = (
             "opinion"
             if subject.subject_type == "bot"
@@ -609,7 +708,7 @@ class MemoryPolicy:
         dedupe_key = "policy:" + hashlib.sha256(
             dedupe_body.encode("utf-8")
         ).hexdigest()
-        claim, _created = self.store.create_claim(
+        claim, _created = ledger.create_claim(
             scope_type=scope_type,
             scope_id=scope_id,
             speaker_qq=str(event.context.user_id),
@@ -695,14 +794,130 @@ def _passes_luhn(value: str) -> bool:
     return checksum % 10 == 0
 
 
-def _is_iso_temporal(value: str) -> bool:
+def _unquoted_text(value: str) -> str:
+    without_blocks = _BLOCK_QUOTE_PATTERN.sub(" ", value)
+    return _QUOTED_TEXT_PATTERN.sub(" ", without_blocks)
+
+
+def _has_unquoted_first_person(value: str) -> bool:
+    return _FIRST_PERSON_PATTERN.search(_unquoted_text(value)) is not None
+
+
+def _has_explicit_qq_marker(value: str, qq_id: str) -> bool:
+    return (
+        re.search(
+            rf"(?i)(?<![a-z0-9])(?:qq(?:号|号码)?\s*(?:[:：#]\s*)?|@)"
+            rf"{re.escape(qq_id)}(?!\d)",
+            value,
+        )
+        is not None
+    )
+
+
+def _message_subclauses(value: str) -> tuple[str, ...]:
+    return tuple(
+        subclause.strip()
+        for clause in _CLAUSE_BREAK_PATTERN.split(value)
+        for subclause in _SUBCLAUSE_BREAK_PATTERN.split(clause)
+        if subclause.strip()
+    )
+
+
+def _has_bound_operation_clause(
+    event: MemoryEvent,
+    candidate: CandidateClaim,
+    operation_pattern: re.Pattern[str],
+    *,
+    allow_explicit_lead: bool = False,
+) -> bool:
+    return bool(
+        _bound_operation_clauses(
+            event,
+            candidate,
+            operation_pattern,
+            allow_explicit_lead=allow_explicit_lead,
+        )
+    )
+
+
+def _bound_operation_clauses(
+    event: MemoryEvent,
+    candidate: CandidateClaim,
+    operation_pattern: re.Pattern[str],
+    *,
+    allow_explicit_lead: bool = False,
+) -> tuple[str, ...]:
+    clauses = _message_subclauses(event.text)
+    matched: list[str] = []
+    for index, clause in enumerate(clauses):
+        if operation_pattern.search(clause) is None:
+            continue
+        if _clause_supports_candidate(event, candidate, clause):
+            matched.append(clause)
+        elif (
+            allow_explicit_lead
+            and _EXPLICIT_CORRECTION_PATTERN.search(clause)
+            and index + 1 < len(clauses)
+            and _clause_supports_candidate(
+                event,
+                candidate,
+                clauses[index + 1],
+            )
+        ):
+            matched.append(clauses[index + 1])
+    return tuple(dict.fromkeys(matched))
+
+
+def _clause_supports_candidate(
+    event: MemoryEvent,
+    candidate: CandidateClaim,
+    clause: str,
+) -> bool:
+    unquoted = _unquoted_text(clause)
+    return (
+        candidate.value in unquoted
+        and _clause_supports_subject(event, candidate.subject_ref, unquoted)
+        and _clause_supports_predicate(candidate.predicate, unquoted)
+    )
+
+
+def _clause_supports_subject(
+    event: MemoryEvent,
+    subject_ref: str,
+    clause: str,
+) -> bool:
+    if subject_ref == "speaker":
+        return _has_unquoted_first_person(clause)
+    if subject_ref == "bot":
+        return re.search(r"(?i)(?:你|bot|机器人|助手)", clause) is not None
+    if subject_ref == "reply_target":
+        return re.search(r"(?:他|她|对方|回复对象)", clause) is not None
+    match = _QQ_REF_PATTERN.fullmatch(subject_ref)
+    if match is None:
+        return False
+    qq_id = match.group(1)
+    if qq_id == str(event.context.user_id):
+        return _has_unquoted_first_person(clause)
+    return _has_explicit_qq_marker(clause, qq_id)
+
+
+def _clause_supports_predicate(predicate: str, clause: str) -> bool:
+    markers = _PREDICATE_TEXT_MARKERS.get(predicate)
+    if markers is not None:
+        return any(marker in clause for marker in markers)
+    return predicate.casefold() in clause.casefold()
+
+
+def _normalize_temporal(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("temporal value must be concise text")
     candidate = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
     try:
-        datetime.fromisoformat(candidate)
-        return True
+        parsed = datetime.fromisoformat(candidate)
     except ValueError:
-        try:
-            date.fromisoformat(candidate)
-            return True
-        except ValueError:
-            return False
+        raise ValueError("temporal value must be ISO-8601") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("temporal value must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat()

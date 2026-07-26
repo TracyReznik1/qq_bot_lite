@@ -24,6 +24,22 @@ def private_event(
     )
 
 
+def raw_claim(**overrides):
+    value = {
+        "subject_ref": "speaker",
+        "predicate": "likes",
+        "value": "跑步",
+        "memory_type": "preference",
+        "modality": "asserted",
+        "confidence": "high",
+        "operation": "add",
+        "valid_from": None,
+        "valid_to": None,
+    }
+    value.update(overrides)
+    return value
+
+
 class MemoryExtractorTests(unittest.TestCase):
     def setUp(self):
         try:
@@ -189,6 +205,90 @@ class MemoryExtractorTests(unittest.TestCase):
             self.extractor.extract(private_event("我昨天开始喜欢跑步")),
         )
         self.assertEqual(2, self.llm.chat.call_count)
+
+    def test_temporal_values_require_aware_ordered_timestamps(self):
+        from src.memory.extractor import MemoryExtractor
+
+        invalid_temporals = (
+            {"valid_from": "2026-07-26"},
+            {"valid_from": "2026-07-26T08:00:00"},
+            {
+                "valid_from": "2026-07-27T00:00:00+00:00",
+                "valid_to": "2026-07-26T00:00:00+00:00",
+            },
+        )
+        for invalid in invalid_temporals:
+            with self.subTest(invalid=invalid):
+                llm = mock.Mock()
+                llm.chat.side_effect = [
+                    ChatResponse(
+                        content=json.dumps(
+                            {"claims": [raw_claim(**invalid)]},
+                            ensure_ascii=False,
+                        )
+                    ),
+                    ChatResponse(content='{"claims": []}'),
+                ]
+                extractor = MemoryExtractor(llm)
+                self.assertEqual(
+                    (),
+                    extractor.extract(private_event("我喜欢跑步")),
+                )
+                self.assertEqual(2, llm.chat.call_count)
+
+    def test_temporal_values_are_normalized_to_utc(self):
+        self.llm.chat.return_value = ChatResponse(
+            content=json.dumps(
+                {
+                    "claims": [
+                        raw_claim(
+                            valid_from="2026-07-26T08:00:00+08:00",
+                            valid_to="2026-07-27T08:00:00+08:00",
+                        )
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        extracted = self.extractor.extract(private_event("我以前喜欢跑步"))
+
+        self.assertEqual(
+            "2026-07-26T00:00:00+00:00",
+            extracted[0].valid_from,
+        )
+        self.assertEqual(
+            "2026-07-27T00:00:00+00:00",
+            extracted[0].valid_to,
+        )
+
+    def test_claim_count_and_qq_reference_length_are_bounded(self):
+        invalid_responses = (
+            {"claims": [raw_claim(predicate=f"fact_{index}") for index in range(17)]},
+            {
+                "claims": [
+                    raw_claim(subject_ref="qq:1234567890123")
+                ]
+            },
+        )
+
+        for invalid in invalid_responses:
+            with self.subTest(claim_count=len(invalid["claims"])):
+                llm = mock.Mock()
+                llm.chat.side_effect = [
+                    ChatResponse(
+                        content=json.dumps(invalid, ensure_ascii=False)
+                    ),
+                    ChatResponse(content='{"claims": []}'),
+                ]
+                from src.memory.extractor import MemoryExtractor
+
+                extractor = MemoryExtractor(llm)
+                self.assertEqual(
+                    (),
+                    extractor.extract(private_event("我陈述事实")),
+                )
+                self.assertEqual(2, llm.chat.call_count)
 
     def test_images_are_ephemeral_user_input_not_system_persona(self):
         self.llm.chat.return_value = ChatResponse(content='{"claims": []}')

@@ -675,6 +675,76 @@ class MemoryStoreTests(unittest.TestCase):
             }.isdisjoint(audit_columns)
         )
 
+    def test_exact_scoped_claim_query_is_not_capped_by_fts_limit(self):
+        for index in range(513):
+            self.store.create_claim(
+                scope_type="group",
+                scope_id="900",
+                speaker_qq="101",
+                subject_type="qq_user",
+                subject_id=(
+                    "target-after-limit"
+                    if index == 512
+                    else f"filler-{index}"
+                ),
+                predicate="likes",
+                value=f"value-{index}",
+                memory_type="fact",
+                modality="asserted",
+                source_kind="message:speaker",
+                source_message_id=f"exact-query-{index}",
+                source_excerpt=f"value-{index}",
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="high",
+                dedupe_key=f"exact-query-{index}",
+            )
+
+        exact = self.store.find_claims_exact(
+            scope_type="group",
+            scope_id="900",
+            statuses=("active", "disputed"),
+            subject_type="qq_user",
+            subject_id="target-after-limit",
+            predicates=("likes",),
+        )
+
+        self.assertEqual(1, len(exact))
+        self.assertEqual("value-512", exact[0].value)
+
+    def test_reconciliation_transaction_rolls_back_all_writes(self):
+        with self.assertRaisesRegex(RuntimeError, "injected failure"):
+            with self.store.reconciliation() as transaction:
+                transaction.create_claim(
+                    scope_type="private",
+                    scope_id="10001",
+                    speaker_qq="10001",
+                    subject_type="qq_user",
+                    subject_id="10001",
+                    predicate="likes",
+                    value="transaction-private-value",
+                    memory_type="preference",
+                    modality="asserted",
+                    source_kind="message:speaker",
+                    source_message_id="transaction-message",
+                    source_excerpt="我喜欢 transaction-private-value",
+                    extraction_confidence="high",
+                    attribution_confidence="high",
+                    truth_confidence="high",
+                    dedupe_key="transaction-claim",
+                )
+                raise RuntimeError("injected failure")
+
+        self.assertEqual(
+            (),
+            self.store.search_claims("transaction-private-value"),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM memory_claims"
+            ).fetchone()[0]
+        self.assertEqual(0, count)
+
     def test_constraints_and_foreign_keys_reject_invalid_records(self):
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.create_claim(
