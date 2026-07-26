@@ -11,6 +11,8 @@ def help_text() -> str:
         "/search DeepSeek 最新消息\n"
         "/remember 我喜欢简洁回答\n"
         "/globalremember 所有人都知道的设定（管理员）\n"
+        "/memories [查询词]\n"
+        "/forget <记忆ID或内容>\n"
         "/reset\n"
         "/help\n"
         "群聊里默认需要 @ 我。\n"
