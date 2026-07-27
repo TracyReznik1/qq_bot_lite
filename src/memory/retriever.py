@@ -258,6 +258,9 @@ class MemoryRetriever:
         query_folded = query.casefold()
         scope_type, scope_id = context.primary_scope
         search_scopes = [(scope_type, scope_id)]
+        source_group_id = str(context.group_id or "").strip()
+        if not context.is_group and source_group_id:
+            search_scopes.append(("group", source_group_id))
         if (scope_type, scope_id) != ("global", "global"):
             search_scopes.append(("global", "global"))
 
@@ -283,10 +286,16 @@ class MemoryRetriever:
                 reverse=True,
             )
             if matching_aliases:
+                longest_length = len(matching_aliases[0])
+                longest_aliases = {
+                    alias
+                    for alias in matching_aliases
+                    if len(alias) == longest_length
+                }
                 subject_ids = {
                     claim.subject_id
                     for claim in alias_claims
-                    if claim.value in matching_aliases
+                    if claim.value in longest_aliases
                 }
                 if len(subject_ids) == 1:
                     return next(iter(subject_ids))

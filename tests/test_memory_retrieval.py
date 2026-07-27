@@ -552,6 +552,171 @@ class MemoryRetrievalTests(unittest.TestCase):
             scores["CURRENT-USER-DISTRACTOR"],
         )
 
+    def test_longest_exact_alias_wins_over_contained_short_alias(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "name",
+            "小明同学",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "likes",
+            "LONG-ALIAS-SUBJECT",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1003",
+            "1003",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1003",
+            "1003",
+            "likes",
+            "SHORT-ALIAS-SUBJECT",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "小明同学喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertGreater(
+            scores["LONG-ALIAS-SUBJECT"],
+            scores["SHORT-ALIAS-SUBJECT"],
+        )
+
+    def test_private_alias_resolution_uses_source_group_before_global(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "likes",
+            "SOURCE-GROUP-SUBJECT",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "likes",
+            "GLOBAL-SUBJECT",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "小明喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertGreater(
+            scores["SOURCE-GROUP-SUBJECT"],
+            scores["GLOBAL-SUBJECT"],
+        )
+
+    def test_ambiguous_private_source_group_alias_stops_before_global(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "likes",
+            "SOURCE-GROUP-CURRENT-USER",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "likes",
+            "GLOBAL-FALLTHROUGH",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "小明喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertGreater(
+            scores["SOURCE-GROUP-CURRENT-USER"],
+            scores["GLOBAL-FALLTHROUGH"],
+        )
+
     def test_ambiguous_group_alias_does_not_fall_through_to_global_subject(self):
         for speaker_qq, subject_id, value in (
             ("1002", "1002", "GROUP-PREFERENCE-A"),
