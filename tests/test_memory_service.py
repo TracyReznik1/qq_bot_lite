@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
@@ -22,6 +23,15 @@ class MemoryServiceTests(unittest.TestCase):
 
     def test_integrity_check_returns_ok(self):
         self.assertEqual("ok", self.store.integrity_check())
+
+    def test_default_service_uses_config_memory_database_path(self):
+        expected_path = Path(self.temp_dir) / "configured" / "memory.sqlite3"
+        fake_config = SimpleNamespace(memory_database_path=expected_path)
+
+        with patch("src.memory.service.config", fake_config):
+            service = MemoryService(extractor=MagicMock())
+
+        self.assertEqual(expected_path, service.store.path)
 
     def test_stage_event_and_release_job(self):
         service = MemoryService(store=self.store)

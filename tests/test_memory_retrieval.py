@@ -3,7 +3,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import shutil
+from types import SimpleNamespace
+from unittest import mock
 
+from src.chat.prompt import build_system_prompt
 from src.memory.models import (
     MemoryClaim,
     MemoryContext,
@@ -45,6 +48,7 @@ class MemoryRetrievalTests(unittest.TestCase):
         valid_from: str | None = None,
         valid_to: str | None = None,
         created_at_offset: int = 0,
+        truth_confidence: str = "high",
     ) -> MemoryClaim:
         event = MemoryEvent(
             context=MemoryContext(
@@ -72,13 +76,22 @@ class MemoryRetrievalTests(unittest.TestCase):
             source_excerpt=f"test message {predicate} {value}",
             extraction_confidence="high",
             attribution_confidence="high",
-            truth_confidence="high",
+            truth_confidence=truth_confidence,
             dedupe_key=f"test:{scope_type}:{scope_id}:{speaker_qq}:{predicate}:{value}:{created_at_offset}",
             status=status,
             valid_from=valid_from,
             valid_to=valid_to,
         )
         return claim
+
+    def test_default_retriever_uses_config_memory_database_path(self):
+        expected_path = Path(self.temp_dir) / "configured" / "memory.sqlite3"
+        fake_config = SimpleNamespace(memory_database_path=expected_path)
+
+        with mock.patch("src.memory.retriever.config", fake_config):
+            retriever = MemoryRetriever()
+
+        self.assertEqual(expected_path, retriever.store.path)
 
     def test_private_scope_isolation_user_a_and_user_b(self):
         # User A private claim
@@ -160,6 +173,11 @@ class MemoryRetrievalTests(unittest.TestCase):
         self.assertEqual(2, len(values))
         self.assertIn(("1001", "好用", "disputed"), values)
         self.assertIn(("1002", "不好用", "disputed"), values)
+        formatted = format_memory_context(results)
+        self.assertIn("发言者=1001", formatted)
+        self.assertIn("发言者=1002", formatted)
+        self.assertIn("内容=opinion为好用", formatted)
+        self.assertIn("内容=opinion为不好用", formatted)
 
     def test_excluded_lifecycle_states(self):
         self._create_claim("private", "1001", "1001", "1001", "status1", "retracted_val", status="retracted")
@@ -196,6 +214,276 @@ class MemoryRetrievalTests(unittest.TestCase):
         p_values = [r.claim.value for r in personalization_results]
         self.assertIn("安安", p_values)
 
+    def test_group_prompt_never_exposes_private_identity_as_evidence(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "real_name",
+            "PRIVATE-NAME",
+            memory_type="identity",
+        )
+
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+        results = self.retriever.retrieve(context, "我是谁")
+        formatted = format_memory_context(results)
+
+        self.assertNotIn("PRIVATE-NAME", [result.claim.value for result in results])
+        self.assertNotIn("PRIVATE-NAME", formatted)
+
+    def test_group_personalization_fallback_is_current_user_self_attribution_only(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "preferred_name",
+            "CURRENT-GROUP-NAME",
+            memory_type="preferred_name",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "preferred_name",
+            "OTHER-USER-NAME",
+            memory_type="preferred_name",
+        )
+        self._create_claim(
+            "group",
+            "2002",
+            "1001",
+            "1001",
+            "preferred_name",
+            "OTHER-GROUP-NAME",
+            memory_type="preferred_name",
+        )
+
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+        results = self.retriever.retrieve(context, "怎么称呼")
+        personalization = {
+            result.claim.value
+            for result in results
+            if result.usage == "personalization"
+        }
+
+        self.assertEqual({"CURRENT-GROUP-NAME"}, personalization)
+        self.assertNotIn(
+            "OTHER-GROUP-NAME",
+            [result.claim.value for result in results],
+        )
+
+    def test_private_preferred_name_prevents_group_personalization_fallback(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "preferred_name",
+            "PRIVATE-PREFERRED-NAME",
+            memory_type="preferred_name",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "preferred_name",
+            "GROUP-PREFERRED-NAME",
+            memory_type="preferred_name",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "怎么称呼")
+        personalization = {
+            result.claim.value
+            for result in results
+            if result.usage == "personalization"
+        }
+
+        self.assertEqual({"PRIVATE-PREFERRED-NAME"}, personalization)
+
+    def test_first_person_identity_query_ranks_current_qq_subject_first(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "name",
+            "CURRENT-PERSON",
+            memory_type="identity",
+        )
+        for index, query in enumerate(("我是谁", "我叫什么", "怎么称呼"), 1):
+            self._create_claim(
+                "private",
+                "1001",
+                "1001",
+                str(2000 + index),
+                "note",
+                query,
+                memory_type="fact",
+            )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        for query in ("我是谁", "我叫什么", "怎么称呼"):
+            with self.subTest(query=query):
+                result = self.retriever.retrieve(context, query, limit=1)
+                self.assertEqual("CURRENT-PERSON", result[0].claim.value)
+
+    def test_explicit_alias_resolves_current_group_before_global(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1002",
+            "likes",
+            "GROUP-SUBJECT-PREFERENCE",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "likes",
+            "CURRENT-USER-DISTRACTOR",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "likes",
+            "GLOBAL-SUBJECT-PREFERENCE",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "小明喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertGreater(
+            scores["GROUP-SUBJECT-PREFERENCE"],
+            scores["GLOBAL-SUBJECT-PREFERENCE"],
+        )
+        self.assertGreater(
+            scores["GROUP-SUBJECT-PREFERENCE"],
+            scores["CURRENT-USER-DISTRACTOR"],
+        )
+
+    def test_truth_confidence_affects_ranking_before_extraction_confidence(self):
+        low_truth = self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "LOW-TRUTH",
+            memory_type="preference",
+            truth_confidence="low",
+        )
+        high_truth = self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "HIGH-TRUTH",
+            memory_type="preference",
+            truth_confidence="high",
+        )
+        self.store.update_claim(low_truth.id, extraction_confidence="high")
+        self.store.update_claim(high_truth.id, extraction_confidence="low")
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        results = self.retriever.retrieve(context, "我喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertGreater(scores["HIGH-TRUTH"], scores["LOW-TRUTH"])
+
+    def test_expired_current_claim_is_excluded(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "EXPIRED",
+            memory_type="preference",
+            valid_to=_utc_now_offset(-1),
+        )
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "CURRENT",
+            memory_type="preference",
+            valid_to=_utc_now_offset(3600),
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        values = [
+            result.claim.value
+            for result in self.retriever.retrieve(context, "喜欢")
+        ]
+
+        self.assertEqual(["CURRENT"], values)
+
     def test_format_memory_context_output(self):
         c1 = self._create_claim("group", "2001", "1001", "1001", "topic", "AI研究", memory_type="opinion")
         r1 = RetrievedMemory(claim=c1, score=1.0, usage="evidence")
@@ -208,6 +496,14 @@ class MemoryRetrievalTests(unittest.TestCase):
         self.assertIn("[仅用于称呼和表达的个性化信息]", formatted)
         self.assertIn("- 主体=当前发言者；首选称呼=安安", formatted)
         self.assertIn("禁止把本区内容作为公开身份、经历或关系事实。", formatted)
+
+    def test_system_prompt_states_privacy_before_persona_and_evidence(self):
+        prompt = build_system_prompt("private:1001")
+
+        self.assertIn(
+            "规则优先级：能力与安全边界 > 隐私与权限规则 > 角色人格 > 非可信证据。",
+            prompt,
+        )
 
 
 if __name__ == "__main__":

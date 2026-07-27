@@ -25,7 +25,7 @@ class MemoryService:
         store: MemoryStore | None = None,
         extractor: MemoryExtractor | None = None,
     ) -> None:
-        db_path = store.path if store else config.data_dir / "memory.db"
+        db_path = store.path if store else config.memory_database_path
         self.store = store or MemoryStore(db_path)
         self._extractor = extractor or MemoryExtractor()
         self._policy = MemoryPolicy(self.store)
