@@ -126,6 +126,19 @@ class MemoryRetriever:
                 for claim in private_claims
             ]
             candidates.extend((claim, "evidence") for claim in global_claims)
+            candidates.extend(
+                (
+                    claim,
+                    "personalization"
+                    if _is_group_safe_personalization(claim)
+                    else "evidence",
+                )
+                for claim in self._private_group_fallback(
+                    context=context,
+                    private_claims=private_claims,
+                    now_utc=now_utc,
+                )
+            )
 
         resolved_subject = self._resolve_query_subject(
             context,
@@ -204,6 +217,38 @@ class MemoryRetriever:
             if _is_group_safe_personalization(claim)
         }
 
+    def _private_group_fallback(
+        self,
+        *,
+        context: MemoryContext,
+        private_claims: Sequence[MemoryClaim],
+        now_utc: datetime,
+    ) -> tuple[MemoryClaim, ...]:
+        group_id = str(context.group_id or "").strip()
+        if not group_id:
+            return ()
+        user_id = str(context.user_id)
+        private_predicates = {
+            claim.predicate
+            for claim in private_claims
+            if claim.subject_id == user_id
+            and _is_private_fallback_information(claim)
+        }
+        group_claims = self.store.find_claims_exact(
+            scope_type="group",
+            scope_id=group_id,
+            statuses=_CURRENT_STATUSES,
+            subject_type="qq_user",
+            subject_id=user_id,
+            speaker_qq=user_id,
+        )
+        return tuple(
+            claim
+            for claim in _current_claims(group_claims, now_utc)
+            if _is_private_fallback_information(claim)
+            and claim.predicate not in private_predicates
+        )
+
     def _resolve_query_subject(
         self,
         context: MemoryContext,
@@ -237,14 +282,15 @@ class MemoryRetriever:
                 key=len,
                 reverse=True,
             )
-            for alias in matching_aliases:
+            if matching_aliases:
                 subject_ids = {
                     claim.subject_id
                     for claim in alias_claims
-                    if claim.value == alias
+                    if claim.value in matching_aliases
                 }
                 if len(subject_ids) == 1:
                     return next(iter(subject_ids))
+                return None
 
         compact_query = "".join(query_folded.split())
         if (
@@ -313,6 +359,16 @@ def _is_group_safe_personalization(claim: MemoryClaim) -> bool:
     return (
         _is_preferred_name_claim(claim)
         or _is_response_style_claim(claim)
+    )
+
+
+def _is_private_fallback_information(claim: MemoryClaim) -> bool:
+    return (
+        claim.memory_type in {"identity", "preferred_name", "preference"}
+        or claim.predicate in (
+            *_NAME_PREDICATES,
+            *_RESPONSE_STYLE_PREDICATES,
+        )
     )
 
 

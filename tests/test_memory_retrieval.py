@@ -320,6 +320,142 @@ class MemoryRetrievalTests(unittest.TestCase):
 
         self.assertEqual({"PRIVATE-PREFERRED-NAME"}, personalization)
 
+    def test_private_context_falls_back_to_exact_self_claims_from_source_group(self):
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "name",
+            "SOURCE-GROUP-IDENTITY",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "preferred_name",
+            "SOURCE-GROUP-NAME",
+            memory_type="preferred_name",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "likes",
+            "SOURCE-GROUP-PREFERENCE",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "")
+        by_value = {result.claim.value: result for result in results}
+
+        self.assertEqual(
+            {
+                "SOURCE-GROUP-IDENTITY",
+                "SOURCE-GROUP-NAME",
+                "SOURCE-GROUP-PREFERENCE",
+            },
+            set(by_value),
+        )
+        self.assertEqual(
+            "evidence",
+            by_value["SOURCE-GROUP-IDENTITY"].usage,
+        )
+        self.assertEqual(
+            "personalization",
+            by_value["SOURCE-GROUP-NAME"].usage,
+        )
+        self.assertEqual(
+            "evidence",
+            by_value["SOURCE-GROUP-PREFERENCE"].usage,
+        )
+        self.assertTrue(
+            all(result.claim.scope_type == "group" for result in results)
+        )
+
+    def test_private_fallback_is_exact_self_attributed_and_source_group_isolated(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "name",
+            "PRIVATE-IDENTITY",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "name",
+            "BLOCKED-GROUP-IDENTITY",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "1001",
+            "likes",
+            "OTHER-SPEAKER",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1002",
+            "likes",
+            "OTHER-SUBJECT",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2002",
+            "1001",
+            "1001",
+            "likes",
+            "OTHER-GROUP",
+            memory_type="preference",
+        )
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "likes",
+            "ALLOWED-PREFERENCE",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+            group_id="2001",
+        )
+
+        values = {
+            result.claim.value
+            for result in self.retriever.retrieve(context, "")
+        }
+
+        self.assertIn("PRIVATE-IDENTITY", values)
+        self.assertIn("ALLOWED-PREFERENCE", values)
+        self.assertNotIn("BLOCKED-GROUP-IDENTITY", values)
+        self.assertNotIn("OTHER-SPEAKER", values)
+        self.assertNotIn("OTHER-SUBJECT", values)
+        self.assertNotIn("OTHER-GROUP", values)
+
     def test_first_person_identity_query_ranks_current_qq_subject_first(self):
         self._create_claim(
             "private",
@@ -414,6 +550,66 @@ class MemoryRetrievalTests(unittest.TestCase):
         self.assertGreater(
             scores["GROUP-SUBJECT-PREFERENCE"],
             scores["CURRENT-USER-DISTRACTOR"],
+        )
+
+    def test_ambiguous_group_alias_does_not_fall_through_to_global_subject(self):
+        for speaker_qq, subject_id, value in (
+            ("1002", "1002", "GROUP-PREFERENCE-A"),
+            ("1003", "1003", "GROUP-PREFERENCE-B"),
+        ):
+            self._create_claim(
+                "group",
+                "2001",
+                speaker_qq,
+                subject_id,
+                "name",
+                "小明",
+                memory_type="identity",
+            )
+            self._create_claim(
+                "group",
+                "2001",
+                speaker_qq,
+                subject_id,
+                "likes",
+                value,
+                memory_type="preference",
+            )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "name",
+            "小明",
+            memory_type="identity",
+        )
+        self._create_claim(
+            "global",
+            "global",
+            "9002",
+            "9002",
+            "likes",
+            "GLOBAL-FALLTHROUGH",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "小明喜欢什么")
+        scores = {result.claim.value: result.score for result in results}
+
+        self.assertLess(
+            scores["GLOBAL-FALLTHROUGH"],
+            scores["GROUP-PREFERENCE-A"],
+        )
+        self.assertLess(
+            scores["GLOBAL-FALLTHROUGH"],
+            scores["GROUP-PREFERENCE-B"],
         )
 
     def test_truth_confidence_affects_ranking_before_extraction_confidence(self):
