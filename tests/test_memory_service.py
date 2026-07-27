@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -54,6 +55,147 @@ class MemoryServiceTests(unittest.TestCase):
         # Check ephemeral images stored in memory
         self.assertIn(job_id, service._ephemeral_images)
         self.assertEqual(("data:image/png;base64,123",), service._ephemeral_images[job_id])
+
+    def test_start_schedules_ninety_day_cleanup_before_workers(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+
+        with patch.object(
+            self.store,
+            "cleanup_old_jobs_and_excerpts",
+            wraps=self.store.cleanup_old_jobs_and_excerpts,
+        ) as cleanup:
+            service.start(worker_count=0)
+            try:
+                cleanup.assert_called_once_with(days=90)
+            finally:
+                service.stop()
+
+    def test_release_failure_does_not_retain_ephemeral_images(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="release-failure",
+            sequence=1,
+            text="ordinary text",
+        )
+        job_id = service.stage_event(event)
+
+        with patch.object(
+            self.store,
+            "mark_job_ready",
+            side_effect=RuntimeError("database failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                service.release_job(
+                    job_id,
+                    image_data_urls=["data:image/png;base64,private-image"],
+                )
+
+        self.assertNotIn(job_id, service._ephemeral_images)
+
+    def test_stop_removes_unclaimed_ephemeral_images(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        service.start(worker_count=0)
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="stopped-before-claim",
+            sequence=1,
+            text="ordinary text",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(
+            job_id,
+            image_data_urls=["data:image/png;base64,private-image"],
+        )
+
+        service.stop()
+
+        self.assertEqual({}, service._ephemeral_images)
+
+    def test_worker_state_failure_is_redacted_and_clears_ephemeral_images(self):
+        extractor = MagicMock()
+        extractor.extract.side_effect = RuntimeError(
+            "incoming-body-private-marker"
+        )
+        service = MemoryService(store=self.store, extractor=extractor)
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="worker-failure",
+            sequence=1,
+            text="claim-value-private-marker",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(
+            job_id,
+            image_data_urls=["data:image/png;base64,private-image-marker"],
+        )
+        claimed = self.store.claim_next_job("private:1001")
+
+        with (
+            patch.object(
+                self.store,
+                "fail_job",
+                side_effect=ValueError("database-private-marker"),
+            ),
+            self.assertLogs("qq-bot", level="ERROR") as captured,
+        ):
+            service._process_claimed_job(claimed)
+
+        logged = "\n".join(captured.output)
+        self.assertIn(f"job_id={job_id}", logged)
+        self.assertIn("scope_key=private:1001", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertIn("ValueError", logged)
+        self.assertNotIn("incoming-body-private-marker", logged)
+        self.assertNotIn("claim-value-private-marker", logged)
+        self.assertNotIn("database-private-marker", logged)
+        self.assertNotIn("private-image-marker", logged)
+        self.assertNotIn(job_id, service._ephemeral_images)
+
+    def test_worker_survives_redacted_claim_failure(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        first_attempt = Event()
+        second_attempt = Event()
+        release_second = Event()
+        attempts = 0
+
+        def claim():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_attempt.set()
+                raise RuntimeError("claim-private-marker")
+            second_attempt.set()
+            release_second.wait(timeout=2)
+            return None
+
+        with (
+            patch.object(service, "_find_and_claim_next_job", side_effect=claim),
+            self.assertLogs("qq-bot", level="ERROR") as captured,
+        ):
+            service.start(worker_count=1)
+            try:
+                self.assertTrue(first_attempt.wait(timeout=2))
+                self.assertTrue(second_attempt.wait(timeout=2))
+            finally:
+                release_second.set()
+                service.stop()
+
+        logged = "\n".join(captured.output)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("claim-private-marker", logged)
 
     def test_worker_processes_job_to_completion(self):
         mock_extractor = MagicMock()

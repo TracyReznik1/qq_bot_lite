@@ -1,4 +1,3 @@
-import logging
 import os
 import unittest
 from threading import Event, Lock
@@ -54,8 +53,44 @@ class MainMessageQueueConfigurationTests(unittest.TestCase):
             main.message_queue.executor._max_workers,
         )
 
+    def test_global_queue_registers_group_memory_sequence_on_acceptance(self):
+        service = mock.Mock()
+        event = {
+            "message_type": "group",
+            "group_id": 20,
+            "user_id": 7,
+            "raw_message": "ordinary",
+            "_qqbot_sequence": 42,
+        }
+
+        with mock.patch.object(main, "get_memory_service", return_value=service):
+            main.message_queue.on_accepted(event)
+
+        service.register_pending_sequence.assert_called_once_with("group:20", 42)
+
 
 class MessageQueueConcurrencyTests(unittest.TestCase):
+    def test_acceptance_hook_runs_with_sequence_before_processing_starts(self):
+        accepted = []
+        processed = []
+        queue = MessageQueue(
+            max_workers=1,
+            on_accepted=lambda data: accepted.append(data["_qqbot_sequence"]),
+        )
+
+        try:
+            queue.enqueue(
+                private_message(7, "first"),
+                lambda data: processed.append(
+                    (data["_qqbot_sequence"], tuple(accepted))
+                ),
+            )
+        finally:
+            queue.executor.shutdown(wait=True)
+
+        self.assertEqual(1, len(accepted))
+        self.assertEqual([(accepted[0], (accepted[0],))], processed)
+
     def test_different_private_sessions_can_run_in_parallel(self):
         queue = MessageQueue(max_workers=2)
         first_started = Event()
@@ -156,9 +191,8 @@ class MessageQueueConcurrencyTests(unittest.TestCase):
                 raise RuntimeError("first message failed")
             second_finished.set()
 
-        logger = logging.getLogger("qq-bot")
         try:
-            with patch.object(logger, "exception") as log_exception:
+            with self.assertLogs("qq-bot", level="ERROR") as captured:
                 queue.enqueue(private_message(7, "1"), process)
                 self.assertTrue(first_started.wait(WAIT_TIMEOUT))
                 queue.enqueue(private_message(7, "2"), process)
@@ -169,9 +203,9 @@ class MessageQueueConcurrencyTests(unittest.TestCase):
                 with state_lock:
                     self.assertEqual([1, 2], order)
                 self.assertFalse(first_timed_out.is_set())
-                log_exception.assert_called_once_with(
-                    "Background message processing failed"
-                )
+                logged = "\n".join(captured.output)
+                self.assertIn("RuntimeError", logged)
+                self.assertNotIn("first message failed", logged)
         finally:
             release_first.set()
             queue.executor.shutdown(wait=True)

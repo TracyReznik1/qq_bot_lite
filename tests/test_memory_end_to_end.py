@@ -68,6 +68,48 @@ class MemoryEndToEndTests(unittest.TestCase):
         finally:
             service.stop()
 
+    def test_group_sequence_two_cannot_be_claimed_before_late_staged_sequence_one(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        first = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="group:2001:1001",
+                is_group=True,
+                group_id="2001",
+            ),
+            message_id="first",
+            sequence=1,
+            text="first ordinary message",
+        )
+        second = MemoryEvent(
+            context=MemoryContext(
+                user_id="1002",
+                session_key="group:2001:1002",
+                is_group=True,
+                group_id="2001",
+            ),
+            message_id="second",
+            sequence=2,
+            text="second ordinary message",
+        )
+        scope_key = "group:2001"
+        service.register_pending_sequence(scope_key, first.sequence)
+        service.register_pending_sequence(scope_key, second.sequence)
+
+        second_id = service.stage_event(second)
+        service.release_job(second_id)
+
+        self.assertIsNone(service._find_and_claim_next_job())
+
+        first_id = service.stage_event(first)
+        service.release_job(first_id)
+        first_claim = service._find_and_claim_next_job()
+        self.assertEqual(first_id, first_claim.id)
+        service._process_claimed_job(first_claim)
+
+        second_claim = service._find_and_claim_next_job()
+        self.assertEqual(second_id, second_claim.id)
+
 
 if __name__ == "__main__":
     unittest.main()

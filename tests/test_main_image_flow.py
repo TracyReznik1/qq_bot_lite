@@ -41,6 +41,151 @@ def group_event(raw_message, message, message_id=11):
 
 
 class MainImageFlowTests(unittest.TestCase):
+    def test_memory_stage_failure_does_not_change_successful_chat_reply(self):
+        event = private_event("hello", "hello", message_id=301)
+        memory_service = mock.Mock()
+        memory_service.stage_event.side_effect = RuntimeError(
+            "incoming-private-text-must-not-be-logged"
+        )
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(main, "generate_reply", return_value="successful reply"),
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        send.assert_called_once_with("1", "successful reply", is_group=False)
+        memory_service.release_job.assert_not_called()
+
+    def test_memory_release_failure_does_not_send_a_second_error_reply(self):
+        event = private_event("hello", "hello", message_id=302)
+        memory_service = mock.Mock()
+        memory_service.stage_event.return_value = 91
+        memory_service.release_job.side_effect = RuntimeError(
+            "successful-reply-must-not-be-logged"
+        )
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(main, "generate_reply", return_value="successful reply"),
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        send.assert_called_once_with("1", "successful reply", is_group=False)
+        memory_service.release_job.assert_called_once_with(91, [])
+
+    def test_structured_reply_reference_resolves_author_before_staging(self):
+        event = private_event(
+            "[CQ:reply,id=reply-77]他喜欢跑步",
+            [
+                {"type": "reply", "data": {"id": "reply-77"}},
+                {"type": "text", "data": {"text": "他喜欢跑步"}},
+            ],
+            message_id=303,
+        )
+        memory_service = mock.Mock()
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(
+                main.onebot,
+                "get_message_author",
+                return_value="456",
+            ) as get_author,
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(main, "generate_reply", return_value="ok"),
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            memory_service.stage_event.side_effect = (
+                lambda _event: 92 if get_author.called else self.fail(
+                    "reply author lookup must precede staging"
+                )
+            )
+            main.process_message(event)
+
+        get_author.assert_called_once_with("reply-77")
+        staged_event = memory_service.stage_event.call_args.args[0]
+        self.assertEqual("reply-77", staged_event.reply_to_message_id)
+        self.assertEqual("456", staged_event.reply_to_user_id)
+        self.assertEqual("他喜欢跑步", staged_event.text)
+
+    def test_message_and_reply_bodies_are_absent_from_captured_logs(self):
+        incoming = "incoming-private-marker-4b739"
+        reply = "reply-private-marker-85d20"
+        event = private_event(incoming, incoming, message_id=304)
+        memory_service = mock.Mock()
+        memory_service.stage_event.return_value = 93
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(main, "generate_reply", return_value=reply),
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+            self.assertLogs("qq-bot", level="INFO") as captured,
+        ):
+            main.process_message(event)
+
+        logged = "\n".join(captured.output)
+        self.assertNotIn(incoming, logged)
+        self.assertNotIn(reply, logged)
+
+    def test_command_clears_acceptance_reservation_without_staging(self):
+        event = private_event("/help", "/help", message_id=305)
+        event["_qqbot_sequence"] = 305
+        memory_service = mock.Mock()
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(
+                main,
+                "handle_command",
+                return_value=CommandResult(True, "help"),
+            ),
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        memory_service.stage_event.assert_not_called()
+        memory_service.clear_pending_sequence.assert_called_once_with(
+            "private:1",
+            305,
+        )
+
+    def test_chat_exception_log_contains_only_error_class_metadata(self):
+        incoming = "incoming-error-marker-d19c"
+        exception_body = "provider-private-marker-651e"
+        event = private_event(incoming, incoming, message_id=306)
+        memory_service = mock.Mock()
+        memory_service.stage_event.return_value = 94
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(
+                main,
+                "generate_reply",
+                side_effect=RuntimeError(exception_body),
+            ),
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+            self.assertLogs("qq-bot", level="ERROR") as captured,
+        ):
+            main.process_message(event)
+
+        logged = "\n".join(captured.output)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn(incoming, logged)
+        self.assertNotIn(exception_body, logged)
+
     def test_private_cq_file_image_is_resolved_only_for_chat_loading(self):
         event = private_event(
             "[CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
@@ -237,7 +382,7 @@ class MainImageFlowTests(unittest.TestCase):
             "1", "图片读取失败，请重新发送。", is_group=False
         )
 
-    def test_image_routing_logs_use_placeholder_not_temporary_url(self):
+    def test_image_routing_logs_omit_placeholder_and_temporary_url(self):
         event = group_event(
             f"[CQ:at,qq=9] [CQ:image,file=a.png,url={IMAGE_URL}]",
             [
@@ -257,7 +402,7 @@ class MainImageFlowTests(unittest.TestCase):
         logged = repr(log_info.call_args_list)
         self.assertNotIn(IMAGE_URL, logged)
         self.assertNotIn("base64", logged)
-        self.assertIn("[图片]", logged)
+        self.assertNotIn("[图片]", logged)
 
     def test_real_history_file_omits_image_data_and_temporary_url(self):
         event = private_event(

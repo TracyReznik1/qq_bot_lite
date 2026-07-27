@@ -444,6 +444,119 @@ class MemoryStoreTests(unittest.TestCase):
         second = self.store.claim_next_job("group:30003")
         self.assertEqual(second_id, second.id)
 
+    def test_cleanup_honors_cutoff_and_keeps_cleaned_jobs_readable(self):
+        recent_id, _ = self.store.create_job(
+            private_event(
+                message_id="recent-done",
+                sequence=10,
+                text="RECENT_JOB_BODY_91ba",
+            )
+        )
+        old_id, _ = self.store.create_job(
+            private_event(
+                message_id="old-done",
+                sequence=11,
+                text="OLD_JOB_BODY_a614",
+            )
+        )
+        running_id, _ = self.store.create_job(
+            private_event(
+                message_id="current-running",
+                sequence=12,
+                text="CURRENT_CLAIM_BODY_201c",
+            )
+        )
+        for job_id in (recent_id, old_id, running_id):
+            self.store.mark_job_ready(job_id)
+            claimed = self.store.claim_next_job("private:10001")
+            self.assertIsNotNone(claimed)
+            if job_id == running_id:
+                break
+            self.store.complete_job(claimed.id)
+
+        archived, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="old-archived-predicate",
+            value="old-archived-value",
+            memory_type="fact",
+            modality="asserted",
+            source_kind="message:speaker",
+            source_message_id="old-archived-source",
+            source_excerpt="OLD_ARCHIVED_EXCERPT_f781",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="high",
+            dedupe_key="old-archived-claim",
+            status="archived",
+        )
+        self.store.add_evidence(
+            archived.id,
+            source_kind="message:speaker",
+            source_message_id="old-archived-evidence",
+            source_excerpt="OLD_ARCHIVED_EVIDENCE_33c1",
+        )
+        active, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="current-active-predicate",
+            value="current-active-value",
+            memory_type="fact",
+            modality="asserted",
+            source_kind="message:speaker",
+            source_message_id="current-active-source",
+            source_excerpt="CURRENT_ACTIVE_EXCERPT_8f12",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="high",
+            dedupe_key="current-active-claim",
+        )
+        old_timestamp = (
+            datetime.now(timezone.utc) - timedelta(days=91)
+        ).isoformat()
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE memory_jobs SET updated_at = ? WHERE id = ?",
+                (old_timestamp, old_id),
+            )
+            connection.execute(
+                "UPDATE memory_claims SET created_at = ? WHERE id IN (?, ?)",
+                (old_timestamp, archived.id, active.id),
+            )
+            connection.execute(
+                "UPDATE memory_evidence SET created_at = ? WHERE claim_id = ?",
+                (old_timestamp, archived.id),
+            )
+
+        self.store.cleanup_old_jobs_and_excerpts(days=90)
+
+        self.assertEqual("RECENT_JOB_BODY_91ba", self.store.get_job(recent_id).text)
+        cleaned = self.store.get_job(old_id)
+        self.assertEqual("", cleaned.text)
+        self.assertNotIn("OLD_JOB_BODY_a614", cleaned.payload_json)
+        self.assertEqual(
+            "CURRENT_CLAIM_BODY_201c",
+            self.store.get_job(running_id).text,
+        )
+        self.assertEqual("", self.store.get_claim(archived.id).source_excerpt)
+        self.assertEqual("", self.store.list_evidence(archived.id)[0].source_excerpt)
+        self.assertEqual(
+            "CURRENT_ACTIVE_EXCERPT_8f12",
+            self.store.get_claim(active.id).source_excerpt,
+        )
+        with self.store._connection() as connection:
+            archived_fts_excerpt = connection.execute(
+                "SELECT source_excerpt FROM memory_fts WHERE rowid = ?",
+                (archived.id,),
+            ).fetchone()[0]
+        self.assertEqual("", archived_fts_excerpt)
+
     def test_recovers_abandoned_running_jobs_after_reopen(self):
         job_id, _ = self.store.create_job(
             private_event(message_id="crash-recovery", sequence=1)

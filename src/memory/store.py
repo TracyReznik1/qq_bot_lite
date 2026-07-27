@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -263,16 +263,76 @@ class MemoryStore:
         return str(row[0]) if row else "failed"
 
     def cleanup_old_jobs_and_excerpts(self, days: int = 90) -> int:
-        cutoff = _utc_now()
+        cutoff = _format_utc(
+            datetime.now(timezone.utc) - timedelta(days=days)
+        )
+        cleaned = 0
+        archived_claim_ids: tuple[int, ...] = ()
+        needs_fts_optimize = False
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
                 UPDATE memory_jobs
                 SET payload_json = '{}'
-                WHERE state = 'done'
-                """
+                WHERE state = 'done' AND updated_at < ?
+                """,
+                (cutoff,),
             )
-            return cursor.rowcount
+            cleaned += cursor.rowcount
+            archived_rows = connection.execute(
+                """
+                SELECT id
+                FROM memory_claims
+                WHERE status = 'archived'
+                  AND created_at < ?
+                  AND source_excerpt <> ''
+                """,
+                (cutoff,),
+            ).fetchall()
+            archived_claim_ids = tuple(int(row["id"]) for row in archived_rows)
+            if archived_claim_ids:
+                placeholders = ",".join("?" for _ in archived_claim_ids)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE memory_claims
+                    SET source_excerpt = ''
+                    WHERE id IN ({placeholders})
+                    """,
+                    archived_claim_ids,
+                )
+                cleaned += cursor.rowcount
+                needs_fts_optimize = not _fts_secure_delete_enabled(connection)
+                for claim_id in archived_claim_ids:
+                    connection.execute(
+                        "DELETE FROM memory_fts WHERE rowid = ?",
+                        (claim_id,),
+                    )
+                    claim = connection.execute(
+                        "SELECT * FROM memory_claims WHERE id = ?",
+                        (claim_id,),
+                    ).fetchone()
+                    _insert_fts_row(connection, claim)
+            cursor = connection.execute(
+                """
+                UPDATE memory_evidence
+                SET source_excerpt = ''
+                WHERE created_at < ?
+                  AND source_excerpt <> ''
+                  AND claim_id IN (
+                      SELECT id
+                      FROM memory_claims
+                      WHERE status = 'archived'
+                  )
+                """,
+                (cutoff,),
+            )
+            cleaned += cursor.rowcount
+        if cleaned:
+            if needs_fts_optimize:
+                self._optimize_fts_for_privacy()
+            self._checkpoint_wal()
+        return cleaned
 
     def create_job(self, event: MemoryEvent) -> tuple[int, bool]:
         scope_type, scope_id = event.context.primary_scope
@@ -1064,8 +1124,8 @@ def _job_from_row(row: sqlite3.Row) -> MemoryJob:
         sequence=int(row["sequence"]),
         payload_json=str(row["payload_json"]),
         context=context,
-        message_id=str(payload["message_id"]),
-        text=str(payload["text"]),
+        message_id=str(payload.get("message_id", "")),
+        text=str(payload.get("text", "")),
         image_count=int(payload.get("image_count", 0)),
         mentioned_qq_ids=tuple(
             str(value) for value in payload.get("mentioned_qq_ids", ())

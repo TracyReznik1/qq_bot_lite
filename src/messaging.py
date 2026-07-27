@@ -1,7 +1,8 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import logging
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 from src.utils.storage import safe_id
 
@@ -20,6 +21,16 @@ def get_event_session_key(data: dict[str, Any]) -> str | None:
 
     is_group = data.get("message_type") == "group"
     return build_session_key(uid, data, is_group)
+
+
+def get_event_memory_scope_key(data: dict[str, Any]) -> str | None:
+    uid = str(data.get("user_id", "")).strip()
+    if not uid:
+        return None
+    if data.get("message_type") == "group":
+        group_id = str(data.get("group_id", "")).strip()
+        return f"group:{safe_id(group_id)}" if group_id else None
+    return f"private:{safe_id(uid)}"
 
 
 def build_message_dedupe_key(data: dict[str, Any], message_id: Any) -> str:
@@ -54,7 +65,12 @@ def next_qqbot_sequence() -> int:
 
 
 class MessageQueue:
-    def __init__(self, max_workers: int = 4, max_processed_message_ids: int = 500):
+    def __init__(
+        self,
+        max_workers: int = 4,
+        max_processed_message_ids: int = 500,
+        on_accepted: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="qq-message")
         self.processed_message_ids: set[str] = set()
         self.processed_message_order: deque[str] = deque()
@@ -63,6 +79,7 @@ class MessageQueue:
         self.session_message_queues: dict[str, deque[dict[str, Any]]] = {}
         self.active_session_workers: set[str] = set()
         self.max_processed_message_ids = max_processed_message_ids
+        self.on_accepted = on_accepted
 
     def mark_seen(self, data: dict[str, Any]) -> bool:
         message_id = data.get("message_id")
@@ -86,11 +103,18 @@ class MessageQueue:
         if session_key is None:
             return
 
-        if "_qqbot_sequence" not in data:
-            data["_qqbot_sequence"] = next_qqbot_sequence()
-
         should_start_worker = False
         with self.session_queue_lock:
+            if "_qqbot_sequence" not in data:
+                data["_qqbot_sequence"] = next_qqbot_sequence()
+            if self.on_accepted is not None:
+                try:
+                    self.on_accepted(data)
+                except Exception as error:
+                    logging.getLogger("qq-bot").error(
+                        "Message acceptance hook failed error_type=%s",
+                        type(error).__name__,
+                    )
             queue = self.session_message_queues.setdefault(session_key, deque())
             queue.append(data)
             if session_key not in self.active_session_workers:
@@ -101,8 +125,6 @@ class MessageQueue:
             self.executor.submit(self._drain_session, session_key, process_func)
 
     def _drain_session(self, session_key: str, process_func) -> None:
-        import logging
-
         while True:
             with self.session_queue_lock:
                 queue = self.session_message_queues.get(session_key)
@@ -114,9 +136,10 @@ class MessageQueue:
 
             try:
                 process_func(data)
-            except Exception:
-                logging.getLogger("qq-bot").exception(
-                    "Background message processing failed"
+            except Exception as error:
+                logging.getLogger("qq-bot").error(
+                    "Background message processing failed error_type=%s",
+                    type(error).__name__,
                 )
 
 

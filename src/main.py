@@ -1,5 +1,6 @@
 import hmac
 import logging
+import re
 import time
 from threading import Lock
 from typing import Any
@@ -13,6 +14,7 @@ from src.persona import get_persona
 from src.messaging import (
     MessageQueue,
     enqueue_message,
+    get_event_memory_scope_key,
     get_event_session_key,
     mark_message_seen,
 )
@@ -42,17 +44,46 @@ _startup_lock = Lock()
 
 onebot = OneBotClient(config)
 
+
+def _register_pending_memory_sequence(data: dict[str, Any]) -> None:
+    scope_key = get_event_memory_scope_key(data)
+    sequence = int(data.get("_qqbot_sequence") or 0)
+    if scope_key and sequence > 0:
+        get_memory_service().register_pending_sequence(scope_key, sequence)
+
 message_queue = MessageQueue(
     max_workers=config.message_workers,
     max_processed_message_ids=MAX_PROCESSED_MESSAGE_IDS,
+    on_accepted=_register_pending_memory_sequence,
 )
 
 
-def message_preview(text: str, limit: int = 80) -> str:
-    preview = " ".join(str(text or "").split())
-    if len(preview) > limit:
-        return preview[:limit] + "..."
-    return preview
+CQ_REPLY_PATTERN = re.compile(
+    r"\[CQ:reply,(?:[^\]]*,)?id=([^,\]]+)[^\]]*\]",
+    re.IGNORECASE,
+)
+
+
+def get_reply_message_id(data: dict[str, Any], raw_message: str) -> str | None:
+    message = data.get("message")
+    if isinstance(message, list):
+        for segment in message:
+            if not isinstance(segment, dict) or segment.get("type") != "reply":
+                continue
+            segment_data = segment.get("data")
+            if isinstance(segment_data, dict):
+                message_id = str(
+                    segment_data.get("id")
+                    or segment_data.get("message_id")
+                    or ""
+                ).strip()
+                if message_id:
+                    return message_id
+    match = CQ_REPLY_PATTERN.search(raw_message)
+    if match:
+        return match.group(1).strip()
+    message_id = str(data.get("reply_to_message_id") or "").strip()
+    return message_id or None
 
 
 def startup() -> None:
@@ -123,19 +154,18 @@ def send_reply(target_id: Any, text: str, is_group: bool) -> None:
     )
     for index, part in enumerate(parts, 1):
         logger.info(
-            "Sending reply part target_id=%s is_group=%s part=%s/%s chars=%s preview=%r",
+            "Sending reply part target_id=%s is_group=%s part=%s/%s chars=%s",
             target_id,
             is_group,
             index,
             len(parts),
             len(part),
-            message_preview(part),
         )
         onebot.send_msg(target_id, part, is_group=is_group)
         time.sleep(0.2)
 
 
-def process_message(data: dict[str, Any]) -> None:
+def _process_message(data: dict[str, Any]) -> None:
     uid = str(data.get("user_id", ""))
     raw_msg = str(data.get("raw_message", "")).strip()
     if not uid or not raw_msg:
@@ -190,6 +220,8 @@ def process_message(data: dict[str, Any]) -> None:
             )
             return
 
+    raw_msg = CQ_REPLY_PATTERN.sub("", raw_msg).strip()
+
     try:
         parsed_message = parse_image_message(data, raw_msg)
         route_text = parsed_message.text or (
@@ -200,12 +232,12 @@ def process_message(data: dict[str, Any]) -> None:
 
         route = route_message(route_text)
         logger.info(
-            "Message routed session_key=%s is_group=%s handler=%s command=%s query=%r",
+            "Message routed session_key=%s is_group=%s handler=%s command=%s query_chars=%s",
             session_key,
             is_group,
             route.handler,
             route.command,
-            message_preview(route.query),
+            len(route.query or ""),
         )
         if route.handler == "command":
             result = handle_command(
@@ -229,6 +261,21 @@ def process_message(data: dict[str, Any]) -> None:
             is_group=is_group,
             group_id=str(data.get("group_id")) if is_group else None,
         )
+        reply_to_message_id = get_reply_message_id(
+            data,
+            str(data.get("raw_message") or ""),
+        )
+        reply_to_user_id = (
+            onebot.get_message_author(reply_to_message_id)
+            if reply_to_message_id
+            else None
+        )
+        if reply_to_user_id is None:
+            reply_to_user_id = (
+                str(data.get("reply_to_user_id"))
+                if data.get("reply_to_user_id")
+                else None
+            )
         mem_event = MemoryEvent(
             context=mem_ctx,
             message_id=str(data.get("message_id") or ""),
@@ -236,10 +283,21 @@ def process_message(data: dict[str, Any]) -> None:
             text=parsed_message.text,
             image_count=len(parsed_message.image_urls),
             mentioned_qq_ids=tuple(str(qid) for qid in data.get("mentioned_qq_ids") or ()),
-            reply_to_message_id=str(data.get("reply_to_message_id")) if data.get("reply_to_message_id") else None,
-            reply_to_user_id=str(data.get("reply_to_user_id")) if data.get("reply_to_user_id") else None,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_user_id=reply_to_user_id,
         )
-        job_id = get_memory_service().stage_event(mem_event)
+        memory_service = get_memory_service()
+        job_id: int | None = None
+        try:
+            job_id = memory_service.stage_event(mem_event)
+        except Exception as error:
+            scope_type, scope_id = mem_ctx.primary_scope
+            logger.error(
+                "Memory stage failed scope_key=%s sequence=%s error_type=%s",
+                f"{scope_type}:{scope_id}",
+                mem_event.sequence,
+                type(error).__name__,
+            )
         image_data_urls: list[str] = []
 
         try:
@@ -257,25 +315,60 @@ def process_message(data: dict[str, Any]) -> None:
             logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
             send_reply(target_id, reply, is_group)
         finally:
-            get_memory_service().release_job(job_id, image_data_urls)
+            if job_id is not None:
+                try:
+                    memory_service.release_job(job_id, image_data_urls)
+                except Exception as error:
+                    logger.error(
+                        "Memory release failed job_id=%s error_type=%s",
+                        job_id,
+                        type(error).__name__,
+                    )
     except ImageInputError as error:
         send_reply(target_id, str(error), is_group)
     except ImageRecognitionUnavailable as error:
         logger.info("Image recognition unavailable session_key=%s", session_key)
         send_reply(target_id, str(error), is_group)
     except RuntimeError as error:
-        logger.exception("Configuration error")
+        logger.error(
+            "Configuration error error_type=%s",
+            type(error).__name__,
+        )
         send_reply(target_id, f"配置还没好：{error}", is_group)
-    except Exception:
-        logger.exception("Message handling failed")
+    except Exception as error:
+        logger.error(
+            "Message handling failed error_type=%s",
+            type(error).__name__,
+        )
         send_reply(target_id, "我这边处理失败了，先缓一缓再试。", is_group)
+
+
+def process_message(data: dict[str, Any]) -> None:
+    scope_key = get_event_memory_scope_key(data)
+    sequence = int(data.get("_qqbot_sequence") or 0)
+    try:
+        _process_message(data)
+    finally:
+        if scope_key and sequence > 0:
+            try:
+                get_memory_service().clear_pending_sequence(scope_key, sequence)
+            except Exception as error:
+                logger.error(
+                    "Memory sequence cleanup failed scope_key=%s sequence=%s error_type=%s",
+                    scope_key,
+                    sequence,
+                    type(error).__name__,
+                )
 
 
 def process_message_safely(data: dict[str, Any]) -> None:
     try:
         process_message(data)
-    except Exception:
-        logger.exception("Background message processing failed")
+    except Exception as error:
+        logger.error(
+            "Background message processing failed error_type=%s",
+            type(error).__name__,
+        )
 
 
 def is_callback_authorized() -> bool:
