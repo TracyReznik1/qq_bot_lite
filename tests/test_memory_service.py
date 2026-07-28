@@ -97,6 +97,64 @@ class MemoryServiceTests(unittest.TestCase):
 
         self.assertNotIn(job_id, service._ephemeral_images)
 
+    def test_duplicate_completed_job_release_never_retains_images(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="duplicate-completed",
+            sequence=1,
+            text="ordinary text",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(job_id)
+        claimed = self.store.claim_next_job("private:1001")
+        self.store.complete_job(claimed.id)
+
+        duplicate_id = service.stage_event(event)
+        service.release_job(
+            duplicate_id,
+            image_data_urls=["data:image/png;base64,duplicate-private-image"],
+        )
+
+        self.assertEqual(job_id, duplicate_id)
+        self.assertEqual("done", self.store.get_job(job_id).state)
+        self.assertNotIn(job_id, service._ephemeral_images)
+
+    def test_duplicate_failed_job_release_never_retains_images(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="duplicate-failed",
+            sequence=1,
+            text="ordinary text",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(job_id)
+        claimed = self.store.claim_next_job("private:1001")
+        self.store.fail_job(
+            claimed.id,
+            error_type="RuntimeError",
+            retry_at=None,
+        )
+
+        duplicate_id = service.stage_event(event)
+        service.release_job(
+            duplicate_id,
+            image_data_urls=["data:image/png;base64,duplicate-private-image"],
+        )
+
+        self.assertEqual(job_id, duplicate_id)
+        self.assertEqual("failed", self.store.get_job(job_id).state)
+        self.assertNotIn(job_id, service._ephemeral_images)
+
     def test_stop_removes_unclaimed_ephemeral_images(self):
         service = MemoryService(store=self.store, extractor=MagicMock())
         service.start(worker_count=0)
@@ -163,6 +221,53 @@ class MemoryServiceTests(unittest.TestCase):
         self.assertNotIn("database-private-marker", logged)
         self.assertNotIn("private-image-marker", logged)
         self.assertNotIn(job_id, service._ephemeral_images)
+
+    def test_state_update_failure_recovers_only_current_job_and_unblocks_scope(self):
+        extractor = MagicMock()
+        extractor.extract.side_effect = [RuntimeError("first failure"), (), ()]
+        service = MemoryService(store=self.store, extractor=extractor)
+        first = MemoryEvent(
+            context=MemoryContext("1001", "private:1001", False),
+            message_id="recover-first",
+            sequence=1,
+            text="first",
+        )
+        second = MemoryEvent(
+            context=MemoryContext("1001", "private:1001", False),
+            message_id="recover-second",
+            sequence=2,
+            text="second",
+        )
+        other = MemoryEvent(
+            context=MemoryContext("2002", "private:2002", False),
+            message_id="other-running",
+            sequence=3,
+            text="other",
+        )
+        first_id = service.stage_event(first)
+        second_id = service.stage_event(second)
+        other_id = service.stage_event(other)
+        for job_id in (first_id, second_id, other_id):
+            service.release_job(job_id)
+        first_claim = self.store.claim_next_job("private:1001")
+        other_claim = self.store.claim_next_job("private:2002")
+
+        with patch.object(
+            self.store,
+            "fail_job",
+            side_effect=ValueError("state write failed"),
+        ):
+            service._process_claimed_job(first_claim)
+
+        self.assertEqual("retry", self.store.get_job(first_id).state)
+        self.assertEqual("running", self.store.get_job(other_claim.id).state)
+        reclaimed = self.store.claim_next_job("private:1001")
+        self.assertEqual(first_id, reclaimed.id)
+        service._process_claimed_job(reclaimed)
+        following = self.store.claim_next_job("private:1001")
+        self.assertEqual(second_id, following.id)
+        service._process_claimed_job(following)
+        self.assertEqual("done", self.store.get_job(second_id).state)
 
     def test_worker_survives_redacted_claim_failure(self):
         service = MemoryService(store=self.store, extractor=MagicMock())

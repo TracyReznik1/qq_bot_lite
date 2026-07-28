@@ -557,6 +557,93 @@ class MemoryStoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual("", archived_fts_excerpt)
 
+    def test_cleanup_retries_maintenance_after_post_commit_failure(self):
+        job_marker = "RETRY_JOB_BODY_711d"
+        excerpt_marker = "RETRY_ARCHIVED_EXCERPT_4c20"
+        job_id, _ = self.store.create_job(
+            private_event(
+                message_id="retry-maintenance-job",
+                sequence=20,
+                text=job_marker,
+            )
+        )
+        self.store.mark_job_ready(job_id)
+        claimed = self.store.claim_next_job("private:10001")
+        self.store.complete_job(claimed.id)
+        archived, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="retry-maintenance-predicate",
+            value="retry-maintenance-value",
+            memory_type="fact",
+            modality="asserted",
+            source_kind="message:speaker",
+            source_message_id="retry-maintenance-source",
+            source_excerpt=excerpt_marker,
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="high",
+            dedupe_key="retry-maintenance-claim",
+            status="archived",
+        )
+        old_timestamp = (
+            datetime.now(timezone.utc) - timedelta(days=91)
+        ).isoformat()
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE memory_jobs SET updated_at = ? WHERE id = ?",
+                (old_timestamp, job_id),
+            )
+            connection.execute(
+                "UPDATE memory_claims SET created_at = ? WHERE id = ?",
+                (old_timestamp, archived.id),
+            )
+
+        with (
+            mock.patch(
+                "src.memory.store._fts_secure_delete_enabled",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.store,
+                "_optimize_fts_for_privacy",
+                side_effect=RuntimeError("maintenance interrupted"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            self.store.cleanup_old_jobs_and_excerpts(days=90)
+
+        with (
+            mock.patch(
+                "src.memory.store._fts_secure_delete_enabled",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.store,
+                "_optimize_fts_for_privacy",
+                wraps=self.store._optimize_fts_for_privacy,
+            ) as optimize,
+            mock.patch.object(
+                self.store,
+                "_checkpoint_wal",
+                wraps=self.store._checkpoint_wal,
+            ) as checkpoint,
+        ):
+            self.store.cleanup_old_jobs_and_excerpts(days=90)
+
+        optimize.assert_called_once_with()
+        checkpoint.assert_called_once_with()
+        self.assertEqual("", self.store.get_job(job_id).text)
+        self.assertEqual("", self.store.get_claim(archived.id).source_excerpt)
+        for path in (self.path, Path(f"{self.path}-wal")):
+            if path.exists():
+                contents = path.read_bytes()
+                self.assertNotIn(job_marker.encode(), contents)
+                self.assertNotIn(excerpt_marker.encode(), contents)
+
     def test_recovers_abandoned_running_jobs_after_reopen(self):
         job_id, _ = self.store.create_job(
             private_event(message_id="crash-recovery", sequence=1)

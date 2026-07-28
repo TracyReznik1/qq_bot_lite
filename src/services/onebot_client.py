@@ -102,11 +102,12 @@ class OneBotClient:
                 is_group,
                 response.status_code,
             )
-        except Exception:
-            logger.exception(
-                "OneBot send failed endpoint=%s target_id=%s is_group=%s chars=%s",
+        except Exception as error:
+            logger.error(
+                "OneBot send failed endpoint=%s target_id=%s is_group=%s chars=%s error_type=%s",
                 endpoint,
                 target_id,
                 is_group,
                 len(message),
+                type(error).__name__,
             )

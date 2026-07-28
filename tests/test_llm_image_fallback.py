@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+import requests
+
 import src.main as main
 import src.services.llm_client as llm_client
 from src.services.llm_types import ChatResponse, LLMModelSpec
@@ -32,6 +34,33 @@ def image_messages():
 
 
 class LlmImageFallbackTests(unittest.TestCase):
+    def test_provider_failures_log_error_classes_without_exception_bodies(self):
+        for error in (
+            RuntimeError("runtime-secret-sentinel"),
+            requests.ConnectionError("connection-secret-sentinel"),
+            ValueError("value-secret-sentinel"),
+        ):
+            with self.subTest(error_type=type(error).__name__):
+                client = llm_client.FallbackLLMClient(
+                    [LLMModelSpec(provider="gemini", model="redacted-log")]
+                )
+                with (
+                    mock.patch.object(
+                        client,
+                        "_get_client",
+                        return_value=mock.Mock(
+                            chat=mock.Mock(side_effect=error),
+                        ),
+                    ),
+                    self.assertLogs("qq-bot", level="WARNING") as captured,
+                    self.assertRaises(RuntimeError),
+                ):
+                    client.chat([{"role": "user", "content": "private input"}])
+
+                logged = "\n".join(captured.output)
+                self.assertIn(type(error).__name__, logged)
+                self.assertNotIn(str(error), logged)
+
     def image_error_type(self):
         error_type = getattr(llm_client, "ImageRecognitionUnavailable", None)
         self.assertIsNotNone(

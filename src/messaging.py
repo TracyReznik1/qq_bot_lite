@@ -70,6 +70,7 @@ class MessageQueue:
         max_workers: int = 4,
         max_processed_message_ids: int = 500,
         on_accepted: Callable[[dict[str, Any]], None] | None = None,
+        on_rejected: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="qq-message")
         self.processed_message_ids: set[str] = set()
@@ -80,6 +81,7 @@ class MessageQueue:
         self.active_session_workers: set[str] = set()
         self.max_processed_message_ids = max_processed_message_ids
         self.on_accepted = on_accepted
+        self.on_rejected = on_rejected
 
     def mark_seen(self, data: dict[str, Any]) -> bool:
         message_id = data.get("message_id")
@@ -122,7 +124,28 @@ class MessageQueue:
                 should_start_worker = True
 
         if should_start_worker:
-            self.executor.submit(self._drain_session, session_key, process_func)
+            try:
+                self.executor.submit(
+                    self._drain_session,
+                    session_key,
+                    process_func,
+                )
+            except Exception:
+                with self.session_queue_lock:
+                    rejected = tuple(
+                        self.session_message_queues.pop(session_key, ())
+                    )
+                    self.active_session_workers.discard(session_key)
+                if self.on_rejected is not None:
+                    for rejected_data in rejected:
+                        try:
+                            self.on_rejected(rejected_data)
+                        except Exception as error:
+                            logging.getLogger("qq-bot").error(
+                                "Message rejection hook failed error_type=%s",
+                                type(error).__name__,
+                            )
+                raise
 
     def _drain_session(self, session_key: str, process_func) -> None:
         while True:

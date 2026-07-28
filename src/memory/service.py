@@ -94,7 +94,10 @@ class MemoryService:
 
     def release_job(self, job_id: int, image_data_urls: Sequence[str] = ()) -> None:
         with self._lock:
-            self.store.mark_job_ready(job_id)
+            entered_ready = self.store.mark_job_ready(job_id)
+            if not entered_ready:
+                self._cond.notify_all()
+                return
             if image_data_urls:
                 self._ephemeral_images[job_id] = tuple(image_data_urls)
             self._cond.notify_all()
@@ -211,14 +214,30 @@ class MemoryService:
                     retry_at=retry_at,
                 )
             except Exception as state_error:
-                logger.error(
-                    "Memory job state update failed job_id=%s scope_key=%s attempts=%s error_type=%s cause_type=%s",
-                    job.id,
-                    job.scope_key,
-                    job.attempts,
-                    type(state_error).__name__,
-                    error_type,
-                )
+                try:
+                    recovered = self.store.recover_running_job(
+                        job.id,
+                        error_type,
+                    )
+                except Exception as recovery_error:
+                    logger.error(
+                        "Memory job recovery failed job_id=%s scope_key=%s attempts=%s error_type=%s cause_type=%s",
+                        job.id,
+                        job.scope_key,
+                        job.attempts,
+                        type(recovery_error).__name__,
+                        type(state_error).__name__,
+                    )
+                else:
+                    logger.error(
+                        "Memory job state update failed job_id=%s scope_key=%s attempts=%s error_type=%s cause_type=%s recovered=%s",
+                        job.id,
+                        job.scope_key,
+                        job.attempts,
+                        type(state_error).__name__,
+                        error_type,
+                        recovered,
+                    )
             else:
                 if retry_at is not None:
                     logger.warning(

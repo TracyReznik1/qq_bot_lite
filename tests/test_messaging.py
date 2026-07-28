@@ -68,8 +68,69 @@ class MainMessageQueueConfigurationTests(unittest.TestCase):
 
         service.register_pending_sequence.assert_called_once_with("group:20", 42)
 
+    def test_global_queue_clears_group_memory_sequence_on_rejection(self):
+        service = mock.Mock()
+        event = {
+            "message_type": "group",
+            "group_id": 20,
+            "user_id": 7,
+            "raw_message": "ordinary",
+            "_qqbot_sequence": 43,
+        }
+
+        with mock.patch.object(main, "get_memory_service", return_value=service):
+            main.message_queue.on_rejected(event)
+
+        service.clear_pending_sequence.assert_called_once_with("group:20", 43)
+
 
 class MessageQueueConcurrencyTests(unittest.TestCase):
+    def test_submit_failure_rolls_back_reservation_and_session_state(self):
+        accepted = []
+        rejected = []
+        queue = MessageQueue(
+            max_workers=1,
+            on_accepted=lambda data: accepted.append(
+                data["_qqbot_sequence"]
+            ),
+            on_rejected=lambda data: rejected.append(
+                data["_qqbot_sequence"]
+            ),
+        )
+        first = private_message(7, "first")
+        first_session = get_event_session_key(first)
+        processed = Event()
+
+        try:
+            with (
+                mock.patch.object(
+                    queue.executor,
+                    "submit",
+                    side_effect=RuntimeError("executor unavailable"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "executor unavailable"),
+            ):
+                queue.enqueue(first, lambda _data: None)
+
+            self.assertEqual(
+                [first["_qqbot_sequence"]],
+                accepted,
+            )
+            self.assertEqual(
+                [first["_qqbot_sequence"]],
+                rejected,
+            )
+            self.assertNotIn(first_session, queue.session_message_queues)
+            self.assertNotIn(first_session, queue.active_session_workers)
+
+            queue.enqueue(
+                private_message(7, "second"),
+                lambda _data: processed.set(),
+            )
+            self.assertTrue(processed.wait(WAIT_TIMEOUT))
+        finally:
+            queue.executor.shutdown(wait=True)
+
     def test_acceptance_hook_runs_with_sequence_before_processing_starts(self):
         accepted = []
         processed = []

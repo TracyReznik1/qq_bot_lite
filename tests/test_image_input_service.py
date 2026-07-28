@@ -493,6 +493,28 @@ class ImageInputServiceTests(unittest.TestCase):
         self.assertIn("InvalidAuthorData", logged)
         self.assertNotIn("must-not-be-logged", logged)
 
+    def test_onebot_send_failure_log_omits_exception_body(self):
+        cfg = SimpleNamespace(
+            onebot_url="http://127.0.0.1:3000",
+            onebot_access_token="",
+            request_timeout=3,
+        )
+        secret = "onebot-private-url-or-response-sentinel"
+
+        with (
+            mock.patch(
+                "src.services.onebot_client.requests.post",
+                side_effect=RuntimeError(secret),
+            ),
+            self.assertLogs("qq-bot", level="ERROR") as captured,
+        ):
+            OneBotClient(cfg).send_msg("123", "private reply")
+
+        logged = "\n".join(captured.output)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("private reply", logged)
+
     def test_rejects_non_public_ipv4_and_ipv6_targets_before_downloading(self):
         service = self.service()
         unsafe_targets = (

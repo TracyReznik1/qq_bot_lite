@@ -282,15 +282,21 @@ class MemoryStore:
             cleaned += cursor.rowcount
             archived_rows = connection.execute(
                 """
-                SELECT id
+                SELECT id, source_excerpt
                 FROM memory_claims
                 WHERE status = 'archived'
                   AND created_at < ?
-                  AND source_excerpt <> ''
                 """,
                 (cutoff,),
             ).fetchall()
-            archived_claim_ids = tuple(int(row["id"]) for row in archived_rows)
+            archived_claim_ids = tuple(
+                int(row["id"])
+                for row in archived_rows
+                if str(row["source_excerpt"])
+            )
+            needs_fts_optimize = bool(
+                archived_rows
+            ) and not _fts_secure_delete_enabled(connection)
             if archived_claim_ids:
                 placeholders = ",".join("?" for _ in archived_claim_ids)
                 cursor = connection.execute(
@@ -302,7 +308,6 @@ class MemoryStore:
                     archived_claim_ids,
                 )
                 cleaned += cursor.rowcount
-                needs_fts_optimize = not _fts_secure_delete_enabled(connection)
                 for claim_id in archived_claim_ids:
                     connection.execute(
                         "DELETE FROM memory_fts WHERE rowid = ?",
@@ -328,10 +333,9 @@ class MemoryStore:
                 (cutoff,),
             )
             cleaned += cursor.rowcount
-        if cleaned:
-            if needs_fts_optimize:
-                self._optimize_fts_for_privacy()
-            self._checkpoint_wal()
+        if needs_fts_optimize:
+            self._optimize_fts_for_privacy()
+        self._checkpoint_wal()
         return cleaned
 
     def create_job(self, event: MemoryEvent) -> tuple[int, bool]:
@@ -396,9 +400,9 @@ class MemoryStore:
             raise KeyError(f"memory job {job_id} does not exist")
         return _job_from_row(row)
 
-    def mark_job_ready(self, job_id: int) -> None:
+    def mark_job_ready(self, job_id: int) -> bool:
         with self._connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE memory_jobs
                 SET state = 'ready', retry_at = NULL, error_type = NULL,
@@ -407,6 +411,7 @@ class MemoryStore:
                 """,
                 (_utc_now(), job_id),
             )
+        return cursor.rowcount == 1
 
     def claim_next_job(self, scope_key: str) -> MemoryJob | None:
         timestamp = _utc_now()
@@ -491,6 +496,20 @@ class MemoryStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"memory job {job_id} is not running")
+
+    def recover_running_job(self, job_id: int, error_type: str) -> bool:
+        timestamp = _utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE memory_jobs
+                SET state = 'retry', retry_at = ?, error_type = ?,
+                    updated_at = ?
+                WHERE id = ? AND state = 'running'
+                """,
+                (timestamp, error_type, timestamp, job_id),
+            )
+        return cursor.rowcount == 1
 
     def recover_running_jobs(self, scope_key: str | None = None) -> int:
         timestamp = _utc_now()

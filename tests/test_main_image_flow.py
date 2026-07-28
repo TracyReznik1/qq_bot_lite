@@ -116,6 +116,33 @@ class MainImageFlowTests(unittest.TestCase):
         self.assertEqual("456", staged_event.reply_to_user_id)
         self.assertEqual("他喜欢跑步", staged_event.text)
 
+    def test_cq_only_reply_with_attributes_around_id_uses_raw_fallback(self):
+        raw_message = (
+            "[CQ:reply,seq=12,id=reply-88,time=1720000000]他喜欢游泳"
+        )
+        event = private_event(raw_message, raw_message, message_id=307)
+        memory_service = mock.Mock()
+
+        with (
+            mock.patch.object(main, "get_memory_service", return_value=memory_service),
+            mock.patch.object(
+                main.onebot,
+                "get_message_author",
+                return_value="789",
+            ) as get_author,
+            mock.patch.object(main, "load_chat_images", return_value=[]),
+            mock.patch.object(main, "generate_reply", return_value="ok"),
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        get_author.assert_called_once_with("reply-88")
+        staged_event = memory_service.stage_event.call_args.args[0]
+        self.assertEqual("reply-88", staged_event.reply_to_message_id)
+        self.assertEqual("789", staged_event.reply_to_user_id)
+        self.assertEqual("他喜欢游泳", staged_event.text)
+
     def test_message_and_reply_bodies_are_absent_from_captured_logs(self):
         incoming = "incoming-private-marker-4b739"
         reply = "reply-private-marker-85d20"

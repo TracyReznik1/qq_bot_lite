@@ -170,27 +170,27 @@ class FallbackLLMClient:
             except RuntimeError as exc:
                 # Missing API key → do NOT retry; log and skip this model.
                 logger.warning(
-                    "LLM config error provider=%s model=%s: %s",
+                    "LLM config error provider=%s model=%s error_type=%s",
                     spec.provider,
                     spec.model,
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
             except Exception as exc:
                 if _is_retryable_error(exc):
                     logger.warning(
-                        "LLM call failed provider=%s model=%s reason=%s — trying next fallback",
+                        "LLM call failed provider=%s model=%s error_type=%s — trying next fallback",
                         spec.provider,
                         spec.model,
-                        exc,
+                        type(exc).__name__,
                     )
                     continue
                 # For unexpected errors, log and continue (don't crash the bot).
                 logger.warning(
-                    "LLM call failed (non-retryable) provider=%s model=%s reason=%s",
+                    "LLM call failed (non-retryable) provider=%s model=%s error_type=%s",
                     spec.provider,
                     spec.model,
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
 

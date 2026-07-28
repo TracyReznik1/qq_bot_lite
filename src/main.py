@@ -51,10 +51,19 @@ def _register_pending_memory_sequence(data: dict[str, Any]) -> None:
     if scope_key and sequence > 0:
         get_memory_service().register_pending_sequence(scope_key, sequence)
 
+
+def _clear_pending_memory_sequence(data: dict[str, Any]) -> None:
+    scope_key = get_event_memory_scope_key(data)
+    sequence = int(data.get("_qqbot_sequence") or 0)
+    if scope_key and sequence > 0:
+        get_memory_service().clear_pending_sequence(scope_key, sequence)
+
+
 message_queue = MessageQueue(
     max_workers=config.message_workers,
     max_processed_message_ids=MAX_PROCESSED_MESSAGE_IDS,
     on_accepted=_register_pending_memory_sequence,
+    on_rejected=_clear_pending_memory_sequence,
 )
 
 
