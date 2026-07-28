@@ -8,6 +8,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -23,7 +24,7 @@ from src.memory.models import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_SOURCE_EXCERPT_CHARS = 500
 PRIVACY_CHECKPOINT_TIMEOUT_MS = 250
 PRIVACY_OPTIMIZE_TIMEOUT_MS = 250
@@ -199,6 +200,13 @@ def _redact_forbidden_payload_data(text: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _DeleteMutation:
+    deleted: bool
+    needs_checkpoint: bool
+    needs_fts_optimize: bool
+
+
 class MemoryStore:
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -225,6 +233,32 @@ class MemoryStore:
             connection.execute("BEGIN IMMEDIATE")
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO memory_claim_id_sequence(singleton, last_id)
+                VALUES (
+                    1,
+                    (
+                        SELECT COALESCE(MAX(candidate_id), 0)
+                        FROM (
+                            SELECT id AS candidate_id
+                            FROM memory_claims
+                            UNION ALL
+                            SELECT claim_id AS candidate_id
+                            FROM memory_deletion_audit
+                            UNION ALL
+                            SELECT claim_id AS candidate_id
+                            FROM memory_pending_privacy_cleanup
+                        )
+                    )
+                )
+                ON CONFLICT(singleton) DO UPDATE SET
+                    last_id = MAX(
+                        memory_claim_id_sequence.last_id,
+                        excluded.last_id
+                    )
+                """
+            )
             if sqlite3.sqlite_version_info >= (3, 42, 0):
                 connection.execute(
                     """
@@ -605,6 +639,22 @@ class MemoryStore:
             return _update_claim_in_connection(connection, claim_id, **changes)
 
     def delete_claim_physically(self, claim_id: int, *, reason: str) -> bool:
+        mutation = self._delete_claim_transaction(claim_id, reason=reason)
+        self._run_privacy_maintenance(
+            needs_checkpoint=mutation.needs_checkpoint,
+            needs_fts_optimize=mutation.needs_fts_optimize,
+        )
+        if mutation.needs_checkpoint:
+            self._clear_pending_privacy_cleanup(claim_id)
+        return mutation.deleted
+
+    def _delete_claim_transaction(
+        self,
+        claim_id: int,
+        *,
+        reason: str,
+    ) -> _DeleteMutation:
+        """Commit the row mutation and return required post-commit maintenance."""
         if _AUDIT_REASON_PATTERN.fullmatch(reason) is None:
             raise ValueError("deletion reason must be a body-free audit code")
         deleted = False
@@ -614,22 +664,27 @@ class MemoryStore:
             connection.execute("BEGIN IMMEDIATE")
             needs_fts_optimize = not _fts_secure_delete_enabled(connection)
             exists = connection.execute(
-                "SELECT 1 FROM memory_claims WHERE id = ?",
+                """
+                SELECT scope_type, scope_id
+                FROM memory_claims
+                WHERE id = ?
+                """,
                 (claim_id,),
             ).fetchone()
             if exists is None:
-                needs_checkpoint = (
-                    connection.execute(
-                        """
-                        SELECT 1
-                        FROM memory_deletion_audit
-                        WHERE claim_id = ?
-                        LIMIT 1
-                        """,
-                        (claim_id,),
-                    ).fetchone()
-                    is not None
-                )
+                pending = connection.execute(
+                    """
+                    SELECT needs_fts_optimize
+                    FROM memory_pending_privacy_cleanup
+                    WHERE claim_id = ?
+                    """,
+                    (claim_id,),
+                ).fetchone()
+                needs_checkpoint = pending is not None
+                if pending is not None:
+                    needs_fts_optimize = bool(
+                        pending["needs_fts_optimize"]
+                    )
             else:
                 connection.execute(
                     """
@@ -637,6 +692,28 @@ class MemoryStore:
                     VALUES (?, ?, ?)
                     """,
                     (claim_id, reason, _utc_now()),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memory_pending_privacy_cleanup(
+                        claim_id, reason, scope_type, scope_id,
+                        needs_fts_optimize, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(claim_id) DO UPDATE SET
+                        reason = excluded.reason,
+                        scope_type = excluded.scope_type,
+                        scope_id = excluded.scope_id,
+                        needs_fts_optimize = excluded.needs_fts_optimize,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        claim_id,
+                        reason,
+                        str(exists["scope_type"]),
+                        str(exists["scope_id"]),
+                        int(needs_fts_optimize),
+                        _utc_now(),
+                    ),
                 )
                 connection.execute(
                     "DELETE FROM memory_fts WHERE rowid = ?",
@@ -648,11 +725,22 @@ class MemoryStore:
                 )
                 deleted = True
                 needs_checkpoint = True
+        return _DeleteMutation(
+            deleted=deleted,
+            needs_checkpoint=needs_checkpoint,
+            needs_fts_optimize=needs_fts_optimize,
+        )
+
+    def _run_privacy_maintenance(
+        self,
+        *,
+        needs_checkpoint: bool,
+        needs_fts_optimize: bool,
+    ) -> None:
         if needs_checkpoint:
             if needs_fts_optimize:
                 self._optimize_fts_for_privacy()
             self._checkpoint_wal()
-        return deleted
 
     def delete_claim_physically_with_outcome(
         self,
@@ -661,23 +749,25 @@ class MemoryStore:
         reason: str,
     ) -> PhysicalDeleteOutcome:
         """Delete and report post-commit privacy maintenance precisely."""
-        had_claim = self.get_claim(claim_id) is not None
         had_audit = self._has_deletion_audit(claim_id)
+        mutation = self._delete_claim_transaction(claim_id, reason=reason)
         try:
-            deleted = self.delete_claim_physically(
-                claim_id,
-                reason=reason,
+            self._run_privacy_maintenance(
+                needs_checkpoint=mutation.needs_checkpoint,
+                needs_fts_optimize=mutation.needs_fts_optimize,
             )
-        except RuntimeError:
-            if had_claim or self._has_deletion_audit(claim_id):
+            if mutation.needs_checkpoint:
+                self._clear_pending_privacy_cleanup(claim_id)
+        except Exception:
+            if mutation.needs_checkpoint:
                 return PhysicalDeleteOutcome(
                     status="partial",
-                    row_deleted=self.get_claim(claim_id) is None,
+                    row_deleted=True,
                     cleanup_complete=False,
                     retryable=True,
                 )
             raise
-        if deleted:
+        if mutation.deleted:
             return PhysicalDeleteOutcome(
                 status="deleted",
                 row_deleted=True,
@@ -698,6 +788,71 @@ class MemoryStore:
             retryable=False,
         )
 
+    def retry_pending_delete_cleanup(
+        self,
+        claim_id: int,
+        *,
+        actor_qq: str,
+        is_admin: bool,
+    ) -> tuple[PhysicalDeleteOutcome, str] | None:
+        with self._connection() as connection:
+            pending = connection.execute(
+                """
+                SELECT reason, scope_type, scope_id, needs_fts_optimize
+                FROM memory_pending_privacy_cleanup
+                WHERE claim_id = ?
+                """,
+                (claim_id,),
+            ).fetchone()
+        if pending is None:
+            return None
+        reason = str(pending["reason"])
+        scope_type = str(pending["scope_type"])
+        scope_id = str(pending["scope_id"])
+        needs_fts_optimize = bool(pending["needs_fts_optimize"])
+        authorized = is_admin or (
+            reason == "private_privacy_delete"
+            and scope_type == "private"
+            and scope_id == actor_qq
+        )
+        if not authorized:
+            return None
+        try:
+            self._run_privacy_maintenance(
+                needs_checkpoint=True,
+                needs_fts_optimize=needs_fts_optimize,
+            )
+            self._clear_pending_privacy_cleanup(claim_id)
+        except Exception:
+            return (
+                PhysicalDeleteOutcome(
+                    status="partial",
+                    row_deleted=True,
+                    cleanup_complete=False,
+                    retryable=True,
+                ),
+                f"{scope_type}:{scope_id}",
+            )
+        return (
+            PhysicalDeleteOutcome(
+                status="cleanup_completed",
+                row_deleted=True,
+                cleanup_complete=True,
+                retryable=False,
+            ),
+            f"{scope_type}:{scope_id}",
+        )
+
+    def _clear_pending_privacy_cleanup(self, claim_id: int) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM memory_pending_privacy_cleanup
+                WHERE claim_id = ?
+                """,
+                (claim_id,),
+            )
+
     def _has_deletion_audit(self, claim_id: int) -> bool:
         with self._connection() as connection:
             row = connection.execute(
@@ -716,6 +871,7 @@ class MemoryStore:
         claim_id: int,
         *,
         actor_qq: str,
+        group_id: str,
         source_message_id: str,
     ) -> MemoryClaim | None:
         """Suppress a foreign group claim when its subject disputes its use."""
@@ -730,9 +886,11 @@ class MemoryStore:
             target = _claim_from_row(row)
             if (
                 target.scope_type != "group"
+                or target.scope_id != group_id
                 or target.subject_type != "qq_user"
                 or target.subject_id != actor_qq
                 or target.speaker_qq == actor_qq
+                or target.status != "active"
             ):
                 return None
             connection.execute(
@@ -751,12 +909,7 @@ class MemoryStore:
                     _utc_now(),
                 ),
             )
-            disputed = _update_claim_in_connection(
-                connection,
-                target.id,
-                status="disputed",
-            )
-        return disputed
+        return target
 
     def subject_dispute_suppressed_ids(
         self,
@@ -764,17 +917,11 @@ class MemoryStore:
     ) -> frozenset[int]:
         if not claim_ids:
             return frozenset()
-        placeholders = ", ".join("?" for _ in claim_ids)
         with self._connection() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT target_claim_id
-                FROM memory_subject_disputes
-                WHERE target_claim_id IN ({placeholders})
-                """,
+            return _subject_dispute_suppressed_ids_in_connection(
+                connection,
                 claim_ids,
-            ).fetchall()
-        return frozenset(int(row["target_claim_id"]) for row in rows)
+            )
 
     def retract_group_claim(
         self,
@@ -1020,6 +1167,15 @@ class _MemoryReconciliation:
     def find_claims_exact(self, **filters: Any) -> tuple[MemoryClaim, ...]:
         return _find_claims_exact(self.connection, **filters)
 
+    def subject_dispute_suppressed_ids(
+        self,
+        claim_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        return _subject_dispute_suppressed_ids_in_connection(
+            self.connection,
+            claim_ids,
+        )
+
 
 def _create_claim_in_connection(
     connection: sqlite3.Connection,
@@ -1032,7 +1188,19 @@ def _create_claim_in_connection(
     fields["source_excerpt"] = str(fields["source_excerpt"])[
         :MAX_SOURCE_EXCERPT_CHARS
     ]
+    sequence_row = connection.execute(
+        """
+        UPDATE memory_claim_id_sequence
+        SET last_id = last_id + 1
+        WHERE singleton = 1
+        RETURNING last_id
+        """
+    ).fetchone()
+    if sequence_row is None:
+        raise RuntimeError("memory claim ID sequence is not initialized")
+    fields["id"] = int(sequence_row["last_id"])
     columns = (
+        "id",
         "scope_type",
         "scope_id",
         "speaker_qq",
@@ -1060,14 +1228,14 @@ def _create_claim_in_connection(
     cursor = connection.execute(
         """
         INSERT INTO memory_claims(
-            scope_type, scope_id, speaker_qq, subject_type, subject_id,
+            id, scope_type, scope_id, speaker_qq, subject_type, subject_id,
             predicate, value, memory_type, modality, source_kind,
             source_message_id, source_excerpt, extraction_confidence,
             attribution_confidence, truth_confidence, status,
             created_at, valid_from, valid_to, last_confirmed_at,
             dedupe_key
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(dedupe_key) DO NOTHING
         """,
@@ -1230,6 +1398,24 @@ def _find_claims_exact(
         parameters,
     ).fetchall()
     return tuple(_claim_from_row(row) for row in rows)
+
+
+def _subject_dispute_suppressed_ids_in_connection(
+    connection: sqlite3.Connection,
+    claim_ids: tuple[int, ...],
+) -> frozenset[int]:
+    if not claim_ids:
+        return frozenset()
+    placeholders = ", ".join("?" for _ in claim_ids)
+    rows = connection.execute(
+        f"""
+        SELECT target_claim_id
+        FROM memory_subject_disputes
+        WHERE target_claim_id IN ({placeholders})
+        """,
+        claim_ids,
+    ).fetchall()
+    return frozenset(int(row["target_claim_id"]) for row in rows)
 
 
 def _fts_secure_delete_enabled(connection: sqlite3.Connection) -> bool:
@@ -1396,6 +1582,12 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS memory_claim_id_sequence (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        last_id INTEGER NOT NULL CHECK (last_id >= 0)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS memory_evidence (
         id INTEGER PRIMARY KEY,
         claim_id INTEGER NOT NULL
@@ -1449,6 +1641,18 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS memory_pending_privacy_cleanup (
+        claim_id INTEGER PRIMARY KEY,
+        reason TEXT NOT NULL,
+        scope_type TEXT NOT NULL
+            CHECK (scope_type IN ('private', 'group', 'global', 'bot')),
+        scope_id TEXT NOT NULL,
+        needs_fts_optimize INTEGER NOT NULL
+            CHECK (needs_fts_optimize IN (0, 1)),
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS memory_subject_disputes (
         target_claim_id INTEGER NOT NULL
             REFERENCES memory_claims(id) ON DELETE CASCADE,
@@ -1457,6 +1661,10 @@ _SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL,
         PRIMARY KEY(target_claim_id, actor_qq)
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS memory_subject_disputes_actor_idx
+    ON memory_subject_disputes(actor_qq, target_claim_id)
     """,
     """
     CREATE INDEX IF NOT EXISTS memory_jobs_claim_idx

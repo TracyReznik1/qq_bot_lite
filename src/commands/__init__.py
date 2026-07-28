@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import dataclass
 from typing import Callable
 
@@ -397,6 +398,25 @@ def _permitted_claims(
     return tuple(claims)
 
 
+def _store_unavailable_forget_result(
+    claim_id: int,
+    claim_scope: str,
+) -> CommandResult:
+    reply = (
+        f"记忆存储暂时不可用，尚未删除记忆 (ID: {claim_id})："
+        f"scope={claim_scope}；status=failed；cause=store_unavailable。"
+    )
+    outcome = CommandOutcome(
+        code="forget_failed",
+        facts=(str(claim_id), "retryable=true"),
+        fallback_reply=reply,
+        status="failed",
+        scope=claim_scope,
+        cause="store_unavailable",
+    )
+    return CommandResult(handled=True, reply=reply, outcome=outcome)
+
+
 def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> CommandResult:
     target = query.strip()
     if not target:
@@ -416,6 +436,44 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
         exact = store.get_claim(int(target))
         if exact is not None and _claim_is_permitted(context, exact):
             matched_claims = [exact]
+        elif exact is None:
+            retry = store.retry_pending_delete_cleanup(
+                int(target),
+                actor_qq=context.uid,
+                is_admin=context.is_admin,
+            )
+            if retry is not None:
+                deletion, claim_scope = retry
+                if deletion.status == "cleanup_completed":
+                    prefix = "已完成记忆隐私清理"
+                    cause = "privacy_cleanup_completed"
+                else:
+                    prefix = "记忆正文已删除但隐私清理仍待重试"
+                    cause = "privacy_cleanup_pending"
+                reply = (
+                    f"{prefix} (ID: {target})：scope={claim_scope}；"
+                    f"status={deletion.status}；cause={cause}。"
+                )
+                outcome = CommandOutcome(
+                    code=(
+                        "forget_cleanup_completed"
+                        if deletion.cleanup_complete
+                        else "forget_partial"
+                    ),
+                    facts=(
+                        target,
+                        f"retryable={str(deletion.retryable).lower()}",
+                    ),
+                    fallback_reply=reply,
+                    status=deletion.status,
+                    scope=claim_scope,
+                    cause=cause,
+                )
+                return CommandResult(
+                    handled=True,
+                    reply=reply,
+                    outcome=outcome,
+                )
     else:
         low_target = target.lower()
         matched_claims = [
@@ -454,10 +512,16 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
     target_claim = matched_claims[0]
     claim_scope = f"{target_claim.scope_type}:{target_claim.scope_id}"
     if context.is_admin:
-        deletion = store.delete_claim_physically_with_outcome(
-            target_claim.id,
-            reason="administrator_delete",
-        )
+        try:
+            deletion = store.delete_claim_physically_with_outcome(
+                target_claim.id,
+                reason="administrator_delete",
+            )
+        except sqlite3.Error:
+            return _store_unavailable_forget_result(
+                target_claim.id,
+                claim_scope,
+            )
         if deletion.status == "deleted":
             reply = (
                 f"已删除记忆 (ID: {target_claim.id})：scope={claim_scope}；"
@@ -508,10 +572,16 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
         target_claim.scope_type == "private"
         and target_claim.scope_id == context.uid
     ):
-        deletion = store.delete_claim_physically_with_outcome(
-            target_claim.id,
-            reason="private_privacy_delete",
-        )
+        try:
+            deletion = store.delete_claim_physically_with_outcome(
+                target_claim.id,
+                reason="private_privacy_delete",
+            )
+        except sqlite3.Error:
+            return _store_unavailable_forget_result(
+                target_claim.id,
+                claim_scope,
+            )
         status = deletion.status
         if status == "deleted":
             cause = "private_privacy_delete"
@@ -599,6 +669,7 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
         disputed = store.register_subject_dispute(
             target_claim.id,
             actor_qq=context.uid,
+            group_id=str(context.memory_context.group_id or ""),
             source_message_id=context.message_id,
         )
         if disputed is None:

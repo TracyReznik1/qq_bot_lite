@@ -1,7 +1,10 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -463,7 +466,7 @@ class MemoryCommandsTests(unittest.TestCase):
         result = handle_command(route, context, store=self.store)
 
         original = self.store.get_claim(target.id)
-        self.assertEqual("disputed", original.status)
+        self.assertEqual("active", original.status)
         self.assertNotEqual("retracted", original.status)
         self.assertEqual("disputed", result.outcome.status)
         self.assertEqual("subject_dispute", result.outcome.cause)
@@ -475,6 +478,73 @@ class MemoryCommandsTests(unittest.TestCase):
             )
         }
         self.assertNotIn(target.id, answer_ids)
+
+    def test_committed_author_retraction_cannot_be_overwritten_by_subject_dispute(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1001",
+            predicate="likes",
+            value="先撤回后争议",
+        )
+
+        self.assertTrue(
+            self.store.retract_group_claim(
+                target.id,
+                actor_qq="1002",
+                group_id="2001",
+            )
+        )
+        disputed = self.store.register_subject_dispute(
+            target.id,
+            actor_qq="1001",
+            group_id="2001",
+            source_message_id="late-subject-dispute",
+        )
+
+        self.assertIsNone(disputed)
+        self.assertEqual("retracted", self.store.get_claim(target.id).status)
+        self.assertNotIn(
+            target.id,
+            self.store.subject_dispute_suppressed_ids((target.id,)),
+        )
+
+    def test_author_retraction_and_subject_dispute_race_ends_retracted(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1001",
+            predicate="likes",
+            value="并发撤回与争议",
+        )
+        barrier = threading.Barrier(2)
+
+        def retract():
+            barrier.wait()
+            return self.store.retract_group_claim(
+                target.id,
+                actor_qq="1002",
+                group_id="2001",
+            )
+
+        def dispute():
+            barrier.wait()
+            return self.store.register_subject_dispute(
+                target.id,
+                actor_qq="1001",
+                group_id="2001",
+                source_message_id="concurrent-subject-dispute",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            retraction = pool.submit(retract)
+            subject_dispute = pool.submit(dispute)
+            self.assertTrue(retraction.result())
+            subject_dispute.result()
+
+        self.assertEqual("retracted", self.store.get_claim(target.id).status)
 
     def test_admin_delete_after_subject_dispute_removes_every_body_copy(self):
         marker = "争议后删除正文-marker-918d"
@@ -640,14 +710,174 @@ class MemoryCommandsTests(unittest.TestCase):
         self.assertEqual("partial", result.outcome.status)
         self.assertEqual("privacy_cleanup_pending", result.outcome.cause)
         self.assertNotIn("status=deleted", result.reply)
-
-        retry = self.store.delete_claim_physically_with_outcome(
-            target.id,
-            reason="private_privacy_delete",
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            pending = connection.execute(
+                """
+                SELECT reason, scope_type, scope_id, needs_fts_optimize
+                FROM memory_pending_privacy_cleanup
+                WHERE claim_id = ?
+                """,
+                (target.id,),
+            ).fetchone()
+            pending_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_pending_privacy_cleanup)"
+                ).fetchall()
+            }
+        self.assertEqual(
+            ("private_privacy_delete", "private", "1001", 0),
+            pending,
         )
-        self.assertEqual("cleanup_completed", retry.status)
-        self.assertTrue(retry.cleanup_complete)
-        self.assertFalse(retry.retryable)
+        self.assertTrue(
+            {"predicate", "value", "source_excerpt"}.isdisjoint(
+                pending_columns
+            )
+        )
+
+        retry_store = MemoryStore(self.db_path)
+        retry_store.initialize()
+        replacement = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="删除后新建记录不可复用旧ID",
+        )
+        self.assertNotEqual(target.id, replacement.id)
+        foreign_result = handle_command(
+            route,
+            CommandContext(
+                uid="1002",
+                session_key="private:1002",
+                raw_message=f"/forget {target.id}",
+                message_id="foreign-cleanup-retry",
+            ),
+            store=retry_store,
+        )
+        self.assertEqual("not_found", foreign_result.outcome.status)
+
+        retry_result = handle_command(route, context, store=retry_store)
+        self.assertEqual("cleanup_completed", retry_result.outcome.status)
+        self.assertEqual(
+            "privacy_cleanup_completed",
+            retry_result.outcome.cause,
+        )
+        self.assertIn("retryable=false", retry_result.outcome.facts)
+        self.assertIsNotNone(retry_store.get_claim(replacement.id))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            pending_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM memory_pending_privacy_cleanup
+                WHERE claim_id = ?
+                """,
+                (target.id,),
+            ).fetchone()[0]
+        self.assertEqual(0, pending_count)
+
+    def test_precommit_database_lock_returns_store_unavailable_outcome(self):
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="提交前锁冲突",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-precommit-lock",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+        locker = sqlite3.connect(self.db_path)
+        locker.execute("BEGIN IMMEDIATE")
+        original_connect = sqlite3.connect
+
+        def short_timeout_connect(*args, **kwargs):
+            kwargs["timeout"] = 0.01
+            return original_connect(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                sqlite3,
+                "connect",
+                side_effect=short_timeout_connect,
+            ):
+                result = handle_command(route, context, store=self.store)
+        finally:
+            locker.rollback()
+            locker.close()
+
+        self.assertEqual("failed", result.outcome.status)
+        self.assertEqual("store_unavailable", result.outcome.cause)
+        self.assertIn("retryable=true", result.outcome.facts)
+        self.assertIsNotNone(self.store.get_claim(target.id))
+
+    def test_operational_error_after_delete_commit_reports_partial_and_retries(self):
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="提交后数据库清理锁定",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-operational-cleanup",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        with mock.patch.object(
+            self.store,
+            "_checkpoint_wal",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = handle_command(route, context, store=self.store)
+
+        self.assertIsNone(self.store.get_claim(target.id))
+        self.assertEqual("partial", result.outcome.status)
+        self.assertEqual("privacy_cleanup_pending", result.outcome.cause)
+        self.assertIn("retryable=true", result.outcome.facts)
+
+        retry_store = MemoryStore(self.db_path)
+        retry_store.initialize()
+        with mock.patch.object(
+            retry_store,
+            "_checkpoint_wal",
+            side_effect=sqlite3.OperationalError("database is still locked"),
+        ):
+            retry_pending = retry_store.delete_claim_physically_with_outcome(
+                target.id,
+                reason="private_privacy_delete",
+            )
+        self.assertEqual("partial", retry_pending.status)
+        self.assertTrue(retry_pending.row_deleted)
+        self.assertTrue(retry_pending.retryable)
+
+        retry_result = handle_command(route, context, store=retry_store)
+        self.assertEqual("cleanup_completed", retry_result.outcome.status)
+        self.assertEqual(
+            "privacy_cleanup_completed",
+            retry_result.outcome.cause,
+        )
+        self.assertIn("retryable=false", retry_result.outcome.facts)
 
     def test_admin_forget_physically_deletes_group_claim(self):
         target = self.create_claim(

@@ -736,16 +736,21 @@ class MemoryPolicy:
         scope_type, scope_id = event.context.primary_scope
         aliases: set[str] = set()
         for predicate in ("name", "preferred_name"):
+            alias_claims = self._active_claims(
+                scope_type,
+                scope_id,
+                "qq_user",
+                qq_id,
+                predicate,
+                ledger=ledger,
+            )
+            suppressed_ids = ledger.subject_dispute_suppressed_ids(
+                tuple(claim.id for claim in alias_claims)
+            )
             aliases.update(
                 claim.value
-                for claim in self._active_claims(
-                    scope_type,
-                    scope_id,
-                    "qq_user",
-                    qq_id,
-                    predicate,
-                    ledger=ledger,
-                )
+                for claim in alias_claims
+                if claim.id not in suppressed_ids
                 if claim.value and claim.value in event.text
             )
         for alias in aliases:
@@ -757,9 +762,13 @@ class MemoryPolicy:
                 predicates=("name", "preferred_name"),
                 value=alias,
             )
+            suppressed_ids = ledger.subject_dispute_suppressed_ids(
+                tuple(claim.id for claim in matches)
+            )
             subject_ids = {
                 claim.subject_id
                 for claim in matches
+                if claim.id not in suppressed_ids
             }
             if subject_ids == {qq_id}:
                 return True

@@ -552,6 +552,54 @@ class MemoryRetrievalTests(unittest.TestCase):
             scores["CURRENT-USER-DISTRACTOR"],
         )
 
+    def test_disputed_alias_cannot_boost_other_claims_for_its_subject(self):
+        disputed_alias = self._create_claim(
+            "group",
+            "2001",
+            "1003",
+            "1002",
+            "name",
+            "海风",
+            memory_type="identity",
+        )
+        target_claim = self._create_claim(
+            "group",
+            "2001",
+            "1003",
+            "1002",
+            "note",
+            "TARGET-OTHER-CLAIM",
+        )
+        competitor = self._create_claim(
+            "group",
+            "2001",
+            "1004",
+            "1004",
+            "note",
+            "COMPETING-CLAIM",
+        )
+        self.store.register_subject_dispute(
+            disputed_alias.id,
+            actor_qq="1002",
+            group_id="2001",
+            source_message_id="dispute-alias",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(context, "海风")
+        result_ids = [result.claim.id for result in results]
+
+        self.assertNotIn(disputed_alias.id, result_ids)
+        self.assertLess(
+            result_ids.index(competitor.id),
+            result_ids.index(target_claim.id),
+        )
+
     def test_longest_exact_alias_wins_over_contained_short_alias(self):
         self._create_claim(
             "group",

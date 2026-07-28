@@ -283,6 +283,14 @@ class MemoryRetriever:
                 ),
                 now_utc,
             )
+            suppressed_alias_ids = self.store.subject_dispute_suppressed_ids(
+                tuple(claim.id for claim in alias_claims)
+            )
+            alias_claims = tuple(
+                claim
+                for claim in alias_claims
+                if claim.id not in suppressed_alias_ids
+            )
             matching_aliases = sorted(
                 {
                     claim.value

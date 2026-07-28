@@ -125,10 +125,212 @@ class MemoryStoreTests(unittest.TestCase):
                 "memory_fts",
             }.issubset(names)
         )
-        self.assertEqual(1, self.store.schema_version())
+        self.assertEqual(2, self.store.schema_version())
         with closing(sqlite3.connect(self.path)) as connection:
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual("wal", journal_mode.lower())
+
+    def test_upgrades_v1_dispute_schema_without_losing_claim_data(self):
+        claim, _ = self.store.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker_qq="1002",
+            subject_type="qq_user",
+            subject_id="1001",
+            predicate="likes",
+            value="preserved-v1-data",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="v1-preserved-message",
+            source_excerpt="preserved-v1-data",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="v1-preserved-claim",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("DROP TABLE memory_subject_disputes")
+            connection.execute("DROP TABLE memory_pending_privacy_cleanup")
+            connection.execute("DROP TABLE memory_claim_id_sequence")
+            connection.execute("DELETE FROM schema_version")
+            connection.execute(
+                """
+                INSERT INTO schema_version(version, applied_at)
+                VALUES (1, '2026-01-01T00:00:00+00:00')
+                """
+            )
+            connection.commit()
+
+        self.store.initialize()
+
+        self.assertEqual(2, self.store.schema_version())
+        self.assertEqual("preserved-v1-data", self.store.get_claim(claim.id).value)
+        with closing(sqlite3.connect(self.path)) as connection:
+            dispute_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'memory_subject_disputes'
+                """
+            ).fetchone()
+            dispute_index = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'index'
+                  AND name = 'memory_subject_disputes_actor_idx'
+                """
+            ).fetchone()
+            pending_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'memory_pending_privacy_cleanup'
+                """
+            ).fetchone()
+            sequence_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'memory_claim_id_sequence'
+                """
+            ).fetchone()
+            foreign_keys = connection.execute(
+                "PRAGMA foreign_key_list(memory_subject_disputes)"
+            ).fetchall()
+        self.assertEqual(("memory_subject_disputes",), dispute_table)
+        self.assertEqual(("memory_subject_disputes_actor_idx",), dispute_index)
+        self.assertEqual(
+            ("memory_pending_privacy_cleanup",),
+            pending_table,
+        )
+        self.assertEqual(("memory_claim_id_sequence",), sequence_table)
+        self.assertIn(
+            ("memory_claims", "target_claim_id", "id", "CASCADE"),
+            {
+                (row[2], row[3], row[4], row[6])
+                for row in foreign_keys
+            },
+        )
+
+    def test_sequence_upgrade_seeds_from_deleted_audit_and_pending_ids(self):
+        cases = (
+            ("audit-only", 40, None, 40),
+            ("pending-only", None, 50, 50),
+        )
+        for label, audit_id, pending_id, expected_floor in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "legacy-sequence.sqlite3"
+                store = MemoryStore(path)
+                store.initialize()
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute("DROP TABLE memory_claim_id_sequence")
+                    if audit_id is not None:
+                        connection.execute(
+                            """
+                            INSERT INTO memory_deletion_audit(
+                                claim_id, reason, deleted_at
+                            ) VALUES (?, 'private_privacy_delete', ?)
+                            """,
+                            (audit_id, "2026-01-01T00:00:00+00:00"),
+                        )
+                    if pending_id is not None:
+                        connection.execute(
+                            """
+                            INSERT INTO memory_pending_privacy_cleanup(
+                                claim_id, reason, scope_type, scope_id,
+                                needs_fts_optimize, created_at
+                            ) VALUES (
+                                ?, 'private_privacy_delete', 'private',
+                                '1001', 0, '2026-01-01T00:00:00+00:00'
+                            )
+                            """,
+                            (pending_id,),
+                        )
+                    connection.commit()
+
+                store.initialize()
+                claim, _ = store.create_claim(
+                    scope_type="private",
+                    scope_id="1001",
+                    speaker_qq="1001",
+                    subject_type="qq_user",
+                    subject_id="1001",
+                    predicate="likes",
+                    value=f"sequence-{label}",
+                    memory_type="preference",
+                    modality="asserted",
+                    source_kind="message",
+                    source_message_id=f"sequence-{label}-message",
+                    source_excerpt=f"sequence-{label}",
+                    extraction_confidence="high",
+                    attribution_confidence="high",
+                    truth_confidence="medium",
+                    dedupe_key=f"sequence-{label}-claim",
+                )
+
+                self.assertGreater(claim.id, expected_floor)
+
+    def test_precommit_database_lock_is_not_reported_as_deleted_or_partial(self):
+        claim, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker_qq="1001",
+            subject_type="qq_user",
+            subject_id="1001",
+            predicate="likes",
+            value="locked-before-commit",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="precommit-lock-message",
+            source_excerpt="locked-before-commit",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="precommit-lock-claim",
+        )
+        locker = sqlite3.connect(self.path)
+        locker.execute("BEGIN IMMEDIATE")
+        original_connect = sqlite3.connect
+
+        def short_timeout_connect(*args, **kwargs):
+            kwargs["timeout"] = 0.01
+            return original_connect(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                sqlite3,
+                "connect",
+                side_effect=short_timeout_connect,
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "locked",
+                ):
+                    self.store.delete_claim_physically_with_outcome(
+                        claim.id,
+                        reason="private_privacy_delete",
+                    )
+        finally:
+            locker.rollback()
+            locker.close()
+
+        self.assertIsNotNone(self.store.get_claim(claim.id))
+        with closing(sqlite3.connect(self.path)) as connection:
+            audit_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM memory_deletion_audit
+                WHERE claim_id = ?
+                """,
+                (claim.id,),
+            ).fetchone()[0]
+        self.assertEqual(0, audit_count)
 
     def test_duplicate_message_job_is_idempotent_across_threads(self):
         event = private_event()

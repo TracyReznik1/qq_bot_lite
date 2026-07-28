@@ -462,6 +462,34 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual((), ambiguous)
 
+    def test_subject_disputed_alias_does_not_resolve_policy_subject(self):
+        alias = seed_claim(
+            self.store,
+            dedupe_key="subject-disputed-policy-alias",
+            speaker_qq="456",
+            subject_id="123",
+            predicate="preferred_name",
+            value="安安",
+        )
+        self.store.register_subject_dispute(
+            alias.id,
+            actor_qq="123",
+            group_id="900",
+            source_message_id="dispute-policy-alias",
+        )
+
+        decisions = self.policy.apply(
+            event(
+                "安安喜欢跑步",
+                user_id="999",
+                message_id="policy-after-alias-dispute",
+                group_id="900",
+            ),
+            (candidate(subject_ref="qq:123"),),
+        )
+
+        self.assertEqual((), decisions)
+
     def test_exact_active_claim_after_fts_limit_is_still_confirmed(self):
         for index in range(512):
             seed_claim(
