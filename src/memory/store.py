@@ -19,6 +19,7 @@ from src.memory.models import (
     MemoryEvent,
     MemoryJob,
     MemoryRelation,
+    PhysicalDeleteOutcome,
 )
 
 
@@ -652,6 +653,151 @@ class MemoryStore:
                 self._optimize_fts_for_privacy()
             self._checkpoint_wal()
         return deleted
+
+    def delete_claim_physically_with_outcome(
+        self,
+        claim_id: int,
+        *,
+        reason: str,
+    ) -> PhysicalDeleteOutcome:
+        """Delete and report post-commit privacy maintenance precisely."""
+        had_claim = self.get_claim(claim_id) is not None
+        had_audit = self._has_deletion_audit(claim_id)
+        try:
+            deleted = self.delete_claim_physically(
+                claim_id,
+                reason=reason,
+            )
+        except RuntimeError:
+            if had_claim or self._has_deletion_audit(claim_id):
+                return PhysicalDeleteOutcome(
+                    status="partial",
+                    row_deleted=self.get_claim(claim_id) is None,
+                    cleanup_complete=False,
+                    retryable=True,
+                )
+            raise
+        if deleted:
+            return PhysicalDeleteOutcome(
+                status="deleted",
+                row_deleted=True,
+                cleanup_complete=True,
+                retryable=False,
+            )
+        if had_audit or self._has_deletion_audit(claim_id):
+            return PhysicalDeleteOutcome(
+                status="cleanup_completed",
+                row_deleted=False,
+                cleanup_complete=True,
+                retryable=False,
+            )
+        return PhysicalDeleteOutcome(
+            status="no_op",
+            row_deleted=False,
+            cleanup_complete=True,
+            retryable=False,
+        )
+
+    def _has_deletion_audit(self, claim_id: int) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM memory_deletion_audit
+                WHERE claim_id = ?
+                LIMIT 1
+                """,
+                (claim_id,),
+            ).fetchone()
+        return row is not None
+
+    def register_subject_dispute(
+        self,
+        claim_id: int,
+        *,
+        actor_qq: str,
+        source_message_id: str,
+    ) -> MemoryClaim | None:
+        """Suppress a foreign group claim when its subject disputes its use."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM memory_claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            target = _claim_from_row(row)
+            if (
+                target.scope_type != "group"
+                or target.subject_type != "qq_user"
+                or target.subject_id != actor_qq
+                or target.speaker_qq == actor_qq
+            ):
+                return None
+            connection.execute(
+                """
+                INSERT INTO memory_subject_disputes(
+                    target_claim_id, actor_qq, source_message_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(target_claim_id, actor_qq) DO UPDATE SET
+                    source_message_id = excluded.source_message_id,
+                    created_at = excluded.created_at
+                """,
+                (
+                    target.id,
+                    actor_qq,
+                    source_message_id,
+                    _utc_now(),
+                ),
+            )
+            disputed = _update_claim_in_connection(
+                connection,
+                target.id,
+                status="disputed",
+            )
+        return disputed
+
+    def subject_dispute_suppressed_ids(
+        self,
+        claim_ids: tuple[int, ...],
+    ) -> frozenset[int]:
+        if not claim_ids:
+            return frozenset()
+        placeholders = ", ".join("?" for _ in claim_ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT target_claim_id
+                FROM memory_subject_disputes
+                WHERE target_claim_id IN ({placeholders})
+                """,
+                claim_ids,
+            ).fetchall()
+        return frozenset(int(row["target_claim_id"]) for row in rows)
+
+    def retract_group_claim(
+        self,
+        claim_id: int,
+        *,
+        actor_qq: str,
+        group_id: str,
+    ) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE memory_claims
+                SET status = 'retracted'
+                WHERE id = ?
+                  AND scope_type = 'group'
+                  AND scope_id = ?
+                  AND speaker_qq = ?
+                  AND status IN ('active', 'disputed')
+                """,
+                (claim_id, group_id, actor_qq),
+            )
+        return cursor.rowcount == 1
 
     def _optimize_fts_for_privacy(self) -> None:
         deadline = time.monotonic() + PRIVACY_OPTIMIZE_TIMEOUT_MS / 1000
@@ -1300,6 +1446,16 @@ _SCHEMA_STATEMENTS = (
         claim_id INTEGER NOT NULL,
         reason TEXT NOT NULL,
         deleted_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_subject_disputes (
+        target_claim_id INTEGER NOT NULL
+            REFERENCES memory_claims(id) ON DELETE CASCADE,
+        actor_qq TEXT NOT NULL,
+        source_message_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(target_claim_id, actor_qq)
     )
     """,
     """

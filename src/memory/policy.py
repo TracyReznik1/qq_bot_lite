@@ -183,6 +183,45 @@ class MemoryPolicy:
         event: MemoryEvent,
         candidates: tuple[CandidateClaim, ...],
     ) -> tuple[PolicyDecision, ...]:
+        return self._apply(event, candidates)
+
+    def apply_command(
+        self,
+        event: MemoryEvent,
+        candidates: tuple[CandidateClaim, ...],
+    ) -> tuple[PolicyDecision, ...]:
+        """Apply an explicit user memory command in its real caller scope."""
+        return self._apply(
+            event,
+            candidates,
+            allow_implicit_speaker=True,
+        )
+
+    def apply_global_command(
+        self,
+        event: MemoryEvent,
+        candidates: tuple[CandidateClaim, ...],
+        *,
+        authorized: bool,
+    ) -> tuple[PolicyDecision, ...]:
+        """Apply an explicitly authorized command to the real global scope."""
+        if not authorized:
+            return ()
+        return self._apply(
+            event,
+            candidates,
+            scope_override=("global", "global"),
+            allow_implicit_speaker=True,
+        )
+
+    def _apply(
+        self,
+        event: MemoryEvent,
+        candidates: tuple[CandidateClaim, ...],
+        *,
+        scope_override: tuple[str, str] | None = None,
+        allow_implicit_speaker: bool = False,
+    ) -> tuple[PolicyDecision, ...]:
         if (
             len(candidates) > MAX_CLAIMS_PER_MESSAGE
             or self._reject_whole_message(event)
@@ -201,6 +240,7 @@ class MemoryPolicy:
                     continue
                 if (
                     candidate.subject_ref == "speaker"
+                    and not allow_implicit_speaker
                     and not _has_unquoted_first_person(event.text)
                 ):
                     continue
@@ -213,7 +253,11 @@ class MemoryPolicy:
                     continue
                 if self.contains_hard_secret(candidate.value):
                     continue
-                scope_type, scope_id = event.context.primary_scope
+                scope_type, scope_id = (
+                    event.context.primary_scope
+                    if scope_override is None
+                    else scope_override
+                )
                 if (
                     event.context.is_group
                     and self.is_sensitive_personal(candidate)

@@ -9,6 +9,7 @@ from flask import Flask, request
 
 from src.chat.chat_service import generate_reply
 from src.commands import CommandContext, handle_command
+from src.commands.renderer import PersonaCommandRenderer
 from src.config import BASE_DIR, config
 from src.persona import get_persona
 from src.messaging import (
@@ -27,6 +28,7 @@ from src.services.image_input_service import (
     parse_image_message,
 )
 from src.services.llm_client import ImageRecognitionUnavailable
+from src.services.llm_client import get_llm_client
 from src.services.onebot_client import OneBotClient
 from src.utils.data_migration import LEGACY_DATA_DIR_NAME, migrate_legacy_data
 
@@ -43,6 +45,7 @@ _startup_initialized = False
 _startup_lock = Lock()
 
 onebot = OneBotClient(config)
+command_renderer = PersonaCommandRenderer(model=get_llm_client())
 
 
 def _register_pending_memory_sequence(data: dict[str, Any]) -> None:
@@ -248,10 +251,23 @@ def _process_message(data: dict[str, Any]) -> None:
             route.command,
             len(route.query or ""),
         )
+        mem_ctx = MemoryContext(
+            user_id=uid,
+            session_key=session_key,
+            is_group=is_group,
+            group_id=str(data.get("group_id")) if is_group else None,
+        )
         if route.handler == "command":
             result = handle_command(
                 route,
-                CommandContext(uid=uid, session_key=session_key, raw_message=route_text),
+                CommandContext(
+                    uid=uid,
+                    session_key=session_key,
+                    raw_message=route_text,
+                    memory_context=mem_ctx,
+                    message_id=str(data.get("message_id") or ""),
+                ),
+                renderer=command_renderer,
             )
             logger.info(
                 "Command handled session_key=%s command=%s handled=%s reply_chars=%s",
@@ -264,12 +280,6 @@ def _process_message(data: dict[str, Any]) -> None:
                 send_reply(target_id, result.reply, is_group)
             return
 
-        mem_ctx = MemoryContext(
-            user_id=uid,
-            session_key=session_key,
-            is_group=is_group,
-            group_id=str(data.get("group_id")) if is_group else None,
-        )
         reply_to_message_id = get_reply_message_id(
             data,
             str(data.get("raw_message") or ""),

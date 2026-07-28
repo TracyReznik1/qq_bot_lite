@@ -113,3 +113,11 @@ class MemoryRelation:
     target_claim_id: int
     relation_type: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class PhysicalDeleteOutcome:
+    status: str
+    row_deleted: bool
+    cleanup_complete: bool
+    retryable: bool

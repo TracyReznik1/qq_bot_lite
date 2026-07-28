@@ -145,6 +145,14 @@ class MemoryRetriever:
             query_text,
             now_utc,
         )
+        suppressed_ids = self.store.subject_dispute_suppressed_ids(
+            tuple(claim.id for claim, _usage in candidates)
+        )
+        candidates = [
+            (claim, usage)
+            for claim, usage in candidates
+            if claim.id not in suppressed_ids
+        ]
         unique_candidates: list[tuple[MemoryClaim, str]] = []
         seen_ids: set[int] = set()
         for claim, usage in candidates:

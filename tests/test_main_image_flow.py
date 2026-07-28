@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -186,6 +187,35 @@ class MainImageFlowTests(unittest.TestCase):
             "private:1",
             305,
         )
+
+    def test_command_receives_real_message_id_and_memory_context(self):
+        event = group_event(
+            "[CQ:at,qq=9] /remember 我喜欢简洁回答",
+            "[CQ:at,qq=9] /remember 我喜欢简洁回答",
+            message_id=98765,
+        )
+
+        with (
+            mock.patch.object(
+                main,
+                "config",
+                replace(main.config, require_group_at=True),
+            ),
+            mock.patch.object(
+                main,
+                "handle_command",
+                return_value=CommandResult(True, "ok"),
+            ) as handle,
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        command_context = handle.call_args.args[1]
+        self.assertEqual("98765", command_context.message_id)
+        self.assertEqual("1", command_context.memory_context.user_id)
+        self.assertTrue(command_context.memory_context.is_group)
+        self.assertEqual("20", command_context.memory_context.group_id)
 
     def test_chat_exception_log_contains_only_error_class_metadata(self):
         incoming = "incoming-error-marker-d19c"

@@ -1,14 +1,19 @@
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.chat.chat_service import chat_history
 from src.commands import CommandContext, handle_command
 from src.config import config
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
 from src.memory.policy import MemoryPolicy
+from src.memory.retriever import MemoryRetriever
 from src.memory.store import MemoryStore
 from src.router import Route
+from src.services.llm_types import ChatResponse
 
 
 class MemoryCommandsTests(unittest.TestCase):
@@ -21,6 +26,39 @@ class MemoryCommandsTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def create_claim(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        speaker: str,
+        subject: str,
+        predicate: str,
+        value: str,
+        status: str = "active",
+    ):
+        claim, created = self.store.create_claim(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            speaker_qq=speaker,
+            subject_type="qq_user",
+            subject_id=subject,
+            predicate=predicate,
+            value=value,
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message:speaker",
+            source_message_id=f"source-{scope_type}-{scope_id}-{predicate}-{value}",
+            source_excerpt=value,
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="high",
+            dedupe_key=f"test-{scope_type}-{scope_id}-{speaker}-{subject}-{predicate}-{value}",
+            status=status,
+        )
+        self.assertTrue(created)
+        return claim
 
     def test_context_derives_memory_context_and_admin_status(self):
         ctx = CommandContext(uid="1001", session_key="private:1001", raw_message="/help")
@@ -92,6 +130,616 @@ class MemoryCommandsTests(unittest.TestCase):
         route = Route(handler="command", action="command", command="globalremember", query="规则")
         result = handle_command(route, ctx_user, store=self.store)
         self.assertIn("只能由管理员", result.reply)
+
+    def test_remember_uses_private_or_current_group_scope(self):
+        candidate = CandidateClaim(
+            subject_ref="speaker",
+            predicate="response_style",
+            value="简洁",
+            memory_type="preference",
+            modality="asserted",
+            confidence="high",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="remember",
+            query="我喜欢简洁回答",
+        )
+
+        with mock.patch(
+            "src.commands.MemoryExtractor.extract",
+            return_value=(candidate,),
+        ):
+            handle_command(
+                route,
+                CommandContext(
+                    uid="1001",
+                    session_key="private:1001",
+                    raw_message="/remember 我喜欢简洁回答",
+                    message_id="private-command-1",
+                ),
+                store=self.store,
+            )
+            handle_command(
+                route,
+                CommandContext(
+                    uid="1001",
+                    session_key="group:2001:1001",
+                    raw_message="/remember 我喜欢简洁回答",
+                    message_id="group-command-1",
+                ),
+                store=self.store,
+            )
+
+        private_claims = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="1001",
+        )
+        group_claims = self.store.find_claims_exact(
+            scope_type="group",
+            scope_id="2001",
+        )
+        self.assertEqual(["private-command-1"], [c.source_message_id for c in private_claims])
+        self.assertEqual(["group-command-1"], [c.source_message_id for c in group_claims])
+
+    def test_admin_globalremember_creates_global_claim_without_private_claim(self):
+        candidate = CandidateClaim(
+            subject_ref="speaker",
+            predicate="global_fact",
+            value="维护窗口是周日",
+            memory_type="fact",
+            modality="asserted",
+            confidence="high",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="globalremember",
+            query="维护窗口是周日",
+        )
+        context = CommandContext(
+            uid="9001",
+            session_key="private:9001",
+            raw_message="/globalremember 维护窗口是周日",
+            message_id="global-command-1",
+            is_admin=True,
+        )
+
+        with mock.patch(
+            "src.commands.MemoryExtractor.extract",
+            return_value=(candidate,),
+        ):
+            result = handle_command(route, context, store=self.store)
+
+        global_claims = self.store.find_claims_exact(
+            scope_type="global",
+            scope_id="global",
+        )
+        private_claims = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="9001",
+        )
+        self.assertEqual(1, len(global_claims))
+        self.assertEqual("9001", global_claims[0].speaker_qq)
+        self.assertEqual("9001", global_claims[0].subject_id)
+        self.assertEqual("global-command-1", global_claims[0].source_message_id)
+        self.assertEqual((), private_claims)
+        self.assertEqual("applied", result.outcome.status)
+        self.assertEqual("global:global", result.outcome.scope)
+
+    def test_real_command_message_ids_preserve_distinct_confirmation_evidence(self):
+        candidate = CandidateClaim(
+            subject_ref="speaker",
+            predicate="likes",
+            value="苹果",
+            memory_type="preference",
+            modality="asserted",
+            confidence="high",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="remember",
+            query="我喜欢苹果",
+        )
+        with mock.patch(
+            "src.commands.MemoryExtractor.extract",
+            return_value=(candidate,),
+        ):
+            for message_id in ("command-101", "command-102"):
+                handle_command(
+                    route,
+                    CommandContext(
+                        uid="1001",
+                        session_key="private:1001",
+                        raw_message="/remember 我喜欢苹果",
+                        message_id=message_id,
+                    ),
+                    store=self.store,
+                )
+
+        claim = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="1001",
+        )[0]
+        evidence_ids = {claim.source_message_id}
+        evidence_ids.update(
+            evidence.source_message_id
+            for evidence in self.store.list_evidence(claim.id)
+        )
+        self.assertEqual({"command-101", "command-102"}, evidence_ids)
+
+    def test_policy_rejection_is_not_reported_as_success(self):
+        rejected = CandidateClaim(
+            subject_ref="speaker",
+            predicate="likes",
+            value="苹果",
+            memory_type="preference",
+            modality="asserted",
+            confidence="low",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="remember",
+            query="我喜欢苹果",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/remember 我喜欢苹果",
+            message_id="rejected-command",
+        )
+
+        with mock.patch(
+            "src.commands.MemoryExtractor.extract",
+            return_value=(rejected,),
+        ):
+            result = handle_command(route, context, store=self.store)
+
+        self.assertEqual("rejected", result.outcome.status)
+        self.assertEqual("policy_rejected", result.outcome.cause)
+        self.assertNotIn("记住了", result.reply)
+        self.assertEqual(
+            (),
+            self.store.find_claims_exact(
+                scope_type="private",
+                scope_id="1001",
+            ),
+        )
+
+    def test_remember_calls_real_extractor_contract_with_memory_event(self):
+        class Llm:
+            def __init__(self):
+                self.messages = None
+
+            def chat(self, messages, **_kwargs):
+                self.messages = messages
+                return ChatResponse(
+                    content=json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "subject_ref": "speaker",
+                                    "predicate": "likes",
+                                    "value": "苹果",
+                                    "memory_type": "preference",
+                                    "modality": "asserted",
+                                    "confidence": "high",
+                                    "operation": "add",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+        llm = Llm()
+        route = Route(
+            handler="command",
+            action="command",
+            command="remember",
+            query="我喜欢苹果",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/remember 我喜欢苹果",
+            message_id="real-extractor-command",
+        )
+
+        with mock.patch(
+            "src.memory.extractor.get_memory_llm_client",
+            return_value=llm,
+        ):
+            result = handle_command(route, context, store=self.store)
+
+        self.assertEqual("applied", result.outcome.status)
+        claim = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="1001",
+        )[0]
+        self.assertEqual("real-extractor-command", claim.source_message_id)
+        prompt = "\n".join(str(message["content"]) for message in llm.messages)
+        self.assertIn('"sender_qq":"1001"', prompt)
+
+    def test_exact_id_outside_top_twelve_retracts_own_group_claim(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1001",
+            subject="1001",
+            predicate="favorite_food",
+            value="苹果",
+        )
+        for index in range(15):
+            self.create_claim(
+                scope_type="group",
+                scope_id="2001",
+                speaker="1001",
+                subject="1001",
+                predicate=f"filler_{index}",
+                value=f"填充内容 {index}",
+            )
+        context = CommandContext(
+            uid="1001",
+            session_key="group:2001:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-own-group",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        retained = self.store.get_claim(target.id)
+        self.assertIsNotNone(retained)
+        self.assertEqual("retracted", retained.status)
+        self.assertEqual("retracted", result.outcome.status)
+        self.assertEqual("author_withdrawal", result.outcome.cause)
+
+    def test_different_group_speaker_cannot_retract_foreign_claim(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1002",
+            predicate="likes",
+            value="游泳",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="group:2001:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-foreign",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertEqual("active", self.store.get_claim(target.id).status)
+        self.assertEqual("forbidden", result.outcome.status)
+        self.assertEqual("foreign_author", result.outcome.cause)
+
+    def test_group_claim_subject_creates_answer_suppression_not_retraction(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1001",
+            predicate="likes",
+            value="游泳",
+        )
+        memory_context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key=memory_context.session_key,
+            raw_message=f"/forget {target.id}",
+            memory_context=memory_context,
+            message_id="forget-as-subject",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        original = self.store.get_claim(target.id)
+        self.assertEqual("disputed", original.status)
+        self.assertNotEqual("retracted", original.status)
+        self.assertEqual("disputed", result.outcome.status)
+        self.assertEqual("subject_dispute", result.outcome.cause)
+        answer_ids = {
+            item.claim.id
+            for item in MemoryRetriever(self.store).retrieve(
+                memory_context,
+                "游泳",
+            )
+        }
+        self.assertNotIn(target.id, answer_ids)
+
+    def test_admin_delete_after_subject_dispute_removes_every_body_copy(self):
+        marker = "争议后删除正文-marker-918d"
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1001",
+            predicate="likes",
+            value=marker,
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+        handle_command(
+            route,
+            CommandContext(
+                uid="1001",
+                session_key="group:2001:1001",
+                raw_message=f"/forget {target.id}",
+                message_id="subject-dispute-before-delete",
+            ),
+            store=self.store,
+        )
+
+        result = handle_command(
+            route,
+            CommandContext(
+                uid="9001",
+                session_key="group:2001:9001",
+                raw_message=f"/forget {target.id}",
+                message_id="admin-delete-after-dispute",
+                is_admin=True,
+            ),
+            store=self.store,
+        )
+
+        self.assertEqual("deleted", result.outcome.status)
+        self.assertEqual((), self.store.search_claims(marker))
+        connection = sqlite3.connect(self.db_path)
+        try:
+            body_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM memory_claims
+                WHERE value = ? OR source_excerpt = ?
+                """,
+                (marker, marker),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(0, body_count)
+
+    def test_group_author_retraction_is_one_conditional_store_mutation(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="原子撤回",
+        )
+
+        self.assertFalse(
+            self.store.retract_group_claim(
+                target.id,
+                actor_qq="1002",
+                group_id="2001",
+            )
+        )
+        self.assertTrue(
+            self.store.retract_group_claim(
+                target.id,
+                actor_qq="1001",
+                group_id="2001",
+            )
+        )
+        self.assertFalse(
+            self.store.retract_group_claim(
+                target.id,
+                actor_qq="1001",
+                group_id="2001",
+            )
+        )
+        self.assertEqual("retracted", self.store.get_claim(target.id).status)
+
+    def test_private_owner_forget_physically_deletes_body_and_keeps_audit_only(self):
+        marker = "private-delete-marker-7f23"
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value=marker,
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-private",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertIsNone(self.store.get_claim(target.id))
+        self.assertEqual((), self.store.search_claims(marker))
+        self.assertEqual("deleted", result.outcome.status)
+        self.assertEqual("private_privacy_delete", result.outcome.cause)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            audit = connection.execute(
+                """
+                SELECT claim_id, reason
+                FROM memory_deletion_audit
+                WHERE claim_id = ?
+                """,
+                (target.id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual((target.id, "private_privacy_delete"), audit)
+
+    def test_physical_delete_cleanup_failure_reports_partial_and_is_retryable(self):
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="维护失败后不可谎报成功",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-partial-cleanup",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        with mock.patch.object(
+            self.store,
+            "_checkpoint_wal",
+            side_effect=RuntimeError("active reader"),
+        ):
+            result = handle_command(route, context, store=self.store)
+
+        self.assertIsNone(self.store.get_claim(target.id))
+        self.assertEqual("partial", result.outcome.status)
+        self.assertEqual("privacy_cleanup_pending", result.outcome.cause)
+        self.assertNotIn("status=deleted", result.reply)
+
+        retry = self.store.delete_claim_physically_with_outcome(
+            target.id,
+            reason="private_privacy_delete",
+        )
+        self.assertEqual("cleanup_completed", retry.status)
+        self.assertTrue(retry.cleanup_complete)
+        self.assertFalse(retry.retryable)
+
+    def test_admin_forget_physically_deletes_group_claim(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1002",
+            predicate="likes",
+            value="管理员删除目标",
+        )
+        context = CommandContext(
+            uid="9001",
+            session_key="group:2001:9001",
+            raw_message=f"/forget {target.id}",
+            message_id="forget-admin",
+            is_admin=True,
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertIsNone(self.store.get_claim(target.id))
+        self.assertEqual("deleted", result.outcome.status)
+        self.assertEqual("administrator_delete", result.outcome.cause)
+
+    def test_natural_description_requires_one_permitted_match(self):
+        first = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="苹果派",
+        )
+        second = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="dislikes",
+            value="苹果汁",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/forget 苹果",
+            message_id="forget-ambiguous",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query="苹果",
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertEqual("ambiguous", result.outcome.status)
+        self.assertEqual("active", self.store.get_claim(first.id).status)
+        self.assertEqual("active", self.store.get_claim(second.id).status)
+
+    def test_group_memories_never_lists_private_personalization_value(self):
+        private_marker = "私密称呼-不可公开-3d81"
+        self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="preferred_name",
+            value=private_marker,
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="group:2001:1001",
+            raw_message="/memories",
+            message_id="list-group",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="memories",
+            query="",
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertNotIn(private_marker, result.reply)
 
 
 if __name__ == "__main__":
