@@ -22,8 +22,6 @@ logger = logging.getLogger("qq-bot")
 llm = get_llm_client()
 chat_history: dict[str, list[dict[str, str]]] = {}
 chat_history_lock = Lock()
-HISTORY_DIR = config.data_dir / "history"
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 MAX_TOOL_CALL_ROUNDS = 2
 TOOL_CALL_LIMIT_FALLBACK = "我搜到了信息，但没能整理出可靠回答。可以换个问法再试一次。"
 
@@ -194,7 +192,7 @@ def build_tool_messages(
 
 
 def _history_path(session_key: str) -> Path:
-    return HISTORY_DIR / f"{safe_id(session_key)}.json"
+    return config.data_dir / "history" / f"{safe_id(session_key)}.json"
 
 
 def _load_history_unlocked(session_key: str) -> list[dict[str, str]]:

@@ -42,6 +42,11 @@ class FinalSynthesisTests(unittest.TestCase):
                 "run_tool",
                 return_value="搜索结果",
             ),
+            mock.patch.object(
+                chat_service,
+                "build_untrusted_context",
+                return_value="[非可信上下文]暂无",
+            ),
             mock.patch.object(chat_service, "append_history"),
             mock.patch.object(chat_service, "_ensure_history_loaded"),
         ):

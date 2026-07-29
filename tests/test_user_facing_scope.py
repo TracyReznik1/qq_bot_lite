@@ -1,15 +1,26 @@
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import src.main as main
 from src.chat.prompt import build_system_prompt
 from src.commands.help import help_text
-from src.persona import get_persona
+from src.persona import PersonaConfigurationError, get_persona
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class UserFacingScopeTests(unittest.TestCase):
+    def setUp(self):
+        service_patch = mock.patch.object(
+            main,
+            "get_memory_service",
+            return_value=mock.Mock(),
+        )
+        service_patch.start()
+        self.addCleanup(service_patch.stop)
+
     def test_help_mentions_image_understanding_not_generation(self):
         text = help_text()
         self.assertIn("发送图片", text)
@@ -33,6 +44,59 @@ class UserFacingScopeTests(unittest.TestCase):
 
         self.assertNotIn("ATRI", readme)
         self.assertIn(get_persona().name, help_message)
+
+    def test_runtime_provider_failure_is_not_reported_as_configuration(self):
+        event = {
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 1001,
+            "self_id": 9,
+            "message_id": 7001,
+            "raw_message": "/remember 私密内容",
+            "message": "/remember 私密内容",
+        }
+        with (
+            mock.patch.object(
+                main,
+                "handle_command",
+                side_effect=RuntimeError("provider-private-marker"),
+            ),
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+            self.assertLogs("qq-bot", level="ERROR") as captured,
+        ):
+            main.process_message(event)
+
+        sent_text = send.call_args.args[1]
+        logged = "\n".join(captured.output)
+        self.assertNotIn("配置还没好", sent_text)
+        self.assertIn("处理失败", sent_text)
+        self.assertNotIn("Configuration error", logged)
+        self.assertIn("Message handling failed", logged)
+        self.assertNotIn("provider-private-marker", logged)
+
+    def test_persona_configuration_failure_keeps_configuration_reply(self):
+        event = {
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 1001,
+            "self_id": 9,
+            "message_id": 7002,
+            "raw_message": "/help",
+            "message": "/help",
+        }
+        with (
+            mock.patch.object(
+                main,
+                "handle_command",
+                side_effect=PersonaConfigurationError("角色文件为空"),
+            ),
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        self.assertIn("配置还没好", send.call_args.args[1])
 
 
 if __name__ == "__main__":

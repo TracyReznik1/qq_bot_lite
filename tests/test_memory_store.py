@@ -13,6 +13,7 @@ from unittest import mock
 
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
 from src.memory.store import MemoryStore
+from tests.runtime import COMPACT_HARD_SECRET_CASES
 
 
 def private_event(
@@ -43,13 +44,14 @@ def group_event(
     message_id: str,
     sequence: int,
     text: str = "群消息",
+    group_id: str = "30003",
 ) -> MemoryEvent:
     return MemoryEvent(
         context=MemoryContext(
             user_id=user_id,
-            session_key=f"group:30003:{user_id}",
+            session_key=f"group:{group_id}:{user_id}",
             is_group=True,
-            group_id="30003",
+            group_id=group_id,
         ),
         message_id=message_id,
         sequence=sequence,
@@ -120,14 +122,22 @@ class MemoryStoreTests(unittest.TestCase):
                 "memory_relations",
                 "memory_jobs",
                 "memory_deletion_audit",
+                "memory_claim_tombstones",
                 "schema_version",
                 "memory_fts",
             }.issubset(names)
         )
-        self.assertEqual(2, self.store.schema_version())
+        self.assertEqual(4, self.store.schema_version())
         with closing(sqlite3.connect(self.path)) as connection:
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            tombstone_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_claim_tombstones)"
+                )
+            }
         self.assertEqual("wal", journal_mode.lower())
+        self.assertEqual({"dedupe_key", "deleted_at"}, tombstone_columns)
 
     def test_upgrades_v1_dispute_schema_without_losing_claim_data(self):
         claim, _ = self.store.create_claim(
@@ -153,6 +163,9 @@ class MemoryStoreTests(unittest.TestCase):
             connection.execute("DROP TABLE memory_subject_disputes")
             connection.execute("DROP TABLE memory_pending_privacy_cleanup")
             connection.execute("DROP TABLE memory_claim_id_sequence")
+            connection.execute(
+                "DROP TABLE IF EXISTS memory_claim_tombstones"
+            )
             connection.execute("DELETE FROM schema_version")
             connection.execute(
                 """
@@ -164,7 +177,7 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.store.initialize()
 
-        self.assertEqual(2, self.store.schema_version())
+        self.assertEqual(4, self.store.schema_version())
         self.assertEqual("preserved-v1-data", self.store.get_claim(claim.id).value)
         with closing(sqlite3.connect(self.path)) as connection:
             dispute_table = connection.execute(
@@ -198,6 +211,14 @@ class MemoryStoreTests(unittest.TestCase):
                   AND name = 'memory_claim_id_sequence'
                 """
             ).fetchone()
+            tombstone_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'memory_claim_tombstones'
+                """
+            ).fetchone()
             foreign_keys = connection.execute(
                 "PRAGMA foreign_key_list(memory_subject_disputes)"
             ).fetchall()
@@ -208,6 +229,7 @@ class MemoryStoreTests(unittest.TestCase):
             pending_table,
         )
         self.assertEqual(("memory_claim_id_sequence",), sequence_table)
+        self.assertEqual(("memory_claim_tombstones",), tombstone_table)
         self.assertIn(
             ("memory_claims", "target_claim_id", "id", "CASCADE"),
             {
@@ -215,6 +237,87 @@ class MemoryStoreTests(unittest.TestCase):
                 for row in foreign_keys
             },
         )
+
+    def test_upgrades_legacy_jobs_with_indexed_source_message_id(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "legacy-jobs.sqlite3"
+            payload = json.dumps(
+                {
+                    "context": {
+                        "user_id": "10001",
+                        "session_key": "private:10001",
+                        "is_group": False,
+                        "group_id": None,
+                    },
+                    "message_id": "legacy-source-42",
+                    "sequence": 42,
+                    "text": "legacy body",
+                    "image_count": 0,
+                    "mentioned_qq_ids": [],
+                    "reply_to_message_id": None,
+                    "reply_to_user_id": None,
+                },
+                ensure_ascii=False,
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE memory_jobs (
+                        id INTEGER PRIMARY KEY,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        scope_key TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        retry_at TEXT,
+                        error_type TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memory_jobs(
+                        dedupe_key, scope_key, sequence, payload_json, state,
+                        attempts, retry_at, error_type, created_at, updated_at
+                    ) VALUES (
+                        'legacy-job', 'private:10001', 42, ?, 'retry',
+                        1, NULL, 'temporary', '2026-01-01', '2026-01-01'
+                    )
+                    """,
+                    (payload,),
+                )
+                connection.commit()
+
+            store = MemoryStore(path)
+            store.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(memory_jobs)"
+                    )
+                }
+                source_message_id = connection.execute(
+                    """
+                    SELECT source_message_id
+                    FROM memory_jobs
+                    WHERE dedupe_key = 'legacy-job'
+                    """
+                ).fetchone()[0]
+                indexes = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA index_list(memory_jobs)"
+                    )
+                }
+
+            self.assertIn("source_message_id", columns)
+            self.assertEqual("legacy-source-42", source_message_id)
+            self.assertIn("memory_jobs_source_message_idx", indexes)
 
     def test_sequence_upgrade_seeds_from_deleted_audit_and_pending_ids(self):
         cases = (
@@ -314,6 +417,8 @@ class MemoryStoreTests(unittest.TestCase):
                     self.store.delete_claim_physically_with_outcome(
                         claim.id,
                         reason="private_privacy_delete",
+                        actor_qq="1001",
+                        is_admin=False,
                     )
         finally:
             locker.rollback()
@@ -424,6 +529,92 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIn("[redacted:credential]", payload)
         self.assertIn("[redacted:payment-data]", payload)
         self.assertIn("[redacted:image-data]", payload)
+
+    def test_job_payload_redacts_delimited_and_compact_secrets_before_sqlite(self):
+        forbidden_values = (
+            "654321",
+            "482915",
+            "736219",
+            "PASSWORD_SPACE_SENTINEL_7F2A",
+            "TOKEN_SPACE_SENTINEL_93B1",
+            "API_KEY_SPACE_SENTINEL_5D8C",
+            "PAYMENT_SPACE_SENTINEL_4A6E",
+            "4111 1111 1111 1111",
+            "1234567890",
+            "9876543210",
+            "1357902468",
+            "2468013579",
+            "123",
+        ) + tuple(
+            dict.fromkeys(
+                raw_value
+                for _label, _secret, raw_value
+                in COMPACT_HARD_SECRET_CASES
+            )
+        )
+        secret_text = "；".join(
+            (
+                "验证码 654321",
+                "OTP 482915",
+                "verification code 736219",
+                "密码 PASSWORD_SPACE_SENTINEL_7F2A",
+                "token TOKEN_SPACE_SENTINEL_93B1",
+                "API key API_KEY_SPACE_SENTINEL_5D8C",
+                "支付凭据 PAYMENT_SPACE_SENTINEL_4A6E",
+                "银行卡号 4111 1111 1111 1111",
+                "bank account 1234567890",
+                "银行账号 9876543210",
+                "银行帐号 1357902468",
+                "支付账号 2468013579",
+                "CVV 123",
+                *(
+                    secret
+                    for _label, secret, _raw_value
+                    in COMPACT_HARD_SECRET_CASES
+                ),
+            )
+        )
+        job_id, _ = self.store.create_job(
+            private_event(
+                message_id="space-delimited-secret-categories",
+                text=secret_text,
+            )
+        )
+
+        payload = self.store.get_job(job_id).payload_json
+
+        for forbidden in forbidden_values:
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, payload)
+        self.assertIn("[redacted:credential]", payload)
+        self.assertIn("[redacted:payment-data]", payload)
+        for database_file in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            if not database_file.exists():
+                continue
+            database_bytes = database_file.read_bytes()
+            for sentinel in (
+                "PASSWORD_SPACE_SENTINEL_7F2A",
+                "TOKEN_SPACE_SENTINEL_93B1",
+                "API_KEY_SPACE_SENTINEL_5D8C",
+                "PAYMENT_SPACE_SENTINEL_4A6E",
+                *(
+                    secret
+                    for _label, secret, _raw_value
+                    in COMPACT_HARD_SECRET_CASES
+                ),
+            ):
+                with self.subTest(
+                    database_file=database_file.name,
+                    sentinel=sentinel,
+                ):
+                    self.assertNotIn(
+                        sentinel.encode("utf-8"),
+                        database_bytes,
+                    )
 
     def test_job_payload_redacts_mime_wrapped_binary_base64(self):
         encoded_values = []
@@ -1035,7 +1226,12 @@ class MemoryStoreTests(unittest.TestCase):
         )
         self.assertTrue(self.store.delete_evidence(evidence_id))
         self.assertTrue(
-            self.store.delete_claim_physically(first.id, reason="user_forget")
+            self.store.delete_claim_physically(
+                first.id,
+                reason="user_forget",
+                actor_qq="10001",
+                is_admin=False,
+            )
         )
         self.assertIsNone(self.store.get_claim(first.id))
         self.assertEqual((), self.store.search_claims("公路骑行"))
@@ -1112,6 +1308,59 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(1, len(exact))
         self.assertEqual("value-512", exact[0].value)
+
+    def test_authorized_search_filters_scope_in_sql_before_fts_limit(self):
+        visible, _ = self.store.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker_qq="1001",
+            subject_type="qq_user",
+            subject_id="1001",
+            predicate="topic",
+            value="AUTHORIZED-LEXICAL-MARKER",
+            memory_type="fact",
+            modality="asserted",
+            source_kind="message:speaker",
+            source_message_id="authorized-visible",
+            source_excerpt="AUTHORIZED-LEXICAL-MARKER",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="high",
+            dedupe_key="authorized-visible",
+        )
+        for index in range(20):
+            self.store.create_claim(
+                scope_type="group",
+                scope_id="other-group",
+                speaker_qq="2002",
+                subject_type="qq_user",
+                subject_id="2002",
+                predicate="topic",
+                value="AUTHORIZED-LEXICAL-MARKER",
+                memory_type="fact",
+                modality="asserted",
+                source_kind="message:speaker",
+                source_message_id=f"unauthorized-{index}",
+                source_excerpt="AUTHORIZED-LEXICAL-MARKER",
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="high",
+                dedupe_key=f"unauthorized-{index}",
+            )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        found = self.store.search_authorized_claims(
+            context,
+            "AUTHORIZED-LEXICAL-MARKER",
+            limit=1,
+        )
+
+        self.assertEqual([visible.id], [claim.id for claim in found])
 
     def test_reconciliation_transaction_rolls_back_all_writes(self):
         with self.assertRaisesRegex(RuntimeError, "injected failure"):
@@ -1197,7 +1446,12 @@ class MemoryStoreTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            self.store.delete_claim_physically(claim.id, reason="user_forget")
+            self.store.delete_claim_physically(
+                claim.id,
+                reason="user_forget",
+                actor_qq="10001",
+                is_admin=False,
+            )
         )
 
         marker_bytes = marker.encode("utf-8")
@@ -1210,6 +1464,255 @@ class MemoryStoreTests(unittest.TestCase):
             if database_file.exists():
                 with self.subTest(database_file=database_file.name):
                     self.assertNotIn(marker_bytes, database_file.read_bytes())
+
+    def test_physical_delete_same_message_id_is_scoped(self):
+        source_message_id = "onebot-collision-7788"
+        private_marker = "PRIVATE_COLLISION_BODY_61A2"
+        group_a_marker = "GROUP_A_COLLISION_BODY_73B4"
+        group_b_marker = "GROUP_B_COLLISION_BODY_95C6"
+        events = (
+            private_event(
+                message_id=source_message_id,
+                text=private_marker,
+            ),
+            group_event(
+                user_id="20001",
+                group_id="30003",
+                message_id=source_message_id,
+                sequence=2,
+                text=group_a_marker,
+            ),
+            group_event(
+                user_id="20002",
+                group_id="40004",
+                message_id=source_message_id,
+                sequence=3,
+                text=group_b_marker,
+            ),
+        )
+        job_ids = []
+        for current_event in events:
+            job_id, created = self.store.create_job(current_event)
+            self.assertTrue(created)
+            self.store.mark_job_ready(job_id)
+            job_ids.append(job_id)
+
+        def create_scoped_claim(
+            scope_type: str,
+            scope_id: str,
+            speaker_qq: str,
+            marker: str,
+        ):
+            claim, created = self.store.create_claim(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                speaker_qq=speaker_qq,
+                subject_type="qq_user",
+                subject_id=speaker_qq,
+                predicate="likes",
+                value=marker,
+                memory_type="preference",
+                modality="asserted",
+                source_kind="message",
+                source_message_id=source_message_id,
+                source_excerpt=marker,
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="medium",
+                dedupe_key=f"collision-{scope_type}-{scope_id}",
+            )
+            self.assertTrue(created)
+            return claim
+
+        private_claim = create_scoped_claim(
+            "private",
+            "10001",
+            "10001",
+            private_marker,
+        )
+        group_a_claim = create_scoped_claim(
+            "group",
+            "30003",
+            "20001",
+            group_a_marker,
+        )
+        group_b_claim = create_scoped_claim(
+            "group",
+            "40004",
+            "20002",
+            group_b_marker,
+        )
+        self.store.add_evidence(
+            group_a_claim.id,
+            source_kind="message",
+            source_message_id=source_message_id,
+            source_excerpt=group_a_marker,
+        )
+        self.store.add_evidence(
+            group_b_claim.id,
+            source_kind="message",
+            source_message_id=source_message_id,
+            source_excerpt=group_b_marker,
+        )
+
+        self.store.delete_claim_physically(
+            private_claim.id,
+            reason="private_privacy_delete",
+            actor_qq="10001",
+            is_admin=False,
+        )
+
+        self.assertEqual("failed", self.store.get_job(job_ids[0]).state)
+        self.assertEqual("", self.store.get_job(job_ids[0]).text)
+        self.assertEqual("ready", self.store.get_job(job_ids[1]).state)
+        self.assertEqual(group_a_marker, self.store.get_job(job_ids[1]).text)
+        self.assertEqual("ready", self.store.get_job(job_ids[2]).state)
+        self.assertEqual(group_b_marker, self.store.get_job(job_ids[2]).text)
+        self.assertEqual(
+            group_a_marker,
+            self.store.get_claim(group_a_claim.id).source_excerpt,
+        )
+        self.assertEqual(
+            group_b_marker,
+            self.store.get_claim(group_b_claim.id).source_excerpt,
+        )
+        self.assertEqual(
+            group_a_marker,
+            self.store.list_evidence(group_a_claim.id)[0].source_excerpt,
+        )
+        self.assertEqual(
+            group_b_marker,
+            self.store.list_evidence(group_b_claim.id)[0].source_excerpt,
+        )
+
+        self.store.delete_claim_physically(
+            group_a_claim.id,
+            reason="administrator_delete",
+            actor_qq="90009",
+            is_admin=True,
+        )
+
+        self.assertEqual("failed", self.store.get_job(job_ids[1]).state)
+        self.assertEqual("", self.store.get_job(job_ids[1]).text)
+        self.assertEqual("ready", self.store.get_job(job_ids[2]).state)
+        self.assertEqual(group_b_marker, self.store.get_job(job_ids[2]).text)
+        self.assertEqual(
+            group_b_marker,
+            self.store.get_claim(group_b_claim.id).source_excerpt,
+        )
+        self.assertEqual(
+            group_b_marker,
+            self.store.list_evidence(group_b_claim.id)[0].source_excerpt,
+        )
+        self.assertIn(
+            group_b_claim.id,
+            {
+                claim.id
+                for claim in self.store.search_claims(group_b_marker)
+            },
+        )
+
+    def test_physical_delete_authorization_is_enforced_in_transaction(self):
+        claim, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="likes",
+            value="atomic-owner-authorization",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="atomic-owner-authorization-message",
+            source_excerpt="atomic-owner-authorization",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="atomic-owner-authorization-claim",
+        )
+
+        with self.assertRaises(PermissionError):
+            self.store.delete_claim_physically_with_outcome(
+                claim.id,
+                reason="private_privacy_delete",
+                actor_qq="10002",
+                is_admin=False,
+            )
+
+        self.assertIsNotNone(self.store.get_claim(claim.id))
+        with closing(sqlite3.connect(self.path)) as connection:
+            audit_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM memory_deletion_audit
+                WHERE claim_id = ?
+                """,
+                (claim.id,),
+            ).fetchone()[0]
+        self.assertEqual(0, audit_count)
+
+    def test_empty_source_id_delete_does_not_scrub_unassociated_rows(self):
+        target, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="likes",
+            value="empty-source-target",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="",
+            source_excerpt="empty-source-target",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="empty-source-target",
+        )
+        sibling, _ = self.store.create_claim(
+            scope_type="private",
+            scope_id="10001",
+            speaker_qq="10001",
+            subject_type="qq_user",
+            subject_id="10001",
+            predicate="dislikes",
+            value="empty-source-unrelated",
+            memory_type="preference",
+            modality="asserted",
+            source_kind="message",
+            source_message_id="",
+            source_excerpt="empty-source-unrelated",
+            extraction_confidence="high",
+            attribution_confidence="high",
+            truth_confidence="medium",
+            dedupe_key="empty-source-unrelated",
+        )
+        job_id, _ = self.store.create_job(
+            private_event(
+                message_id="",
+                text="unassociated empty-id job body",
+            )
+        )
+        self.store.mark_job_ready(job_id)
+
+        self.store.delete_claim_physically(
+            target.id,
+            reason="private_privacy_delete",
+            actor_qq="10001",
+            is_admin=False,
+        )
+
+        self.assertEqual(
+            "empty-source-unrelated",
+            self.store.get_claim(sibling.id).source_excerpt,
+        )
+        self.assertEqual("ready", self.store.get_job(job_id).state)
+        self.assertEqual(
+            "unassociated empty-id job body",
+            self.store.get_job(job_id).text,
+        )
 
     def test_physical_delete_waits_for_concurrent_reader_before_success(self):
         marker = "CONCURRENT_PRIVATE_MARKER_93ad"
@@ -1246,6 +1749,8 @@ class MemoryStoreTests(unittest.TestCase):
                 self.store.delete_claim_physically,
                 claim.id,
                 reason="user_forget",
+                actor_qq="10001",
+                is_admin=False,
             )
             try:
                 deadline = time.monotonic() + 1.0
@@ -1313,7 +1818,12 @@ class MemoryStoreTests(unittest.TestCase):
                 dedupe_key="old-sqlite-private-claim",
             )
             self.assertTrue(
-                store.delete_claim_physically(claim.id, reason="user_forget")
+                store.delete_claim_physically(
+                    claim.id,
+                    reason="user_forget",
+                    actor_qq="10001",
+                    is_admin=False,
+                )
             )
             self.assertNotIn(marker.encode("utf-8"), path.read_bytes())
 
@@ -1349,6 +1859,8 @@ class MemoryStoreTests(unittest.TestCase):
                 self.store.delete_claim_physically(
                     claim.id,
                     reason="user_forget",
+                    actor_qq="10001",
+                    is_admin=False,
                 )
             )
 
@@ -1406,6 +1918,8 @@ class MemoryStoreTests(unittest.TestCase):
                     store.delete_claim_physically(
                         claim.id,
                         reason="user_forget",
+                        actor_qq="10001",
+                        is_admin=False,
                     )
                 )
 
@@ -1424,6 +1938,152 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertTrue(
             delete_transaction_connections.isdisjoint(optimize_connections)
         )
+
+    def test_cleanup_does_not_rewrite_already_empty_old_job_payload(self):
+        job_id, _ = self.store.create_job(
+            private_event(
+                message_id="already-empty-old-job",
+                text="ordinary body",
+            )
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE memory_jobs
+                SET payload_json = '{}',
+                    state = 'done',
+                    updated_at = '2000-01-01T00:00:00+00:00'
+                WHERE id = ?
+                """,
+                (job_id,),
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER reject_empty_payload_rewrite
+                BEFORE UPDATE OF payload_json ON memory_jobs
+                WHEN OLD.payload_json = '{}' AND NEW.payload_json = '{}'
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'already-empty payload was rewritten'
+                    );
+                END
+                """
+            )
+            connection.commit()
+
+        self.assertEqual(
+            0,
+            self.store.cleanup_old_jobs_and_excerpts(days=90),
+        )
+
+    def test_archived_privacy_cleanup_optimizes_old_fts_only_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "old-archive-maintenance.sqlite3"
+            store = MemoryStore(path)
+            with mock.patch.object(
+                sqlite3,
+                "sqlite_version_info",
+                (3, 41, 2),
+            ):
+                store.initialize()
+            claim, _ = store.create_claim(
+                scope_type="private",
+                scope_id="10001",
+                speaker_qq="10001",
+                subject_type="qq_user",
+                subject_id="10001",
+                predicate="likes",
+                value="archived maintenance value",
+                memory_type="preference",
+                modality="asserted",
+                source_kind="message",
+                source_message_id="archived-maintenance-message",
+                source_excerpt="archived maintenance excerpt",
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="medium",
+                dedupe_key="archived-maintenance-claim",
+                status="archived",
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    """
+                    UPDATE memory_claims
+                    SET created_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ?
+                    """,
+                    (claim.id,),
+                )
+                connection.commit()
+
+            with mock.patch.object(
+                store,
+                "_optimize_fts_for_privacy",
+                wraps=store._optimize_fts_for_privacy,
+            ) as optimize:
+                store.cleanup_old_jobs_and_excerpts(days=90)
+                store.cleanup_old_jobs_and_excerpts(days=90)
+
+            self.assertEqual(1, optimize.call_count)
+
+    def test_archived_privacy_cleanup_retries_optimize_after_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "old-archive-retry.sqlite3"
+            store = MemoryStore(path)
+            with mock.patch.object(
+                sqlite3,
+                "sqlite_version_info",
+                (3, 41, 2),
+            ):
+                store.initialize()
+            claim, _ = store.create_claim(
+                scope_type="private",
+                scope_id="10001",
+                speaker_qq="10001",
+                subject_type="qq_user",
+                subject_id="10001",
+                predicate="likes",
+                value="archived retry value",
+                memory_type="preference",
+                modality="asserted",
+                source_kind="message",
+                source_message_id="archived-retry-message",
+                source_excerpt="archived retry excerpt",
+                extraction_confidence="high",
+                attribution_confidence="high",
+                truth_confidence="medium",
+                dedupe_key="archived-retry-claim",
+                status="archived",
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    """
+                    UPDATE memory_claims
+                    SET created_at = '2000-01-01T00:00:00+00:00'
+                    WHERE id = ?
+                    """,
+                    (claim.id,),
+                )
+                connection.commit()
+
+            with mock.patch.object(
+                store,
+                "_optimize_fts_for_privacy",
+                side_effect=[
+                    RuntimeError("forced optimize failure"),
+                    None,
+                ],
+            ) as optimize:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "forced optimize failure",
+                ):
+                    store.cleanup_old_jobs_and_excerpts(days=90)
+                store.cleanup_old_jobs_and_excerpts(days=90)
+                store.cleanup_old_jobs_and_excerpts(days=90)
+
+            self.assertEqual(2, optimize.call_count)
 
     def test_physical_delete_fails_bounded_if_reader_never_releases(self):
         marker = "BLOCKED_PRIVATE_MARKER_6d31"
@@ -1457,6 +2117,8 @@ class MemoryStoreTests(unittest.TestCase):
                 self.store.delete_claim_physically(
                     claim.id,
                     reason="user_forget",
+                    actor_qq="10001",
+                    is_admin=False,
                 )
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertEqual(
@@ -1471,7 +2133,12 @@ class MemoryStoreTests(unittest.TestCase):
             reader.close()
 
         self.assertFalse(
-            self.store.delete_claim_physically(claim.id, reason="user_forget")
+            self.store.delete_claim_physically(
+                claim.id,
+                reason="user_forget",
+                actor_qq="10001",
+                is_admin=False,
+            )
         )
         marker_bytes = marker.encode("utf-8")
         for database_file in (

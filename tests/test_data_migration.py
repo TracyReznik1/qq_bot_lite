@@ -9,7 +9,9 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from tests.runtime import isolated_runtime
 
 
 def write_json(path: Path, data):
@@ -830,40 +832,54 @@ class StartupMigrationTests(unittest.TestCase):
     def test_startup_serializes_concurrent_initialization(self):
         from src import main
 
-        previous_initialized = main._startup_initialized
-        self.addCleanup(setattr, main, "_startup_initialized", previous_initialized)
-        main._startup_initialized = False
-        fake_config = SimpleNamespace(
-            data_dir=main.BASE_DIR / "qqbot_data",
-            history_turns=8,
-        )
-        start = threading.Barrier(3)
-        call_lock = threading.Lock()
-        calls = {"directory": 0}
-        errors = []
+        with tempfile.TemporaryDirectory() as root:
+            base_dir = Path(root)
+            with isolated_runtime(base_dir / "qqbot_data") as runtime:
+                service = Mock()
+                service.store.max_job_sequence.return_value = 0
+                queue = Mock()
+                start = threading.Barrier(3)
+                call_lock = threading.Lock()
+                calls = {"directory": 0}
+                errors = []
 
-        def directory_migration(*args, **kwargs):
-            with call_lock:
-                calls["directory"] += 1
-            time.sleep(0.05)
+                def directory_migration(*args, **kwargs):
+                    with call_lock:
+                        calls["directory"] += 1
+                    time.sleep(0.05)
 
-        def worker():
-            start.wait()
-            try:
-                main.startup()
-            except Exception as error:
-                errors.append(error)
+                def worker():
+                    start.wait()
+                    try:
+                        main.startup()
+                    except Exception as error:
+                        errors.append(error)
 
-        with (
-            patch.object(main, "config", fake_config),
-            patch.object(main, "migrate_legacy_data", side_effect=directory_migration),
-        ):
-            threads = [threading.Thread(target=worker) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            start.wait()
-            for thread in threads:
-                thread.join(timeout=2)
+                with (
+                    patch.object(main, "BASE_DIR", base_dir),
+                    patch.object(main, "config", runtime.config),
+                    patch.object(main, "get_persona"),
+                    patch.object(
+                        main,
+                        "get_memory_service",
+                        return_value=service,
+                    ),
+                    patch.object(main, "message_queue", queue),
+                    patch.object(
+                        main,
+                        "migrate_legacy_data",
+                        side_effect=directory_migration,
+                    ),
+                ):
+                    threads = [
+                        threading.Thread(target=worker)
+                        for _ in range(2)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    start.wait()
+                    for thread in threads:
+                        thread.join(timeout=2)
 
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual([], errors)
@@ -872,38 +888,56 @@ class StartupMigrationTests(unittest.TestCase):
     def test_startup_migrates_default_data_once_before_starting_memory_service(self):
         from src import main
 
-        order = []
-        previous_initialized = main._startup_initialized
-        self.addCleanup(setattr, main, "_startup_initialized", previous_initialized)
-        main._startup_initialized = False
-        fake_config = SimpleNamespace(
-            data_dir=main.BASE_DIR / "qqbot_data",
-            history_turns=8,
-        )
-        with (
-            patch.object(main, "config", fake_config),
-            patch.object(main, "migrate_legacy_data", side_effect=lambda *args, **kwargs: order.append("directory")),
-        ):
-            main.startup()
-            main.startup()
+        with tempfile.TemporaryDirectory() as root:
+            base_dir = Path(root)
+            with isolated_runtime(base_dir / "qqbot_data") as runtime:
+                order = []
+                service = Mock()
+                service.store.max_job_sequence.return_value = 0
+                with (
+                    patch.object(main, "BASE_DIR", base_dir),
+                    patch.object(main, "config", runtime.config),
+                    patch.object(main, "get_persona"),
+                    patch.object(
+                        main,
+                        "get_memory_service",
+                        return_value=service,
+                    ),
+                    patch.object(main, "message_queue", Mock()),
+                    patch.object(
+                        main,
+                        "migrate_legacy_data",
+                        side_effect=lambda *_args, **_kwargs: (
+                            order.append("directory")
+                        ),
+                    ),
+                ):
+                    main.startup()
+                    main.startup()
 
         self.assertEqual(["directory"], order)
 
     def test_startup_does_not_migrate_atri_data_into_custom_data_directory(self):
         from src import main
 
-        previous_initialized = main._startup_initialized
-        self.addCleanup(setattr, main, "_startup_initialized", previous_initialized)
-        main._startup_initialized = False
-        fake_config = SimpleNamespace(
-            data_dir=main.BASE_DIR / "custom_data",
-            history_turns=8,
-        )
-        with (
-            patch.object(main, "config", fake_config),
-            patch.object(main, "migrate_legacy_data") as migrate,
-        ):
-            main.startup()
+        with tempfile.TemporaryDirectory() as root:
+            base_dir = Path(root)
+            with isolated_runtime(base_dir / "custom_data") as runtime:
+                service = Mock()
+                service.store.max_job_sequence.return_value = 0
+                with (
+                    patch.object(main, "BASE_DIR", base_dir),
+                    patch.object(main, "config", runtime.config),
+                    patch.object(main, "get_persona"),
+                    patch.object(
+                        main,
+                        "get_memory_service",
+                        return_value=service,
+                    ),
+                    patch.object(main, "message_queue", Mock()),
+                    patch.object(main, "migrate_legacy_data") as migrate,
+                ):
+                    main.startup()
 
         migrate.assert_not_called()
 

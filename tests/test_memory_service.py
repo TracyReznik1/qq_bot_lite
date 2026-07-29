@@ -7,6 +7,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.memory.extractor import MemoryExtractor
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
 from src.memory.service import MemoryService, get_memory_service
 from src.memory.store import MemoryStore
@@ -345,6 +346,202 @@ class MemoryServiceTests(unittest.TestCase):
         finally:
             service.stop()
 
+    def test_real_extractor_contract_creates_claim_and_completes_job(self):
+        class FakeMemoryLLM:
+            def chat(self, _messages, **_kwargs):
+                return SimpleNamespace(
+                    content=(
+                        '{"claims":[{"subject_ref":"speaker",'
+                        '"predicate":"preferred_name","value":"小明",'
+                        '"memory_type":"preferred_name",'
+                        '"modality":"asserted","confidence":"high",'
+                        '"operation":"add","valid_from":null,'
+                        '"valid_to":null}]}'
+                    )
+                )
+
+        service = MemoryService(
+            store=self.store,
+            extractor=MemoryExtractor(llm=FakeMemoryLLM()),
+        )
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="real-extractor-contract",
+            sequence=1,
+            text="叫我小明",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(job_id)
+        claimed = self.store.claim_next_job("private:1001")
+
+        service._process_claimed_job(claimed)
+
+        self.assertEqual("done", self.store.get_job(job_id).state)
+        claims = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="1001",
+            statuses=("active",),
+        )
+        self.assertEqual(["小明"], [claim.value for claim in claims])
+
+    def test_claim_and_job_completion_roll_back_together_then_retry_once(self):
+        extractor = MagicMock()
+        extractor.extract.return_value = (
+            CandidateClaim(
+                subject_ref="speaker",
+                predicate="likes",
+                value="苹果",
+                memory_type="preference",
+                modality="asserted",
+                confidence="high",
+            ),
+        )
+        service = MemoryService(store=self.store, extractor=extractor)
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="atomic-completion",
+            sequence=1,
+            text="我喜欢苹果",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(job_id)
+        claimed = self.store.claim_next_job("private:1001")
+        with self.store._connection() as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_job_completion
+                BEFORE UPDATE OF state ON memory_jobs
+                WHEN NEW.state = 'done'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced completion failure');
+                END
+                """
+            )
+
+        service._process_claimed_job(claimed)
+
+        self.assertEqual("retry", self.store.get_job(job_id).state)
+        self.assertEqual(
+            (),
+            self.store.find_claims_exact(
+                scope_type="private",
+                scope_id="1001",
+                statuses=("active", "disputed"),
+            ),
+        )
+
+        with self.store._connection() as connection:
+            connection.execute("DROP TRIGGER reject_job_completion")
+        self.store.mark_job_ready(job_id)
+        retry = self.store.claim_next_job("private:1001")
+        service._process_claimed_job(retry)
+
+        self.assertEqual("done", self.store.get_job(job_id).state)
+        claims = self.store.find_claims_exact(
+            scope_type="private",
+            scope_id="1001",
+            statuses=("active", "disputed"),
+        )
+        self.assertEqual(1, len(claims))
+        self.assertEqual("苹果", claims[0].value)
+
+    def test_start_recovers_staged_job_before_later_ready_job(self):
+        extractor = MagicMock()
+        extractor.extract.return_value = ()
+        service = MemoryService(store=self.store, extractor=extractor)
+        context = MemoryContext("1001", "private:1001", False)
+        first_id = service.stage_event(
+            MemoryEvent(
+                context=context,
+                message_id="restart-staged-first",
+                sequence=1,
+                text="first",
+            )
+        )
+        second_id = service.stage_event(
+            MemoryEvent(
+                context=context,
+                message_id="restart-ready-second",
+                sequence=2,
+                text="second",
+            )
+        )
+        service.release_job(second_id)
+
+        service.start(worker_count=1)
+        try:
+            self.assertTrue(
+                service.wait_for_scope("private:1001", timeout=5.0)
+            )
+        finally:
+            service.stop()
+
+        self.assertEqual("done", self.store.get_job(first_id).state)
+        self.assertEqual("done", self.store.get_job(second_id).state)
+        processed_texts = [
+            call.args[0].text for call in extractor.extract.call_args_list
+        ]
+        self.assertEqual(["first", "second"], processed_texts)
+
+    def test_start_failure_leaves_service_restartable(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        original_initialize = self.store.initialize
+        with patch.object(
+            self.store,
+            "initialize",
+            side_effect=[RuntimeError("initialization failed"), None],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "initialization failed",
+            ):
+                service.start(worker_count=1)
+
+            self.assertFalse(service._running)
+            self.assertEqual([], service._workers)
+
+            service.start(worker_count=0)
+            self.assertTrue(service._running)
+            service.stop()
+
+        original_initialize()
+
+    def test_wait_for_scope_treats_retry_job_as_unfinished(self):
+        service = MemoryService(store=self.store, extractor=MagicMock())
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="private:1001",
+                is_group=False,
+            ),
+            message_id="wait-retry-unfinished",
+            sequence=1,
+            text="ordinary text",
+        )
+        job_id = service.stage_event(event)
+        service.release_job(job_id)
+        claimed = self.store.claim_next_job("private:1001")
+        self.store.fail_job(
+            claimed.id,
+            error_type="temporary_provider_failure",
+            retry_at="2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertFalse(
+            service.wait_for_scope(
+                "private:1001",
+                timeout=0.01,
+            )
+        )
+
     def test_retry_on_transient_failure_and_permanent_failure(self):
         mock_extractor = MagicMock()
         mock_extractor.extract.side_effect = RuntimeError("llm connection reset")
@@ -357,8 +554,17 @@ class MemoryServiceTests(unittest.TestCase):
             job_id = service.stage_event(event)
             service.release_job(job_id)
 
-            service.wait_for_scope("private:1001", timeout=5.0)
-            job = self.store.get_job(job_id)
+            deadline = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=1)
+            )
+            while True:
+                job = self.store.get_job(job_id)
+                if job.state == "retry":
+                    break
+                if datetime.now(timezone.utc) >= deadline:
+                    self.fail("timed out waiting for first retry state")
+                Event().wait(0.01)
             self.assertEqual("retry", job.state)
             self.assertEqual("RuntimeError", job.error_type)
             self.assertEqual(1, job.attempts)

@@ -12,12 +12,14 @@ from unittest import mock
 from src.chat.chat_service import chat_history
 from src.commands import CommandContext, handle_command
 from src.config import config
+from src.memory.extractor import MemoryExtractionError
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
 from src.memory.policy import MemoryPolicy
 from src.memory.retriever import MemoryRetriever
 from src.memory.store import MemoryStore
 from src.router import Route
 from src.services.llm_types import ChatResponse
+from tests.runtime import COMPACT_HARD_SECRET_CASES
 
 
 class MemoryCommandsTests(unittest.TestCase):
@@ -63,6 +65,57 @@ class MemoryCommandsTests(unittest.TestCase):
         )
         self.assertTrue(created)
         return claim
+
+    @staticmethod
+    def _valid_extractor_response(value: str = "测试值") -> ChatResponse:
+        return ChatResponse(
+            content=json.dumps(
+                {
+                    "claims": [
+                        {
+                            "subject_ref": "speaker",
+                            "predicate": "remembered_text",
+                            "value": value,
+                            "memory_type": "preference",
+                            "modality": "asserted",
+                            "confidence": "high",
+                            "operation": "add",
+                            "valid_from": None,
+                            "valid_to": None,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    def _explicit_memory_command(
+        self,
+        command: str,
+        *,
+        query: str,
+        renderer,
+    ):
+        is_global = command == "globalremember"
+        return handle_command(
+            Route(
+                handler="command",
+                action="command",
+                command=command,
+                query=query,
+            ),
+            CommandContext(
+                uid="9001" if is_global else "1001",
+                session_key=(
+                    "private:9001" if is_global else "private:1001"
+                ),
+                raw_message=f"/{command} {query}",
+                message_id=f"{command}-failure-contract",
+                is_admin=is_global,
+            ),
+            store=self.store,
+            renderer=renderer,
+        )
 
     def test_context_derives_memory_context_and_admin_status(self):
         ctx = CommandContext(uid="1001", session_key="private:1001", raw_message="/help")
@@ -124,6 +177,205 @@ class MemoryCommandsTests(unittest.TestCase):
         result_mem2 = handle_command(route_mem, cmd_ctx, store=self.store)
         self.assertIn("没有找到", result_mem2.reply)
 
+    def test_deleted_remember_command_cannot_replay_same_claim_dedupe(self):
+        value = "命令回放测试值"
+        extracted = (
+            CandidateClaim(
+                subject_ref="speaker",
+                predicate="remembered_text",
+                value=value,
+                memory_type="preference",
+                modality="asserted",
+                confidence="high",
+            ),
+        )
+        replay_context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/remember {value}",
+            message_id="remember-replay-source",
+        )
+
+        def remember():
+            with mock.patch(
+                "src.commands.MemoryExtractor.extract",
+                return_value=extracted,
+            ):
+                return handle_command(
+                    Route(
+                        handler="command",
+                        action="command",
+                        command="remember",
+                        query=value,
+                    ),
+                    replay_context,
+                    store=self.store,
+                )
+
+        first = remember()
+        claim_id = int(first.outcome.facts[0].partition("=")[2])
+        deleted = handle_command(
+            Route(
+                handler="command",
+                action="command",
+                command="forget",
+                query=str(claim_id),
+            ),
+            CommandContext(
+                uid="1001",
+                session_key="private:1001",
+                raw_message=f"/forget {claim_id}",
+                message_id="forget-remember-replay-source",
+            ),
+            store=self.store,
+        )
+        replay = remember()
+
+        self.assertEqual(
+            ("applied", "deleted", "rejected"),
+            (
+                first.outcome.status,
+                deleted.outcome.status,
+                replay.outcome.status,
+            )
+        )
+        self.assertIsNone(self.store.get_claim(claim_id))
+
+    def test_memories_never_lists_legacy_private_hard_secret(self):
+        secrets = (
+            "sk-legacy-private-command-secret-abcdef123456",
+            *(
+                secret
+                for _label, secret, _raw_value
+                in COMPACT_HARD_SECRET_CASES
+            ),
+        )
+        targets = tuple(
+            self.create_claim(
+                scope_type="private",
+                scope_id="1001",
+                speaker="1001",
+                subject="1001",
+                predicate="fact",
+                value=secret,
+            )
+            for secret in secrets
+        )
+        ordinary = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="fact",
+            value="密码学基础",
+        )
+
+        result = handle_command(
+            Route(
+                handler="command",
+                action="command",
+                command="memories",
+                query="",
+            ),
+            CommandContext(
+                uid="1001",
+                session_key="private:1001",
+                raw_message="/memories",
+                message_id="legacy-private-secret-list",
+            ),
+            store=self.store,
+        )
+
+        self.assertEqual("listed", result.outcome.status)
+        self.assertIn(str(ordinary.id), result.outcome.facts)
+        for target, secret in zip(targets, secrets):
+            with self.subTest(secret=secret):
+                self.assertNotIn(str(target.id), result.outcome.facts)
+                self.assertNotIn(secret, result.reply)
+
+    def test_space_delimited_secret_command_has_no_output_or_storage_leak(self):
+        secret = "PASSWORD_COMMAND_SENTINEL_61E7"
+
+        class RecordingRenderer:
+            def __init__(self):
+                self.facts = None
+                self.fallback = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                self.fallback = fallback
+                return f"persona::{fallback}"
+
+        class RecordingHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.messages = []
+
+            def emit(self, record):
+                self.messages.append(self.format(record))
+
+        renderer = RecordingRenderer()
+        log_handler = RecordingHandler()
+        command_logger = logging.getLogger("qq-bot")
+        command_logger.addHandler(log_handler)
+        try:
+            with mock.patch(
+                "src.commands.MemoryExtractor.extract",
+                return_value=(),
+            ):
+                result = handle_command(
+                    Route(
+                        handler="command",
+                        action="command",
+                        command="remember",
+                        query=f"密码 {secret}",
+                    ),
+                    CommandContext(
+                        uid="1001",
+                        session_key="private:1001",
+                        raw_message=f"/remember 密码 {secret}",
+                        message_id="space-delimited-secret-command",
+                    ),
+                    store=self.store,
+                    renderer=renderer,
+                )
+        finally:
+            command_logger.removeHandler(log_handler)
+
+        self.assertEqual("rejected", result.outcome.status)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            claim_count = connection.execute(
+                "SELECT COUNT(*) FROM memory_claims"
+            ).fetchone()[0]
+            job_count = connection.execute(
+                "SELECT COUNT(*) FROM memory_jobs"
+            ).fetchone()[0]
+        self.assertEqual(0, claim_count)
+        self.assertEqual(0, job_count)
+        leak_surfaces = {
+            "fallback": result.outcome.fallback_reply,
+            "outcome facts": repr(result.outcome.facts),
+            "final reply": result.reply,
+            "renderer facts": repr(renderer.facts),
+            "renderer fallback": renderer.fallback,
+            "logs": "\n".join(log_handler.messages),
+        }
+        for surface, text in leak_surfaces.items():
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, text)
+        sentinel_bytes = secret.encode("utf-8")
+        for database_file in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if database_file.exists():
+                with self.subTest(database_file=database_file.name):
+                    self.assertNotIn(
+                        sentinel_bytes,
+                        database_file.read_bytes(),
+                    )
+
     def test_globalremember_permission_check(self):
         ctx_user = CommandContext(
             uid="regular_user",
@@ -134,6 +386,163 @@ class MemoryCommandsTests(unittest.TestCase):
         route = Route(handler="command", action="command", command="globalremember", query="规则")
         result = handle_command(route, ctx_user, store=self.store)
         self.assertIn("只能由管理员", result.reply)
+
+    def test_explicit_memory_failures_are_classified_and_body_free(self):
+        secret = "USER-MEMORY-BODY-7b1f33"
+
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                return fallback
+
+        class InvalidExtractorModel:
+            def chat(self, _messages, **_kwargs):
+                return ChatResponse(content=f"invalid-{secret}")
+
+        class UnavailableProviderModel:
+            def chat(self, _messages, **_kwargs):
+                raise RuntimeError(f"provider-{secret}")
+
+        class ValidExtractorModel:
+            def chat(self, _messages, **_kwargs):
+                return MemoryCommandsTests._valid_extractor_response(secret)
+
+        cases = (
+            (
+                "extractor_unavailable",
+                InvalidExtractorModel(),
+                None,
+            ),
+            (
+                "provider_unavailable",
+                UnavailableProviderModel(),
+                None,
+            ),
+            (
+                "store_unavailable",
+                ValidExtractorModel(),
+                sqlite3.OperationalError("database is locked"),
+            ),
+        )
+        for command in ("remember", "globalremember"):
+            for cause, model, store_error in cases:
+                with self.subTest(command=command, cause=cause):
+                    renderer = Renderer()
+                    store_patch = (
+                        mock.patch.object(
+                            self.store,
+                            "reconciliation",
+                            side_effect=store_error,
+                        )
+                        if store_error is not None
+                        else mock.patch.object(
+                            self.store,
+                            "reconciliation",
+                            wraps=self.store.reconciliation,
+                        )
+                    )
+                    with (
+                        mock.patch(
+                            "src.memory.extractor.get_memory_llm_client",
+                            return_value=model,
+                        ),
+                        store_patch,
+                    ):
+                        result = self._explicit_memory_command(
+                            command,
+                            query=secret,
+                            renderer=renderer,
+                        )
+
+                    self.assertEqual("failed", result.outcome.status)
+                    self.assertEqual(cause, result.outcome.cause)
+                    self.assertEqual(
+                        ("retryable=true",),
+                        result.outcome.facts,
+                    )
+                    self.assertEqual("failed", renderer.facts.status)
+                    self.assertEqual(cause, renderer.facts.cause)
+                    self.assertEqual(
+                        ("retryable=true",),
+                        renderer.facts.details,
+                    )
+                    self.assertNotIn(
+                        secret,
+                        repr(
+                            (
+                                result.outcome,
+                                renderer.facts,
+                                result.reply,
+                            )
+                        ),
+                    )
+
+    def test_explicit_memory_success_and_rejection_facts_never_include_value(self):
+        secret = "USER-MEMORY-VALUE-8c02e1"
+
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                return fallback
+
+        class ValidExtractorModel:
+            def chat(self, _messages, **_kwargs):
+                return MemoryCommandsTests._valid_extractor_response(secret)
+
+        for command in ("remember", "globalremember"):
+            with self.subTest(command=command, outcome="success"):
+                renderer = Renderer()
+                with mock.patch(
+                    "src.memory.extractor.get_memory_llm_client",
+                    return_value=ValidExtractorModel(),
+                ):
+                    result = self._explicit_memory_command(
+                        command,
+                        query=secret,
+                        renderer=renderer,
+                    )
+                self.assertEqual("applied", result.outcome.status)
+                self.assertNotIn(secret, repr(result.outcome.facts))
+                self.assertNotIn(secret, repr(renderer.facts))
+                self.assertTrue(
+                    all(
+                        fact.startswith("claim_id=")
+                        for fact in result.outcome.facts
+                    )
+                )
+
+            with self.subTest(command=command, outcome="missing_message_id"):
+                renderer = Renderer()
+                is_global = command == "globalremember"
+                result = handle_command(
+                    Route(
+                        handler="command",
+                        action="command",
+                        command=command,
+                        query=secret,
+                    ),
+                    CommandContext(
+                        uid="9001" if is_global else "1001",
+                        session_key=(
+                            "private:9001"
+                            if is_global
+                            else "private:1001"
+                        ),
+                        raw_message=f"/{command} {secret}",
+                        is_admin=is_global,
+                    ),
+                    store=self.store,
+                    renderer=renderer,
+                )
+                self.assertEqual("rejected", result.outcome.status)
+                self.assertEqual((), result.outcome.facts)
+                self.assertNotIn(secret, repr(renderer.facts))
 
     def test_remember_uses_private_or_current_group_scope(self):
         candidate = CandidateClaim(
@@ -753,6 +1162,74 @@ class MemoryCommandsTests(unittest.TestCase):
             connection.close()
         self.assertEqual((target.id, "private_privacy_delete"), audit)
 
+    def test_private_owner_exact_id_can_physically_delete_every_lifecycle(self):
+        for status in (
+            "active",
+            "disputed",
+            "retracted",
+            "superseded",
+            "archived",
+        ):
+            with self.subTest(status=status):
+                target = self.create_claim(
+                    scope_type="private",
+                    scope_id="1001",
+                    speaker="1001",
+                    subject="1001",
+                    predicate=f"delete-{status}",
+                    value=f"private lifecycle {status}",
+                    status=status,
+                )
+                result = handle_command(
+                    Route(
+                        handler="command",
+                        action="command",
+                        command="forget",
+                        query=str(target.id),
+                    ),
+                    CommandContext(
+                        uid="1001",
+                        session_key="private:1001",
+                        raw_message=f"/forget {target.id}",
+                        message_id=f"forget-{status}",
+                    ),
+                    store=self.store,
+                )
+
+                self.assertEqual("deleted", result.outcome.status)
+                self.assertIsNone(self.store.get_claim(target.id))
+
+    def test_admin_exact_id_can_delete_archived_claim_outside_current_scope(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="other-group",
+            speaker="1002",
+            subject="1002",
+            predicate="archived-admin-delete",
+            value="archived administrator target",
+            status="archived",
+        )
+
+        result = handle_command(
+            Route(
+                handler="command",
+                action="command",
+                command="forget",
+                query=str(target.id),
+            ),
+            CommandContext(
+                uid="9001",
+                session_key="private:9001",
+                raw_message=f"/forget {target.id}",
+                message_id="admin-forget-archived",
+                is_admin=True,
+            ),
+            store=self.store,
+        )
+
+        self.assertEqual("deleted", result.outcome.status)
+        self.assertIsNone(self.store.get_claim(target.id))
+
     def test_physical_delete_cleanup_failure_reports_partial_and_is_retryable(self):
         target = self.create_claim(
             scope_type="private",
@@ -852,6 +1329,58 @@ class MemoryCommandsTests(unittest.TestCase):
                 (target.id,),
             ).fetchone()[0]
         self.assertEqual(0, pending_count)
+
+    def test_admin_private_partial_cleanup_can_be_retried_by_owner(self):
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="管理员删除后所有者可重试清理",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+        admin_context = CommandContext(
+            uid="9001",
+            session_key="private:9001",
+            raw_message=f"/forget {target.id}",
+            message_id="admin-private-partial",
+            is_admin=True,
+        )
+
+        with mock.patch.object(
+            self.store,
+            "_checkpoint_wal",
+            side_effect=RuntimeError("active reader"),
+        ):
+            admin_result = handle_command(
+                route,
+                admin_context,
+                store=self.store,
+            )
+
+        self.assertEqual("partial", admin_result.outcome.status)
+        self.assertIsNone(self.store.get_claim(target.id))
+        owner_result = handle_command(
+            route,
+            CommandContext(
+                uid="1001",
+                session_key="private:1001",
+                raw_message=f"/forget {target.id}",
+                message_id="owner-private-cleanup-retry",
+            ),
+            store=MemoryStore(self.db_path),
+        )
+        self.assertEqual("cleanup_completed", owner_result.outcome.status)
+        self.assertEqual(
+            "privacy_cleanup_completed",
+            owner_result.outcome.cause,
+        )
 
     def test_precommit_database_lock_returns_store_unavailable_outcome(self):
         target = self.create_claim(
@@ -1151,6 +1680,8 @@ class MemoryCommandsTests(unittest.TestCase):
             retry_pending = retry_store.delete_claim_physically_with_outcome(
                 target.id,
                 reason="private_privacy_delete",
+                actor_qq="1001",
+                is_admin=False,
             )
         self.assertEqual("partial", retry_pending.status)
         self.assertTrue(retry_pending.row_deleted)
@@ -1255,6 +1786,51 @@ class MemoryCommandsTests(unittest.TestCase):
         result = handle_command(route, context, store=self.store)
 
         self.assertNotIn(private_marker, result.reply)
+
+    def test_group_memories_listing_is_not_starved_by_private_top_results(self):
+        group_claim = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1002",
+            predicate="group_fact",
+            value="GROUP-LISTING-SURVIVES",
+        )
+        self.store.update_claim(
+            group_claim.id,
+            truth_confidence="low",
+            last_confirmed_at="2010-01-01T00:00:00+00:00",
+        )
+        for index in range(20):
+            self.create_claim(
+                scope_type="private",
+                scope_id="1001",
+                speaker="1001",
+                subject="1001",
+                predicate="preferred_name",
+                value=f"昵称{index}",
+            )
+        context = CommandContext(
+            uid="1001",
+            session_key="group:2001:1001",
+            raw_message="/memories",
+            message_id="list-not-starved",
+        )
+
+        result = handle_command(
+            Route(
+                handler="command",
+                action="command",
+                command="memories",
+                query="",
+            ),
+            context,
+            store=self.store,
+        )
+
+        self.assertEqual("listed", result.outcome.status)
+        self.assertIn("GROUP-LISTING-SURVIVES", result.reply)
+        self.assertNotIn("昵称0", result.reply)
 
 
 if __name__ == "__main__":

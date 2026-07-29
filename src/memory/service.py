@@ -37,12 +37,14 @@ class MemoryService:
         self._workers: list[Thread] = []
 
     def start(self, worker_count: int = 2) -> None:
+        started_workers: list[Thread] = []
+        start_error: BaseException | None = None
         with self._lock:
             if self._running:
                 return
-            self._running = True
             self.store.initialize()
             self.store.recover_running_jobs()
+            self.store.recover_staged_jobs()
             try:
                 self.store.cleanup_old_jobs_and_excerpts(days=90)
             except Exception as error:
@@ -50,12 +52,25 @@ class MemoryService:
                     "Memory maintenance failed error_type=%s",
                     type(error).__name__,
                 )
-            self._workers = [
+            workers = [
                 Thread(target=self._worker_loop, daemon=True, name=f"memory-worker-{i}")
                 for i in range(worker_count)
             ]
-            for w in self._workers:
-                w.start()
+            self._workers = workers
+            self._running = True
+            try:
+                for worker in workers:
+                    worker.start()
+                    started_workers.append(worker)
+            except BaseException as error:
+                self._running = False
+                self._workers = []
+                self._cond.notify_all()
+                start_error = error
+        if start_error is not None:
+            for worker in started_workers:
+                worker.join(timeout=2.0)
+            raise start_error
 
     def stop(self) -> None:
         with self._lock:
@@ -116,7 +131,8 @@ class MemoryService:
             row = conn.execute(
                 """
                 SELECT 1 FROM memory_jobs
-                WHERE scope_key = ? AND state IN ('staged', 'ready', 'running')
+                WHERE scope_key = ?
+                  AND state IN ('staged', 'ready', 'running', 'retry')
                 LIMIT 1
                 """,
                 (scope_key,),
@@ -190,13 +206,14 @@ class MemoryService:
                 reply_to_user_id=job.reply_to_user_id,
             )
             candidates = self._extractor.extract(
-                text=job.text,
-                image_data_urls=list(images),
-                mentioned_qq_ids=job.mentioned_qq_ids,
-                reply_to_user_id=job.reply_to_user_id,
+                event,
+                image_data_urls=images,
             )
-            self._policy.apply(event, candidates)
-            self.store.complete_job(job.id)
+            self._policy.apply(
+                event,
+                candidates,
+                complete_job_id=job.id,
+            )
             logger.info("Memory job completed job_id=%s scope_key=%s attempts=%s", job.id, job.scope_key, job.attempts)
         except Exception as err:
             error_type = type(err).__name__

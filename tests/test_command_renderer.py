@@ -7,7 +7,7 @@ from src.commands import CommandContext, handle_command
 from src.commands.renderer import PersonaCommandRenderer, TrustedCommandFacts
 from src.memory.models import CandidateClaim
 from src.memory.store import MemoryStore
-from src.persona import get_persona
+from src.persona import Persona, get_persona
 from src.router import Route
 from src.services.llm_types import ChatResponse
 
@@ -66,6 +66,44 @@ class CommandRendererTests(unittest.TestCase):
         self.assertIn(get_persona().name, reply)
         self.assertIn(fallback, reply)
         self.assertNotIn("claim_id=7", reply)
+
+    def test_complete_persona_reaches_prompt_but_fallback_body_does_not(self):
+        persona_marker = "PERSONA-CONTENT-MARKER-3ea920"
+        private_marker = "USER-MEMORY-SECRET-MARKER-747b16"
+        persona = Persona(
+            name="测试角色",
+            content=(
+                "- 名字：测试角色\n"
+                f"- 语气设定：{persona_marker}\n"
+                "- 回答风格：克制"
+            ),
+        )
+        model = RecordingModel("warm")
+        renderer = PersonaCommandRenderer(model=model)
+        facts = TrustedCommandFacts(
+            code="remember_failed",
+            status="failed",
+            scope="private:1001",
+            cause="provider_unavailable",
+            details=("retryable=true",),
+        )
+
+        with mock.patch(
+            "src.commands.renderer.get_persona",
+            return_value=persona,
+        ):
+            reply = renderer.render(
+                facts,
+                f"确定性回退（{private_marker}）",
+            )
+
+        prompt = "\n".join(
+            str(message["content"])
+            for message in model.messages
+        )
+        self.assertIn(persona_marker, prompt)
+        self.assertNotIn(private_marker, prompt)
+        self.assertIn(private_marker, reply)
 
 
 class CommandRenderingIntegrationTests(unittest.TestCase):

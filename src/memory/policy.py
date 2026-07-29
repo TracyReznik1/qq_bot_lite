@@ -8,6 +8,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from src.memory.models import CandidateClaim, MemoryClaim, MemoryEvent
+from src.memory.privacy import (
+    LearningMode,
+    Sensitivity,
+    classify_sensitive_text,
+    minimal_claim_excerpt,
+)
 from src.memory.store import MemoryStore
 
 
@@ -58,23 +64,6 @@ _HEARSAY_PATTERN = re.compile(
 _UNCERTAINTY_PATTERN = re.compile(
     r"(?:可能|也许|大概|不确定|好像|似乎)"
 )
-_SECRET_PATTERN = re.compile(
-    r"(?:"
-    r"-----BEGIN [^-\r\n]*PRIVATE KEY-----"
-    r"|data:image/[a-z0-9.+-]+;base64,"
-    r"|\bBearer\s+[a-z0-9._~+/=-]+"
-    r"|\bsk-[a-z0-9_-]{8,}"
-    r"|\bgh[pousr]_[a-z0-9]{20,}"
-    r"|\bAKIA[A-Z0-9]{16}\b"
-    r"|(?:api[_ -]?key|secret|access[_ -]?token|"
-    r"payment[_ -]?(?:token|credential)|password|passwd|"
-    r"credential|cookie|otp|authorization|密钥|密码|口令|验证码|"
-    r"支付密码|银行卡号|cvv|cvc)\s*(?:[:=：]|\bis\b|是|为)\s*\S+"
-    r"|(?:iVBORw0KGgo|/9j/|R0lGOD(?:lh|dh)|UklGR)[a-z0-9+/=]{12,}"
-    r")",
-    re.IGNORECASE | re.DOTALL,
-)
-_PAYMENT_NUMBER_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _SENSITIVE_PREDICATE_PARTS = frozenset(
     {
         "address",
@@ -182,8 +171,15 @@ class MemoryPolicy:
         self,
         event: MemoryEvent,
         candidates: tuple[CandidateClaim, ...],
+        *,
+        complete_job_id: int | None = None,
     ) -> tuple[PolicyDecision, ...]:
-        return self._apply(event, candidates)
+        return self._apply(
+            event,
+            candidates,
+            learning_mode=LearningMode.AUTOMATIC,
+            complete_job_id=complete_job_id,
+        )
 
     def apply_command(
         self,
@@ -195,6 +191,11 @@ class MemoryPolicy:
             event,
             candidates,
             allow_implicit_speaker=True,
+            learning_mode=(
+                LearningMode.EXPLICIT_GROUP
+                if event.context.is_group
+                else LearningMode.EXPLICIT_PRIVATE
+            ),
         )
 
     def apply_global_command(
@@ -212,6 +213,7 @@ class MemoryPolicy:
             candidates,
             scope_override=("global", "global"),
             allow_implicit_speaker=True,
+            learning_mode=LearningMode.EXPLICIT_GLOBAL,
         )
 
     def _apply(
@@ -221,15 +223,18 @@ class MemoryPolicy:
         *,
         scope_override: tuple[str, str] | None = None,
         allow_implicit_speaker: bool = False,
+        learning_mode: LearningMode,
+        complete_job_id: int | None = None,
     ) -> tuple[PolicyDecision, ...]:
-        if (
+        reject_all = (
             len(candidates) > MAX_CLAIMS_PER_MESSAGE
             or self._reject_whole_message(event)
-        ):
+        )
+        if reject_all and complete_job_id is None:
             return ()
         decisions: list[PolicyDecision] = []
         with self.store.reconciliation() as transaction:
-            for candidate in candidates:
+            for candidate in (() if reject_all else candidates):
                 if candidate.confidence == "low":
                     continue
                 candidate = self._validated_candidate(candidate)
@@ -251,17 +256,34 @@ class MemoryPolicy:
                 )
                 if subject is None:
                     continue
-                if self.contains_hard_secret(candidate.value):
-                    continue
                 scope_type, scope_id = (
                     event.context.primary_scope
                     if scope_override is None
                     else scope_override
                 )
+                sensitivity = classify_sensitive_text(
+                    f"{candidate.predicate}={candidate.value}"
+                )
+                if sensitivity is Sensitivity.HARD_SECRET:
+                    continue
                 if (
-                    event.context.is_group
-                    and self.is_sensitive_personal(candidate)
+                    sensitivity is Sensitivity.SENSITIVE
+                    and not self._sensitive_candidate_allowed(
+                        event,
+                        subject,
+                        scope_type=scope_type,
+                        learning_mode=learning_mode,
+                    )
                 ):
+                    continue
+                claim_dedupe_key = self._claim_dedupe_key(
+                    event,
+                    candidate,
+                    subject,
+                    scope_type,
+                    scope_id,
+                )
+                if transaction.claim_is_tombstoned(claim_dedupe_key):
                     continue
                 decision = self.decide_against_existing(
                     event,
@@ -269,10 +291,13 @@ class MemoryPolicy:
                     subject,
                     scope_type,
                     scope_id,
+                    learning_mode=learning_mode,
                     ledger=transaction,
                 )
                 if decision is not None:
                     decisions.append(decision)
+            if complete_job_id is not None:
+                transaction.complete_job(complete_job_id)
         return tuple(decisions)
 
     def resolve_subject(
@@ -333,19 +358,43 @@ class MemoryPolicy:
 
     @staticmethod
     def contains_hard_secret(value: str) -> bool:
-        text = str(value or "")
-        if _SECRET_PATTERN.search(text):
-            return True
-        return any(
-            _passes_luhn(match.group(0))
-            for match in _PAYMENT_NUMBER_PATTERN.finditer(text)
+        return (
+            classify_sensitive_text(value)
+            is Sensitivity.HARD_SECRET
         )
 
     @staticmethod
     def is_sensitive_personal(candidate: CandidateClaim) -> bool:
-        predicate = candidate.predicate.casefold()
-        return any(
-            part in predicate for part in _SENSITIVE_PREDICATE_PARTS
+        return (
+            classify_sensitive_text(
+                f"{candidate.predicate}={candidate.value}"
+            )
+            is Sensitivity.SENSITIVE
+        )
+
+    @staticmethod
+    def _sensitive_candidate_allowed(
+        event: MemoryEvent,
+        subject: _ResolvedSubject,
+        *,
+        scope_type: str,
+        learning_mode: LearningMode,
+    ) -> bool:
+        if (
+            learning_mode is LearningMode.EXPLICIT_GROUP
+            and event.context.is_group
+            and scope_type == "group"
+        ):
+            return True
+        return (
+            scope_type == "private"
+            and subject.subject_type == "qq_user"
+            and subject.subject_id == str(event.context.user_id)
+            and learning_mode
+            in {
+                LearningMode.AUTOMATIC,
+                LearningMode.EXPLICIT_PRIVATE,
+            }
         )
 
     def decide_against_existing(
@@ -356,6 +405,7 @@ class MemoryPolicy:
         scope_type: str,
         scope_id: str,
         *,
+        learning_mode: LearningMode = LearningMode.AUTOMATIC,
         ledger=None,
     ) -> PolicyDecision | None:
         ledger = self.store if ledger is None else ledger
@@ -405,6 +455,7 @@ class MemoryPolicy:
                 scope_type,
                 scope_id,
                 status="retracted",
+                learning_mode=learning_mode,
                 ledger=ledger,
             )
             closed_at = candidate.valid_to or _utc_now()
@@ -453,9 +504,15 @@ class MemoryPolicy:
             if exact_archived is not None:
                 ledger.add_evidence(
                     exact_archived.id,
-                    source_kind=f"message:{subject.source}",
+                    source_kind=_source_kind(
+                        learning_mode,
+                        subject.source,
+                    ),
                     source_message_id=event.message_id,
-                    source_excerpt=event.text,
+                    source_excerpt=minimal_claim_excerpt(
+                        event,
+                        candidate,
+                    ),
                 )
                 archived = exact_archived
             elif (
@@ -472,14 +529,21 @@ class MemoryPolicy:
                     scope_type,
                     scope_id,
                     status="archived",
+                    learning_mode=learning_mode,
                     ledger=ledger,
                 )
             else:
                 ledger.add_evidence(
                     exact_same_speaker.id,
-                    source_kind=f"message:{subject.source}",
+                    source_kind=_source_kind(
+                        learning_mode,
+                        subject.source,
+                    ),
                     source_message_id=event.message_id,
-                    source_excerpt=event.text,
+                    source_excerpt=minimal_claim_excerpt(
+                        event,
+                        candidate,
+                    ),
                 )
                 archived = ledger.update_claim(
                     exact_same_speaker.id,
@@ -499,9 +563,15 @@ class MemoryPolicy:
         if exact_same_speaker is not None:
             ledger.add_evidence(
                 exact_same_speaker.id,
-                source_kind=f"message:{subject.source}",
+                source_kind=_source_kind(
+                    learning_mode,
+                    subject.source,
+                ),
                 source_message_id=event.message_id,
-                source_excerpt=event.text,
+                source_excerpt=minimal_claim_excerpt(
+                    event,
+                    candidate,
+                ),
             )
             confirmed = ledger.update_claim(
                 exact_same_speaker.id,
@@ -559,6 +629,7 @@ class MemoryPolicy:
             scope_type,
             scope_id,
             status=status,
+            learning_mode=learning_mode,
             ledger=ledger,
         )
 
@@ -783,6 +854,7 @@ class MemoryPolicy:
         scope_id: str,
         *,
         status: str = "active",
+        learning_mode: LearningMode = LearningMode.AUTOMATIC,
         ledger=None,
     ) -> MemoryClaim:
         ledger = self.store if ledger is None else ledger
@@ -796,6 +868,54 @@ class MemoryPolicy:
             if memory_type == "preferred_name"
             else candidate.valid_to
         )
+        dedupe_key = self._claim_dedupe_key(
+            event,
+            candidate,
+            subject,
+            scope_type,
+            scope_id,
+        )
+        claim, _created = ledger.create_claim(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            speaker_qq=str(event.context.user_id),
+            subject_type=subject.subject_type,
+            subject_id=subject.subject_id,
+            predicate=candidate.predicate,
+            value=candidate.value,
+            memory_type=memory_type,
+            modality=candidate.modality,
+            source_kind=_source_kind(
+                learning_mode,
+                subject.source,
+            ),
+            source_message_id=event.message_id,
+            source_excerpt=minimal_claim_excerpt(
+                event,
+                candidate,
+            ),
+            extraction_confidence=candidate.confidence,
+            attribution_confidence=subject.confidence,
+            truth_confidence=self._truth_confidence(
+                event,
+                candidate,
+                subject,
+            ),
+            dedupe_key=dedupe_key,
+            status=status,
+            valid_from=candidate.valid_from,
+            valid_to=valid_to,
+        )
+        return claim
+
+    @staticmethod
+    def _claim_dedupe_key(
+        event: MemoryEvent,
+        candidate: CandidateClaim,
+        subject: _ResolvedSubject,
+        scope_type: str,
+        scope_id: str,
+    ) -> str:
         dedupe_body = "\0".join(
             (
                 scope_type,
@@ -810,35 +930,9 @@ class MemoryPolicy:
                 event.message_id,
             )
         )
-        dedupe_key = "policy:" + hashlib.sha256(
+        return "policy:" + hashlib.sha256(
             dedupe_body.encode("utf-8")
         ).hexdigest()
-        claim, _created = ledger.create_claim(
-            scope_type=scope_type,
-            scope_id=scope_id,
-            speaker_qq=str(event.context.user_id),
-            subject_type=subject.subject_type,
-            subject_id=subject.subject_id,
-            predicate=candidate.predicate,
-            value=candidate.value,
-            memory_type=memory_type,
-            modality=candidate.modality,
-            source_kind=f"message:{subject.source}",
-            source_message_id=event.message_id,
-            source_excerpt=event.text,
-            extraction_confidence=candidate.confidence,
-            attribution_confidence=subject.confidence,
-            truth_confidence=self._truth_confidence(
-                event,
-                candidate,
-                subject,
-            ),
-            dedupe_key=dedupe_key,
-            status=status,
-            valid_from=candidate.valid_from,
-            valid_to=valid_to,
-        )
-        return claim
 
     @staticmethod
     def _truth_confidence(
@@ -880,6 +974,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _source_kind(
+    learning_mode: LearningMode,
+    attribution_source: str,
+) -> str:
+    if learning_mode is LearningMode.AUTOMATIC:
+        return f"message:{attribution_source}"
+    return (
+        f"command:{learning_mode.value}:"
+        f"{attribution_source}"
+    )
+
+
 def _confidence_rank(value: str) -> int:
     return {"low": 0, "medium": 1, "high": 2}.get(value, 0)
 
@@ -894,21 +1000,6 @@ def _claim_can_close_at(claim: MemoryClaim, valid_to: str) -> bool:
     return datetime.fromisoformat(normalized_start) <= datetime.fromisoformat(
         valid_to
     )
-
-
-def _passes_luhn(value: str) -> bool:
-    digits = [int(character) for character in value if character.isdigit()]
-    if not 13 <= len(digits) <= 19:
-        return False
-    checksum = 0
-    parity = len(digits) % 2
-    for index, digit in enumerate(digits):
-        if index % 2 == parity:
-            digit *= 2
-            if digit > 9:
-                digit -= 9
-        checksum += digit
-    return checksum % 10 == 0
 
 
 def _unquoted_text(value: str) -> str:

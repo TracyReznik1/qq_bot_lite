@@ -11,7 +11,7 @@ from src.chat.chat_service import generate_reply
 from src.commands import CommandContext, handle_command
 from src.commands.renderer import PersonaCommandRenderer
 from src.config import BASE_DIR, config
-from src.persona import get_persona
+from src.persona import PersonaConfigurationError, get_persona
 from src.messaging import (
     MessageQueue,
     enqueue_message,
@@ -115,7 +115,11 @@ def startup() -> None:
                 config.data_dir,
                 config.history_turns,
             )
-        get_memory_service().start()
+        memory_service = get_memory_service()
+        memory_service.start()
+        message_queue.ensure_sequence_at_least(
+            memory_service.store.max_job_sequence()
+        )
         _startup_initialized = True
 
 
@@ -347,7 +351,7 @@ def _process_message(data: dict[str, Any]) -> None:
     except ImageRecognitionUnavailable as error:
         logger.info("Image recognition unavailable session_key=%s", session_key)
         send_reply(target_id, str(error), is_group)
-    except RuntimeError as error:
+    except PersonaConfigurationError as error:
         logger.error(
             "Configuration error error_type=%s",
             type(error).__name__,

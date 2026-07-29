@@ -34,6 +34,15 @@ def image_messages():
 
 
 class LlmImageFallbackTests(unittest.TestCase):
+    def setUp(self):
+        service_patch = mock.patch.object(
+            main,
+            "get_memory_service",
+            return_value=mock.Mock(stage_event=mock.Mock(return_value=1)),
+        )
+        service_patch.start()
+        self.addCleanup(service_patch.stop)
+
     def test_provider_failures_log_error_classes_without_exception_bodies(self):
         for error in (
             RuntimeError("runtime-secret-sentinel"),

@@ -8,6 +8,7 @@ from unittest import mock
 
 from src.chat.prompt import build_system_prompt
 from src.memory.models import (
+    CandidateClaim,
     MemoryClaim,
     MemoryContext,
     MemoryEvent,
@@ -16,6 +17,7 @@ from src.memory.models import (
 from src.memory.store import MemoryStore
 from src.memory.policy import MemoryPolicy
 from src.memory.retriever import MemoryRetriever, format_memory_context
+from tests.runtime import COMPACT_HARD_SECRET_CASES
 
 
 def _utc_now_offset(seconds: int = 0) -> str:
@@ -84,14 +86,251 @@ class MemoryRetrievalTests(unittest.TestCase):
         )
         return claim
 
-    def test_default_retriever_uses_config_memory_database_path(self):
-        expected_path = Path(self.temp_dir) / "configured" / "memory.sqlite3"
-        fake_config = SimpleNamespace(memory_database_path=expected_path)
-
-        with mock.patch("src.memory.retriever.config", fake_config):
+    def test_default_retriever_reuses_runtime_store_without_initializing(self):
+        runtime_service = SimpleNamespace(store=self.store)
+        with (
+            mock.patch(
+                "src.memory.service.get_memory_service",
+                return_value=runtime_service,
+            ),
+            mock.patch.object(
+                MemoryStore,
+                "initialize",
+                side_effect=AssertionError(
+                    "runtime retrieval must not initialize a store"
+                ),
+            ),
+        ):
             retriever = MemoryRetriever()
 
-        self.assertEqual(expected_path, retriever.store.path)
+        self.assertIs(self.store, retriever.store)
+
+    def test_normal_lexical_query_uses_authorized_fts_api(self):
+        self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "苹果",
+            memory_type="preference",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        with mock.patch.object(
+            self.store,
+            "search_authorized_claims",
+            wraps=self.store.search_authorized_claims,
+        ) as search:
+            results = self.retriever.retrieve(context, "苹果")
+
+        search.assert_called()
+        self.assertIn("苹果", [result.claim.value for result in results])
+
+    def test_legacy_private_hard_secret_is_rejected_at_runtime(self):
+        secrets = (
+            "sk-legacy-private-secret-abcdef123456",
+            *(
+                secret
+                for _label, secret, _raw_value
+                in COMPACT_HARD_SECRET_CASES
+            ),
+        )
+        secret_claims = tuple(
+            self._create_claim(
+                "private",
+                "1001",
+                "1001",
+                "1001",
+                "fact",
+                secret,
+            )
+            for secret in secrets
+        )
+        ordinary = self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "fact",
+            "密码学基础",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        results = self.retriever.retrieve(context, "", limit=50)
+        formatted = format_memory_context(results)
+
+        result_ids = {result.claim.id for result in results}
+        self.assertIn(ordinary.id, result_ids)
+        for claim, secret in zip(secret_claims, secrets):
+            with self.subTest(secret=secret):
+                self.assertNotIn(claim.id, result_ids)
+                self.assertNotIn(secret, formatted)
+
+    def test_old_reserved_preference_and_name_survive_high_cardinality(self):
+        old_time = _utc_now_offset(-86400 * 3650)
+        old_preference = self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "likes",
+            "苹果",
+            memory_type="preference",
+        )
+        old_name = self._create_claim(
+            "private",
+            "1001",
+            "1001",
+            "1001",
+            "preferred_name",
+            "安安",
+            memory_type="preferred_name",
+        )
+        self.store.update_claim(
+            old_preference.id,
+            last_confirmed_at=old_time,
+        )
+        self.store.update_claim(old_name.id, last_confirmed_at=old_time)
+        for index in range(24):
+            self._create_claim(
+                "private",
+                "1001",
+                "1001",
+                "1001",
+                f"unrelated_{index}",
+                f"较新的无关事实-{index}",
+                memory_type="fact",
+            )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="private:1001",
+            is_group=False,
+        )
+
+        preference_ids = {
+            result.claim.id
+            for result in self.retriever.retrieve(
+                context,
+                "我喜欢什么",
+                limit=12,
+            )
+        }
+        name_ids = {
+            result.claim.id
+            for result in self.retriever.retrieve(
+                context,
+                "我叫什么",
+                limit=12,
+            )
+        }
+
+        self.assertIn(old_preference.id, preference_ids)
+        self.assertIn(old_name.id, name_ids)
+
+    def test_disputed_selection_includes_complete_relation_closure(self):
+        first = self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "bot",
+            "color",
+            "红色-marker",
+            status="disputed",
+        )
+        counterpart = self._create_claim(
+            "group",
+            "2001",
+            "1002",
+            "bot",
+            "color",
+            "蓝色-counterpart",
+            status="disputed",
+        )
+        self.store.add_relation(
+            first.id,
+            counterpart.id,
+            "contradicts",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(
+            context,
+            "红色-marker",
+            limit=2,
+        )
+        ids = {result.claim.id for result in results}
+        formatted = format_memory_context(results)
+
+        self.assertEqual({first.id, counterpart.id}, ids)
+        self.assertTrue(
+            all(
+                "contradicts" in result.relation_types
+                for result in results
+            )
+        )
+        self.assertIn("status=disputed", formatted)
+        self.assertIn("发言者=1001", formatted)
+        self.assertIn("发言者=1002", formatted)
+
+    def test_conflict_group_larger_than_limit_is_omitted_whole(self):
+        claims = [
+            self._create_claim(
+                "group",
+                "2001",
+                str(1001 + index),
+                "bot",
+                "color",
+                (
+                    "红色-large-conflict"
+                    if index == 0
+                    else f"counterpart-{index}"
+                ),
+                status="disputed",
+            )
+            for index in range(3)
+        ]
+        self.store.add_relation(
+            claims[0].id,
+            claims[1].id,
+            "contradicts",
+        )
+        self.store.add_relation(
+            claims[1].id,
+            claims[2].id,
+            "contradicts",
+        )
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+
+        results = self.retriever.retrieve(
+            context,
+            "红色-large-conflict",
+            limit=2,
+        )
+
+        self.assertTrue(
+            {claim.id for claim in claims}.isdisjoint(
+                result.claim.id for result in results
+            )
+        )
 
     def test_private_scope_isolation_user_a_and_user_b(self):
         # User A private claim
@@ -213,6 +452,94 @@ class MemoryRetrievalTests(unittest.TestCase):
         # Sender's preferred name should be in personalization results
         p_values = [r.claim.value for r in personalization_results]
         self.assertIn("安安", p_values)
+
+    def test_group_personalization_rejects_mislabeled_sensitive_old_claims(self):
+        unsafe_values = (
+            ("preferred_name", "身份证号 110101199001011234"),
+            ("response_style", "北京市朝阳区建国路88号"),
+            ("preferred_name", "HIV阳性"),
+            ("response_style", "我是小明的妻子"),
+            ("preferred_name", "https://example.invalid/private-profile"),
+            ("response_style", "第一行\n第二行"),
+            ("preferred_name", "很长的任意个人资料" * 20),
+        )
+        for predicate, value in unsafe_values:
+            self._create_claim(
+                "private",
+                "1001",
+                "1001",
+                "1001",
+                predicate,
+                value,
+                memory_type=(
+                    "preferred_name"
+                    if predicate == "preferred_name"
+                    else "preference"
+                ),
+            )
+
+        context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+        results = self.retriever.retrieve(context, "")
+        formatted = format_memory_context(results)
+
+        for _predicate, value in unsafe_values:
+            with self.subTest(value=value):
+                self.assertNotIn(
+                    value,
+                    [result.claim.value for result in results],
+                )
+                self.assertNotIn(value, formatted)
+
+    def test_retrieval_filters_old_automatic_sensitive_group_claim_but_keeps_explicit(self):
+        automatic_value = "北京市朝阳区建国路66号"
+        explicit_value = "北京市朝阳区建国路88号"
+        self._create_claim(
+            "group",
+            "2001",
+            "1001",
+            "1001",
+            "fact",
+            automatic_value,
+        )
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="1001",
+                session_key="group:2001:1001",
+                is_group=True,
+                group_id="2001",
+            ),
+            message_id="explicit-sensitive-group",
+            sequence=1,
+            text=f"请在本群记住：我的住址是{explicit_value}",
+        )
+        decisions = self.policy.apply_command(
+            event,
+            (
+                CandidateClaim(
+                    subject_ref="speaker",
+                    predicate="fact",
+                    value=explicit_value,
+                    memory_type="fact",
+                    modality="asserted",
+                    confidence="high",
+                ),
+            ),
+        )
+        self.assertEqual(1, len(decisions))
+
+        results = self.retriever.retrieve(
+            event.context,
+            "住址",
+        )
+        values = [result.claim.value for result in results]
+
+        self.assertNotIn(automatic_value, values)
+        self.assertIn(explicit_value, values)
 
     def test_group_prompt_never_exposes_private_identity_as_evidence(self):
         self._create_claim(

@@ -3,13 +3,15 @@ from dataclasses import dataclass
 from typing import Callable
 
 from src.config import config
-from src.memory.extractor import MemoryExtractor
+from src.memory.extractor import MemoryExtractionError, MemoryExtractor
 from src.memory.models import CandidateClaim, MemoryClaim, MemoryContext, MemoryEvent
 from src.memory.policy import MemoryPolicy
-from src.memory.retriever import MemoryRetriever
+from src.memory.privacy import (
+    claim_contains_hard_secret,
+    shared_claim_is_safe,
+)
 from src.memory.service import get_memory_service
 from src.memory.store import MemoryStore
-from src.persona import get_persona
 from src.router import Route
 
 from .help import help_text
@@ -113,6 +115,36 @@ def _reset_command(_query: str, context: CommandContext, _store: MemoryStore) ->
     return CommandResult(handled=True, reply=reply, outcome=outcome)
 
 
+def _explicit_memory_failure(
+    *,
+    global_memory: bool,
+    scope: str,
+    cause: str,
+) -> CommandResult:
+    subject = "全局记忆" if global_memory else "记忆"
+    reply = (
+        f"{subject}服务暂时不可用，本次未写入：scope={scope}；"
+        f"status=failed；cause={cause}。请稍后重试。"
+    )
+    outcome = CommandOutcome(
+        code=(
+            "global_remember_failed"
+            if global_memory
+            else "remember_failed"
+        ),
+        facts=("retryable=true",),
+        fallback_reply=reply,
+        status="failed",
+        scope=scope,
+        cause=cause,
+    )
+    return CommandResult(
+        handled=True,
+        reply=outcome.fallback_reply,
+        outcome=outcome,
+    )
+
+
 def _remember_command(query: str, context: CommandContext, store: MemoryStore) -> CommandResult:
     text = query.strip()
     if not text:
@@ -133,7 +165,7 @@ def _remember_command(query: str, context: CommandContext, store: MemoryStore) -
         )
         outcome = CommandOutcome(
             code="remember_rejected",
-            facts=(text,),
+            facts=(),
             fallback_reply=reply,
             status="rejected",
             scope=_context_scope(context),
@@ -147,8 +179,22 @@ def _remember_command(query: str, context: CommandContext, store: MemoryStore) -
         message_id=context.message_id,
         sequence=0,
     )
-    extractor = MemoryExtractor()
-    candidates = extractor.extract(event)
+    scope = _context_scope(context)
+    try:
+        extractor = MemoryExtractor()
+        candidates = extractor.extract(event)
+    except MemoryExtractionError:
+        return _explicit_memory_failure(
+            global_memory=False,
+            scope=scope,
+            cause="extractor_unavailable",
+        )
+    except RuntimeError:
+        return _explicit_memory_failure(
+            global_memory=False,
+            scope=scope,
+            cause="provider_unavailable",
+        )
     if not candidates:
         candidates = [
             CandidateClaim(
@@ -162,8 +208,14 @@ def _remember_command(query: str, context: CommandContext, store: MemoryStore) -
         ]
 
     policy = MemoryPolicy(store)
-    decisions = policy.apply_command(event, tuple(candidates))
-    scope = _context_scope(context)
+    try:
+        decisions = policy.apply_command(event, tuple(candidates))
+    except sqlite3.Error:
+        return _explicit_memory_failure(
+            global_memory=False,
+            scope=scope,
+            cause="store_unavailable",
+        )
     if not decisions:
         reply = (
             f"未写入记忆：scope={scope}；"
@@ -171,7 +223,7 @@ def _remember_command(query: str, context: CommandContext, store: MemoryStore) -
         )
         outcome = CommandOutcome(
             code="remember_rejected",
-            facts=(text,),
+            facts=(),
             fallback_reply=reply,
             status="rejected",
             scope=scope,
@@ -190,7 +242,10 @@ def _remember_command(query: str, context: CommandContext, store: MemoryStore) -
     )
     outcome = CommandOutcome(
         code="remembered",
-        facts=(text, *(str(decision.claim_id) for decision in decisions)),
+        facts=tuple(
+            f"claim_id={decision.claim_id}"
+            for decision in decisions
+        ),
         fallback_reply=reply,
         status="applied",
         scope=scope,
@@ -231,7 +286,7 @@ def _global_remember_command(query: str, context: CommandContext, store: MemoryS
         )
         outcome = CommandOutcome(
             code="global_remember_rejected",
-            facts=(text,),
+            facts=(),
             fallback_reply=reply,
             status="rejected",
             scope="global:global",
@@ -245,8 +300,21 @@ def _global_remember_command(query: str, context: CommandContext, store: MemoryS
         message_id=context.message_id,
         sequence=0,
     )
-    extractor = MemoryExtractor()
-    candidates = extractor.extract(event)
+    try:
+        extractor = MemoryExtractor()
+        candidates = extractor.extract(event)
+    except MemoryExtractionError:
+        return _explicit_memory_failure(
+            global_memory=True,
+            scope="global:global",
+            cause="extractor_unavailable",
+        )
+    except RuntimeError:
+        return _explicit_memory_failure(
+            global_memory=True,
+            scope="global:global",
+            cause="provider_unavailable",
+        )
     if not candidates:
         candidates = [
             CandidateClaim(
@@ -260,11 +328,18 @@ def _global_remember_command(query: str, context: CommandContext, store: MemoryS
         ]
 
     policy = MemoryPolicy(store)
-    decisions = policy.apply_global_command(
-        event,
-        tuple(candidates),
-        authorized=context.is_admin,
-    )
+    try:
+        decisions = policy.apply_global_command(
+            event,
+            tuple(candidates),
+            authorized=context.is_admin,
+        )
+    except sqlite3.Error:
+        return _explicit_memory_failure(
+            global_memory=True,
+            scope="global:global",
+            cause="store_unavailable",
+        )
     if not decisions:
         reply = (
             "未写入全局记忆：scope=global:global；"
@@ -272,7 +347,7 @@ def _global_remember_command(query: str, context: CommandContext, store: MemoryS
         )
         outcome = CommandOutcome(
             code="global_remember_rejected",
-            facts=(text,),
+            facts=(),
             fallback_reply=reply,
             status="rejected",
             scope="global:global",
@@ -291,7 +366,10 @@ def _global_remember_command(query: str, context: CommandContext, store: MemoryS
     )
     outcome = CommandOutcome(
         code="remembered_global",
-        facts=(text, *(str(decision.claim_id) for decision in decisions)),
+        facts=tuple(
+            f"claim_id={decision.claim_id}"
+            for decision in decisions
+        ),
         fallback_reply=reply,
         status="applied",
         scope="global:global",
@@ -306,15 +384,32 @@ def _context_scope(context: CommandContext) -> str:
 
 
 def _memories_command(query: str, context: CommandContext, store: MemoryStore) -> CommandResult:
-    retriever = MemoryRetriever(store)
-    results = retriever.retrieve(context.memory_context, query=query.strip())
-    if context.memory_context.is_group:
-        results = tuple(
-            item
-            for item in results
-            if item.claim.scope_type != "private"
+    claims = store.list_authorized_claims(
+        context.memory_context,
+        include_private_personalization=False,
+    )
+    claims = tuple(
+        claim
+        for claim in claims
+        if (
+            not claim_contains_hard_secret(claim)
+            and (
+                claim.scope_type not in {"group", "global"}
+                or shared_claim_is_safe(claim)
+            )
         )
-    if not results:
+    )
+    query_text = query.strip().casefold()
+    if query_text:
+        claims = tuple(
+            claim
+            for claim in claims
+            if (
+                query_text in claim.value.casefold()
+                or query_text in claim.predicate.casefold()
+            )
+        )
+    if not claims:
         reply = "没有找到相关记忆。"
         outcome = CommandOutcome(
             code="memories_empty",
@@ -328,9 +423,12 @@ def _memories_command(query: str, context: CommandContext, store: MemoryStore) -
 
     lines = ["【允许使用的记忆列表】"]
     facts = []
-    for i, item in enumerate(results, 1):
-        lines.append(f"{i}. [{item.claim.memory_type}] {item.claim.predicate}: {item.claim.value} (ID: {item.claim.id})")
-        facts.append(str(item.claim.id))
+    for i, claim in enumerate(claims, 1):
+        lines.append(
+            f"{i}. [{claim.memory_type}] {claim.predicate}: "
+            f"{claim.value} (ID: {claim.id})"
+        )
+        facts.append(str(claim.id))
 
     reply = "\n".join(lines)
     outcome = CommandOutcome(
@@ -347,9 +445,16 @@ def _memories_command(query: str, context: CommandContext, store: MemoryStore) -
 def _claim_is_permitted(
     context: CommandContext,
     claim: MemoryClaim,
+    *,
+    include_noncurrent: bool = False,
 ) -> bool:
-    if claim.status not in {"active", "disputed"}:
+    if (
+        not include_noncurrent
+        and claim.status not in {"active", "disputed"}
+    ):
         return False
+    if context.is_admin:
+        return True
     if context.memory_context.is_group:
         return (
             claim.scope_type == "group"
@@ -446,7 +551,11 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
     try:
         if target.isdigit():
             exact = store.get_claim(int(target))
-            if exact is not None and _claim_is_permitted(context, exact):
+            if exact is not None and _claim_is_permitted(
+                context,
+                exact,
+                include_noncurrent=True,
+            ):
                 matched_claims = [exact]
             elif exact is None:
                 retry = store.retry_pending_delete_cleanup(
@@ -506,7 +615,7 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
         reply = "未找到匹配的记忆。"
         outcome = CommandOutcome(
             code="not_found",
-            facts=(target,),
+            facts=(),
             fallback_reply=reply,
             status="not_found",
             scope=_context_scope(context),
@@ -533,6 +642,8 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
             deletion = store.delete_claim_physically_with_outcome(
                 target_claim.id,
                 reason="administrator_delete",
+                actor_qq=context.uid,
+                is_admin=context.is_admin,
             )
         except sqlite3.Error:
             return _store_unavailable_forget_result(
@@ -593,6 +704,8 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
             deletion = store.delete_claim_physically_with_outcome(
                 target_claim.id,
                 reason="private_privacy_delete",
+                actor_qq=context.uid,
+                is_admin=context.is_admin,
             )
         except sqlite3.Error:
             return _store_unavailable_forget_result(
@@ -782,7 +895,7 @@ def handle_command(
         )
         outcome = CommandOutcome(
             code="unknown",
-            facts=(command_text,),
+            facts=(),
             fallback_reply=reply,
             status="unsupported",
             cause="unknown_command",

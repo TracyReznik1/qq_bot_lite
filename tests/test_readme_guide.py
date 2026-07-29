@@ -147,6 +147,39 @@ class ReadmeGuideTests(unittest.TestCase):
         self.assertIn("### 401 Unauthorized", faq)
         self.assertIn("qqbot → OneBot 请求方向：`ONEBOT_ACCESS_TOKEN`", faq)
 
+    def test_readme_documents_structured_memory_runtime_boundaries(self):
+        memory = readme_section(
+            self.readme,
+            "数据、历史与结构化记忆",
+        )
+        for fact in (
+            "额外的后台模型调用",
+            "最终一致",
+            "SQLite 持久化",
+            "纠正",
+            "撤回",
+            "争议",
+            "物理删除",
+            "私聊个性化",
+            "敏感信息",
+            "显式群记忆",
+            "图片只在当前进程内短暂保留",
+            "旧版 JSON 记忆",
+        ):
+            with self.subTest(fact=fact):
+                self.assertIn(fact, memory)
+        self.assertNotIn("普通聊天回复成功后", memory)
+        self.assertIn("该轮回复处理结束后", memory)
+
+        concurrency = readme_section(self.readme, "多会话并发")
+        self.assertIn("聊天回复队列", concurrency)
+        self.assertIn("进程内", concurrency)
+        self.assertIn("记忆学习任务", concurrency)
+        self.assertIn("SQLite", concurrency)
+
+        limitations = readme_section(self.readme, "运行限制")
+        self.assertNotIn("不是带持久任务队列", limitations)
+
     def test_readme_documents_chat_models_and_native_gemini(self):
         reference = readme_section(
             self.readme,

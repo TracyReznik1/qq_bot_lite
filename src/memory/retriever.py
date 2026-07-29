@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Sequence
 
-from src.config import config
 from src.memory.models import MemoryClaim, MemoryContext, RetrievedMemory
+from src.memory.privacy import (
+    claim_contains_hard_secret,
+    safe_group_personalization,
+    shared_claim_is_safe,
+)
 from src.memory.store import MemoryStore
 
 
@@ -20,15 +25,13 @@ _QUERY_PREDICATE_MARKERS = {
 }
 
 
-def _get_default_store() -> MemoryStore:
-    store = MemoryStore(config.memory_database_path)
-    store.initialize()
-    return store
-
-
 class MemoryRetriever:
     def __init__(self, store: MemoryStore | None = None) -> None:
-        self.store = store or _get_default_store()
+        if store is None:
+            from src.memory.service import get_memory_service
+
+            store = get_memory_service().store
+        self.store = store
 
     def retrieve(
         self,
@@ -42,109 +45,100 @@ class MemoryRetriever:
         user_id = str(context.user_id)
         now_utc = datetime.now(timezone.utc)
         predicate_hints = _predicate_hints(query_text)
+        resolved_subject = self._resolve_query_subject(
+            context,
+            query_text,
+            now_utc,
+        )
+        if (
+            resolved_subject is None
+            and predicate_hints
+            and "我" in "".join(query_text.split())
+        ):
+            resolved_subject = user_id
 
+        candidate_limit = max(limit * 4, 32)
+        base_claims = _current_claims(
+            self.store.search_authorized_claims(
+                context,
+                query_text,
+                limit=candidate_limit,
+            ),
+            now_utc,
+        )
+        structured_claims = _current_claims(
+            self.store.search_authorized_claims(
+                context,
+                "",
+                limit=candidate_limit,
+            ),
+            now_utc,
+        )
+        reserved_predicates = _reserved_predicates_for_query(
+            predicate_hints,
+            include_defaults=not query_text,
+            include_group_personalization=context.is_group,
+        )
+        reserved_claims = _current_claims(
+            self.store.find_reserved_authorized_claims(
+                context,
+                predicates=reserved_predicates,
+                subject_id=resolved_subject,
+                limit=max(limit * 2, 24),
+            ),
+            now_utc,
+        )
+        raw_claims: list[MemoryClaim] = [
+            *base_claims,
+            *structured_claims,
+            *reserved_claims,
+        ]
+
+        fallback_ids: set[int] = set()
         if context.is_group:
-            group_id = str(context.group_id or "")
-            group_claims = _current_claims(
-                self.store.find_claims_exact(
-                    scope_type="group",
-                    scope_id=group_id,
-                    statuses=_CURRENT_STATUSES,
-                ),
-                now_utc,
-            )
-            global_claims = _attributed_global_claims(
-                self.store.find_claims_exact(
-                    scope_type="global",
-                    scope_id="global",
-                    statuses=_CURRENT_STATUSES,
-                ),
-                now_utc,
-            )
-            private_claims = _current_claims(
-                self.store.find_claims_exact(
-                    scope_type="private",
-                    scope_id=user_id,
-                    statuses=_CURRENT_STATUSES,
-                    subject_type="qq_user",
-                    subject_id=user_id,
-                ),
-                now_utc,
-            )
             private_personalization = tuple(
                 claim
-                for claim in private_claims
-                if _is_group_safe_personalization(claim)
+                for claim in raw_claims
+                if claim.scope_type == "private"
+                and _is_group_safe_personalization(claim)
             )
             fallback_ids = self._group_personalization_fallback_ids(
-                group_id=group_id,
+                group_id=str(context.group_id or ""),
                 user_id=user_id,
                 private_personalization=private_personalization,
                 now_utc=now_utc,
             )
-            candidates = [
-                (
-                    claim,
-                    "personalization"
-                    if claim.id in fallback_ids
-                    else "evidence",
-                )
-                for claim in group_claims
-            ]
-            candidates.extend((claim, "evidence") for claim in global_claims)
-            candidates.extend(
-                (claim, "personalization")
-                for claim in private_personalization
-            )
+            for claim_id in fallback_ids:
+                fallback_claim = self.store.get_claim(claim_id)
+                if fallback_claim is not None:
+                    raw_claims.append(fallback_claim)
         else:
-            private_claims = _current_claims(
-                self.store.find_claims_exact(
-                    scope_type="private",
-                    scope_id=user_id,
-                    statuses=_CURRENT_STATUSES,
-                ),
-                now_utc,
+            private_claims = tuple(
+                claim
+                for claim in raw_claims
+                if claim.scope_type == "private"
             )
-            global_claims = _attributed_global_claims(
-                self.store.find_claims_exact(
-                    scope_type="global",
-                    scope_id="global",
-                    statuses=_CURRENT_STATUSES,
-                ),
-                now_utc,
-            )
-            candidates = [
-                (
-                    claim,
-                    "personalization"
-                    if (
-                        claim.subject_id == user_id
-                        and _is_group_safe_personalization(claim)
-                    )
-                    else "evidence",
-                )
-                for claim in private_claims
-            ]
-            candidates.extend((claim, "evidence") for claim in global_claims)
-            candidates.extend(
-                (
-                    claim,
-                    "personalization"
-                    if _is_group_safe_personalization(claim)
-                    else "evidence",
-                )
-                for claim in self._private_group_fallback(
+            raw_claims.extend(
+                self._private_group_fallback(
                     context=context,
                     private_claims=private_claims,
                     now_utc=now_utc,
                 )
             )
 
-        resolved_subject = self._resolve_query_subject(
-            context,
-            query_text,
-            now_utc,
-        )
+        candidates = [
+            (
+                claim,
+                _claim_usage(
+                    context,
+                    claim,
+                    fallback_ids=fallback_ids,
+                ),
+            )
+            for claim in raw_claims
+            if _claim_passes_runtime_privacy(context, claim)
+            and _is_claim_active_and_valid(claim, now_utc)
+        ]
         suppressed_ids = self.store.subject_dispute_suppressed_ids(
             tuple(claim.id for claim, _usage in candidates)
         )
@@ -186,7 +180,98 @@ class MemoryRetriever:
             key=lambda result: (result.score, result.claim.id),
             reverse=True,
         )
-        return tuple(scored_results[:limit])
+        selected: list[RetrievedMemory] = []
+        selected_ids: set[int] = set()
+        rejected_conflict_ids: set[int] = set()
+        for result in scored_results:
+            claim = result.claim
+            if (
+                claim.id in selected_ids
+                or claim.id in rejected_conflict_ids
+            ):
+                continue
+            if claim.status != "disputed":
+                selected.append(result)
+                selected_ids.add(claim.id)
+                if len(selected) >= limit:
+                    break
+                continue
+
+            conflict_claims = self.store.authorized_conflict_group(
+                context,
+                claim.id,
+            )
+            if conflict_claims is None:
+                rejected_conflict_ids.add(claim.id)
+                continue
+            conflict_ids = {item.id for item in conflict_claims}
+            if not conflict_ids:
+                rejected_conflict_ids.add(claim.id)
+                continue
+            conflict_suppressed = self.store.subject_dispute_suppressed_ids(
+                tuple(conflict_ids)
+            )
+            if conflict_suppressed or any(
+                not _claim_passes_runtime_privacy(context, item)
+                or not _is_claim_active_and_valid(item, now_utc)
+                for item in conflict_claims
+            ):
+                rejected_conflict_ids.update(conflict_ids)
+                continue
+            new_conflict_claims = tuple(
+                item
+                for item in conflict_claims
+                if item.id not in selected_ids
+            )
+            if len(selected) + len(new_conflict_claims) > limit:
+                rejected_conflict_ids.update(conflict_ids)
+                continue
+            conflict_results = [
+                RetrievedMemory(
+                    claim=item,
+                    score=_calculate_score(
+                        item,
+                        query_text,
+                        context,
+                        now_utc,
+                        resolved_subject=resolved_subject,
+                        predicate_hints=predicate_hints,
+                    ),
+                    evidence_excerpts=(
+                        (item.source_excerpt,)
+                        if item.source_excerpt
+                        else ()
+                    ),
+                    relation_types=(),
+                    usage=_claim_usage(
+                        context,
+                        item,
+                        fallback_ids=fallback_ids,
+                    ),
+                )
+                for item in new_conflict_claims
+            ]
+            conflict_results.sort(
+                key=lambda item: (item.score, item.claim.id),
+                reverse=True,
+            )
+            selected.extend(conflict_results)
+            selected_ids.update(
+                item.claim.id for item in conflict_results
+            )
+            if len(selected) >= limit:
+                break
+
+        relation_types = self.store.relation_types_for_claims(
+            tuple(item.claim.id for item in selected)
+        )
+        return tuple(
+            replace(
+                item,
+                relation_types=relation_types.get(item.claim.id, ()),
+            )
+            for item in selected
+        )
 
     def _group_personalization_fallback_ids(
         self,
@@ -380,11 +465,72 @@ def _is_response_style_claim(claim: MemoryClaim) -> bool:
     return claim.predicate in _RESPONSE_STYLE_PREDICATES
 
 
+def _reserved_predicates_for_query(
+    predicate_hints: frozenset[str],
+    *,
+    include_defaults: bool,
+    include_group_personalization: bool,
+) -> tuple[str, ...]:
+    predicates: set[str] = set()
+    if include_defaults:
+        predicates.update(
+            (
+                *_NAME_PREDICATES,
+                "likes",
+                *_RESPONSE_STYLE_PREDICATES,
+            )
+        )
+    if "identity" in predicate_hints:
+        predicates.update(_NAME_PREDICATES)
+    if "preferred_name" in predicate_hints:
+        predicates.update(_PREFERRED_NAME_PREDICATES)
+    if "likes" in predicate_hints:
+        predicates.add("likes")
+    if "response_style" in predicate_hints:
+        predicates.update(_RESPONSE_STYLE_PREDICATES)
+    if include_group_personalization:
+        predicates.update(
+            (
+                *_PREFERRED_NAME_PREDICATES,
+                *_RESPONSE_STYLE_PREDICATES,
+            )
+        )
+    return tuple(sorted(predicates))
+
+
+def _claim_passes_runtime_privacy(
+    context: MemoryContext,
+    claim: MemoryClaim,
+) -> bool:
+    if claim_contains_hard_secret(claim):
+        return False
+    if claim.scope_type in {"group", "global"}:
+        return shared_claim_is_safe(claim)
+    if context.is_group and claim.scope_type == "private":
+        return _is_group_safe_personalization(claim)
+    return True
+
+
+def _claim_usage(
+    context: MemoryContext,
+    claim: MemoryClaim,
+    *,
+    fallback_ids: set[int],
+) -> str:
+    if context.is_group:
+        if claim.scope_type == "private" or claim.id in fallback_ids:
+            return "personalization"
+        return "evidence"
+    if (
+        claim.subject_id == str(context.user_id)
+        and _is_group_safe_personalization(claim)
+    ):
+        return "personalization"
+    return "evidence"
+
+
 def _is_group_safe_personalization(claim: MemoryClaim) -> bool:
-    return (
-        _is_preferred_name_claim(claim)
-        or _is_response_style_claim(claim)
-    )
+    return safe_group_personalization(claim)
 
 
 def _is_private_fallback_information(claim: MemoryClaim) -> bool:
@@ -467,7 +613,7 @@ def _calculate_score(
         ):
             relevance_score = 0.75
 
-    age_factor = 1.0
+    recency_score = 1.0
     timestamp_str = claim.last_confirmed_at or claim.created_at
     if timestamp_str and not _is_preferred_name_claim(claim):
         try:
@@ -477,9 +623,15 @@ def _calculate_score(
                 claim.memory_type == "preference"
                 or claim.predicate in ("likes", "response_style")
             ):
-                age_factor = max(0.5, 1.0 / (1.0 + 0.01 * age_days))
+                recency_score = max(
+                    0.5,
+                    1.0 / (1.0 + 0.01 * age_days),
+                )
             else:
-                age_factor = max(0.2, 1.0 / (1.0 + 0.05 * age_days))
+                recency_score = max(
+                    0.2,
+                    1.0 / (1.0 + 0.05 * age_days),
+                )
         except (TypeError, ValueError):
             pass
 
@@ -490,7 +642,7 @@ def _calculate_score(
         + scope_score
         + relevance_score
     )
-    return round(total * age_factor, 4)
+    return round(total + recency_score, 4)
 
 
 def format_memory_context(results: Sequence[RetrievedMemory]) -> str:
@@ -501,8 +653,16 @@ def format_memory_context(results: Sequence[RetrievedMemory]) -> str:
     if evidence_items:
         for r in evidence_items:
             c = r.claim
+            relation_text = (
+                ",".join(r.relation_types)
+                if r.relation_types
+                else "none"
+            )
             evidence_lines.append(
-                f"- 作用域={c.scope_type}:{c.scope_id}；发言者={c.speaker_qq}；主体={c.subject_id}；类型={c.memory_type}；内容={c.predicate}为{c.value}"
+                f"- 作用域={c.scope_type}:{c.scope_id}；"
+                f"发言者={c.speaker_qq}；主体={c.subject_id}；"
+                f"类型={c.memory_type}；内容={c.predicate}为{c.value}；"
+                f"status={c.status}；relations={relation_text}"
             )
     else:
         evidence_lines.append("暂无")

@@ -6,7 +6,16 @@ from dataclasses import replace
 from pathlib import Path
 
 from src.memory.models import CandidateClaim, MemoryContext, MemoryEvent
+from src.memory.privacy import (
+    Sensitivity,
+    classify_sensitive_text,
+    redact_hard_secrets,
+)
 from src.memory.store import MemoryStore
+from tests.runtime import (
+    COMPACT_HARD_SECRET_CASES,
+    ORDINARY_COMPACT_SECRET_PHRASES,
+)
 
 
 def event(
@@ -320,6 +329,24 @@ class MemoryPolicyTests(unittest.TestCase):
 
         self.assertEqual((), decisions)
         self.assertEqual([], self.rows())
+
+    def test_compact_hard_secrets_are_classified_and_redacted_without_phrase_false_positives(
+        self,
+    ):
+        for label, secret, _raw_value in COMPACT_HARD_SECRET_CASES:
+            with self.subTest(secret=label):
+                self.assertIs(
+                    Sensitivity.HARD_SECRET,
+                    classify_sensitive_text(secret),
+                )
+                self.assertNotIn(secret, redact_hard_secrets(secret))
+        for phrase in ORDINARY_COMPACT_SECRET_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertIsNot(
+                    Sensitivity.HARD_SECRET,
+                    classify_sensitive_text(phrase),
+                )
+                self.assertEqual(phrase, redact_hard_secrets(phrase))
 
     def test_rejects_credentials_payment_and_raw_image_from_claim_or_evidence(self):
         cases = (
@@ -1465,6 +1492,281 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertEqual((), group_sensitive)
         self.assertEqual((), image_only)
         self.assertEqual(1, len(accompanied))
+
+    def test_automatic_group_rejects_address_and_health_under_any_label(self):
+        sensitive_values = (
+            "北京市朝阳区建国路88号",
+            "HIV阳性",
+        )
+        misleading_predicates = (
+            "home_address",
+            "lives_at",
+            "condition",
+            "fact",
+            "contact_point",
+        )
+
+        for value in sensitive_values:
+            for predicate in misleading_predicates:
+                with self.subTest(value=value, predicate=predicate):
+                    decisions = self.policy.apply(
+                        event(
+                            f"我的情况是 {value}",
+                            group_id="900",
+                            message_id=f"sensitive-{predicate}-{value}",
+                        ),
+                        (
+                            candidate(
+                                predicate=predicate,
+                                value=value,
+                                memory_type="fact",
+                            ),
+                        ),
+                    )
+                    self.assertEqual((), decisions)
+
+    def test_explicit_current_group_may_store_sensitive_personal_information(self):
+        decisions = self.policy.apply_command(
+            event(
+                "请在本群记住：我的家庭住址是北京市朝阳区建国路88号",
+                group_id="900",
+                message_id="explicit-group-address",
+            ),
+            (
+                candidate(
+                    predicate="fact",
+                    value="北京市朝阳区建国路88号",
+                    memory_type="fact",
+                ),
+            ),
+        )
+
+        self.assertEqual(1, len(decisions))
+        claim = decisions[0].claim
+        self.assertEqual(("group", "900"), (claim.scope_type, claim.scope_id))
+        self.assertEqual("10001", claim.speaker_qq)
+        self.assertEqual("10001", claim.subject_id)
+
+    def test_hard_secrets_are_rejected_in_every_learning_mode(self):
+        hard_secrets = (
+            ("token_signature", "sk-abcdefghijklmnopqrstuvwxyz"),
+            ("otp_colon", "验证码：112233"),
+            ("otp_space", "验证码 654321"),
+            ("english_otp_space", "OTP 482915"),
+            (
+                "verification_code_space",
+                "verification code 736219",
+            ),
+            (
+                "password_space",
+                "密码 PASSWORD_SPACE_SENTINEL_7F2A",
+            ),
+            ("token_space", "token TOKEN_SPACE_SENTINEL_93B1"),
+            ("api_key_space", "API key API_KEY_SPACE_SENTINEL_5D8C"),
+            (
+                "payment_credential_space",
+                "支付凭据 PAYMENT_SPACE_SENTINEL_4A6E",
+            ),
+            ("bank_card_space", "银行卡号 4111 1111 1111 1111"),
+            ("bank_account_space", "bank account 1234567890"),
+            ("bank_account_zh_space", "银行账号 9876543210"),
+            ("bank_account_zh_alt_space", "银行帐号 1357902468"),
+            ("payment_account_zh_space", "支付账号 2468013579"),
+            ("cvv_space", "CVV 123"),
+        ) + tuple(
+            (f"{label}_compact", secret)
+            for label, secret, _raw_value in COMPACT_HARD_SECRET_CASES
+        )
+
+        for secret_label, secret in hard_secrets:
+            candidate_secret = (
+                candidate(
+                    predicate="fact",
+                    value=secret,
+                    memory_type="fact",
+                ),
+            )
+            cases = (
+                (
+                    "automatic",
+                    lambda: self.policy.apply(
+                        event(
+                            f"我需要记住 {secret}",
+                            message_id=f"automatic-{secret_label}",
+                        ),
+                        candidate_secret,
+                    ),
+                ),
+                (
+                    "explicit_private",
+                    lambda: self.policy.apply_command(
+                        event(
+                            f"请记住 {secret}",
+                            message_id=f"private-{secret_label}",
+                        ),
+                        candidate_secret,
+                    ),
+                ),
+                (
+                    "explicit_group",
+                    lambda: self.policy.apply_command(
+                        event(
+                            f"请在群里记住 {secret}",
+                            group_id="900",
+                            message_id=f"group-{secret_label}",
+                        ),
+                        candidate_secret,
+                    ),
+                ),
+                (
+                    "explicit_global",
+                    lambda: self.policy.apply_global_command(
+                        event(
+                            f"请全局记住 {secret}",
+                            message_id=f"global-{secret_label}",
+                        ),
+                        candidate_secret,
+                        authorized=True,
+                    ),
+                ),
+            )
+
+            for mode, operation in cases:
+                with self.subTest(secret=secret_label, mode=mode):
+                    self.assertEqual((), operation())
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            claim_count = connection.execute(
+                "SELECT COUNT(*) FROM memory_claims"
+            ).fetchone()[0]
+        self.assertEqual(0, claim_count)
+
+    def test_deleted_explicit_claim_tombstone_survives_reopen_and_is_candidate_precise(
+        self,
+    ):
+        source = event(
+            "请记住：我喜欢苹果，并且偏好简洁回答",
+            message_id="explicit-replay-source",
+        )
+        claims = (
+            candidate(value="苹果"),
+            candidate(
+                predicate="response_style",
+                value="简洁回答",
+                memory_type="preference",
+            ),
+        )
+        first = self.policy.apply_command(source, claims)
+        deleted_claim = first[0].claim
+        retained_claim = first[1].claim
+
+        self.store.delete_claim_physically(
+            deleted_claim.id,
+            reason="user_forget",
+            actor_qq="10001",
+            is_admin=False,
+        )
+        reopened = MemoryStore(self.path)
+        reopened.initialize()
+        replay = type(self.policy)(reopened).apply_command(source, claims)
+
+        self.assertEqual((retained_claim.id,), tuple(d.claim.id for d in replay))
+        self.assertIsNone(reopened.get_claim(deleted_claim.id))
+        cross_scope = type(self.policy)(reopened).apply_command(
+            event(
+                source.text,
+                user_id="10001",
+                group_id="900",
+                message_id=source.message_id,
+            ),
+            (claims[0],),
+        )
+        self.assertEqual(
+            ("group", "900"),
+            (cross_scope[0].claim.scope_type, cross_scope[0].claim.scope_id),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            tombstones = connection.execute(
+                """
+                SELECT dedupe_key
+                FROM memory_claim_tombstones
+                ORDER BY dedupe_key
+                """
+            ).fetchall()
+        self.assertEqual([(deleted_claim.dedupe_key,)], tombstones)
+
+    def test_global_tombstone_blocks_only_same_sender_dedupe(self):
+        claim_value = "全局规则值"
+        original_event = event(
+            f"请全局记住 {claim_value}",
+            user_id="10001",
+            message_id="global-colliding-message-id",
+        )
+        original_candidate = (
+            candidate(
+                predicate="global_fact",
+                value=claim_value,
+                memory_type="fact",
+            ),
+        )
+        deleted = self.policy.apply_global_command(
+            original_event,
+            original_candidate,
+            authorized=True,
+        )[0].claim
+        self.store.delete_claim_physically(
+            deleted.id,
+            reason="administrator_delete",
+            actor_qq="90009",
+            is_admin=True,
+        )
+
+        same_sender = self.policy.apply_global_command(
+            original_event,
+            original_candidate,
+            authorized=True,
+        )
+        other_sender = self.policy.apply_global_command(
+            event(
+                original_event.text,
+                user_id="20002",
+                message_id=original_event.message_id,
+            ),
+            original_candidate,
+            authorized=True,
+        )
+
+        self.assertEqual((), same_sender)
+        self.assertEqual(1, len(other_sender))
+        self.assertEqual("20002", other_sender[0].claim.speaker_qq)
+
+    def test_mixed_group_message_keeps_only_minimal_harmless_excerpt(self):
+        address = "北京市朝阳区建国路88号"
+        decisions = self.policy.apply(
+            event(
+                f"我喜欢苹果，我的家庭住址是{address}",
+                group_id="900",
+                message_id="mixed-sensitive-message",
+            ),
+            (
+                candidate(
+                    predicate="likes",
+                    value="苹果",
+                    memory_type="preference",
+                ),
+                candidate(
+                    predicate="fact",
+                    value=address,
+                    memory_type="fact",
+                ),
+            ),
+        )
+
+        self.assertEqual(1, len(decisions))
+        claim = decisions[0].claim
+        self.assertEqual("苹果", claim.value)
+        self.assertEqual("苹果", claim.source_excerpt)
+        self.assertNotIn(address, claim.source_excerpt)
 
     def test_low_confidence_and_joke_do_not_become_claims(self):
         self.assertEqual(

@@ -83,6 +83,32 @@ class MainMessageQueueConfigurationTests(unittest.TestCase):
 
         service.clear_pending_sequence.assert_called_once_with("group:20", 43)
 
+    def test_startup_seeds_receive_sequence_before_callbacks_are_accepted(self):
+        service = mock.Mock()
+        service.store.max_job_sequence.return_value = 100
+        queue = mock.Mock()
+        main._startup_initialized = False
+        try:
+            with (
+                mock.patch.object(
+                    main,
+                    "get_persona",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch.object(
+                    main,
+                    "get_memory_service",
+                    return_value=service,
+                ),
+                mock.patch.object(main, "message_queue", queue),
+            ):
+                main.startup()
+        finally:
+            main._startup_initialized = False
+
+        service.start.assert_called_once_with()
+        queue.ensure_sequence_at_least.assert_called_once_with(100)
+
 
 class MessageQueueConcurrencyTests(unittest.TestCase):
     def test_submit_failure_rolls_back_reservation_and_session_state(self):

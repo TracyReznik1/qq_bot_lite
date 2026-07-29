@@ -40,6 +40,11 @@ class MultimodalChatTests(unittest.TestCase):
             mock.patch.object(chat_service, "_ensure_history_loaded"),
             mock.patch.object(chat_service, "_save_history_unlocked"),
             mock.patch.object(
+                chat_service,
+                "build_untrusted_context",
+                return_value="[非可信上下文]暂无",
+            ),
+            mock.patch.object(
                 chat_service.llm,
                 "chat",
                 return_value=ChatResponse(content="看到了"),

@@ -64,6 +64,13 @@ def next_qqbot_sequence() -> int:
         return _sequence_counter
 
 
+def ensure_qqbot_sequence_at_least(sequence: int) -> None:
+    global _sequence_counter
+    minimum = max(int(sequence), 0)
+    with _sequence_lock:
+        _sequence_counter = max(_sequence_counter, minimum)
+
+
 class MessageQueue:
     def __init__(
         self,
@@ -82,6 +89,9 @@ class MessageQueue:
         self.max_processed_message_ids = max_processed_message_ids
         self.on_accepted = on_accepted
         self.on_rejected = on_rejected
+
+    def ensure_sequence_at_least(self, sequence: int) -> None:
+        ensure_qqbot_sequence_at_least(sequence)
 
     def mark_seen(self, data: dict[str, Any]) -> bool:
         message_id = data.get("message_id")

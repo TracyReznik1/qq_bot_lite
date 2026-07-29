@@ -42,6 +42,17 @@ def group_event(raw_message, message, message_id=11):
 
 
 class MainImageFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.memory_service = mock.Mock()
+        self.memory_service.stage_event.return_value = 1
+        service_patch = mock.patch.object(
+            main,
+            "get_memory_service",
+            return_value=self.memory_service,
+        )
+        service_patch.start()
+        self.addCleanup(service_patch.stop)
+
     def test_memory_stage_failure_does_not_change_successful_chat_reply(self):
         event = private_event("hello", "hello", message_id=301)
         memory_service = mock.Mock()
@@ -477,11 +488,19 @@ class MainImageFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL]),
-                mock.patch.object(chat_service, "HISTORY_DIR", Path(temp_dir)),
                 mock.patch.object(
                     chat_service,
                     "config",
-                    SimpleNamespace(persist_history=True, history_turns=8),
+                    SimpleNamespace(
+                        data_dir=Path(temp_dir),
+                        persist_history=True,
+                        history_turns=8,
+                    ),
+                ),
+                mock.patch.object(
+                    chat_service,
+                    "build_untrusted_context",
+                    return_value="[非可信上下文]暂无",
                 ),
                 mock.patch.object(
                     chat_service.llm,
@@ -493,7 +512,9 @@ class MainImageFlowTests(unittest.TestCase):
             ):
                 main.process_message(event)
 
-            history_files = list(Path(temp_dir).glob("*.json"))
+            history_files = list(
+                (Path(temp_dir) / "history").glob("*.json")
+            )
             self.assertEqual(1, len(history_files))
             raw_history = history_files[0].read_text(encoding="utf-8")
             persisted = json.loads(raw_history)
