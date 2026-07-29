@@ -7,6 +7,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Mapping
+import math
 
 
 class SearchTier(StrEnum):
@@ -204,6 +205,36 @@ def _require_enum_values(values: tuple[Any, ...] | frozenset[Any], enum_type: ty
         _require_enum(value, enum_type, field_name)
 
 
+def _tuple(values: Any) -> tuple[Any, ...]:
+    return tuple(values)
+
+
+def _frozenset(values: Any) -> frozenset[Any]:
+    return frozenset(values)
+
+
+def _normalize_fields(instance: Any, **values: Any) -> None:
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+
+
+def _require_number(value: Any, field_name: str, *, non_negative: bool = True) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{field_name} must be a finite number")
+    if non_negative and value < 0:
+        raise ValueError(f"{field_name} must not be negative")
+
+
+def _is_sensitive(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in ("http://", "https://", "api_key", "apikey", "token=", "qq=", "group="))
+
+
+def _require_safe_metadata(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value or _is_sensitive(value):
+        raise ValueError(f"{field_name} must be non-sensitive metadata")
+
+
 @dataclass(frozen=True)
 class RetrievalRequest:
     question: str
@@ -233,6 +264,7 @@ class RetrievalDecision:
     final_reason_codes: tuple[TriggerCode, ...]
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, trigger_codes=_tuple(self.trigger_codes), benefit_dimensions=_frozenset(self.benefit_dimensions), final_reason_codes=_tuple(self.final_reason_codes))
         _require_enum(self.route, SearchTier, "route")
         if self.skip_reason is not None:
             _require_enum(self.skip_reason, SkipReason, "skip_reason")
@@ -287,7 +319,7 @@ class TierBudget:
 
     def __post_init__(self) -> None:
         values = self.__dict__.values()
-        if any(not isinstance(value, int) or value < 0 for value in values):
+        if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("tier budgets must be non-negative integers")
         if self.max_total_queries != self.max_initial_queries + self.max_repair_queries:
             raise ValueError("max_total_queries must equal initial plus repair queries")
@@ -319,6 +351,7 @@ class SearchQuery:
     exclude_domains: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, include_domains=_tuple(self.include_domains), exclude_domains=_tuple(self.exclude_domains))
         _require_enum(self.round_kind, SearchRoundKind, "round_kind")
         _require_enum(self.purpose, QueryPurpose, "purpose")
 
@@ -337,6 +370,7 @@ class SearchPlan:
     budget: TierBudget
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, entities=_tuple(self.entities), initial_queries=_tuple(self.initial_queries), required_topics=_tuple(self.required_topics), required_source_relations=_frozenset(self.required_source_relations), query_redaction_codes=_tuple(self.query_redaction_codes))
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
 
@@ -348,6 +382,7 @@ class RepairPlan:
     repair_query: SearchQuery | None
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, gap_codes=_tuple(self.gap_codes))
         if self.triggered != (self.repair_query is not None):
             raise ValueError("repair_query must be present exactly when repair is triggered")
 
@@ -363,6 +398,9 @@ class ProviderHit:
     published_at: datetime | None
     raw_content: str | None
     quality_flags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, quality_flags=_tuple(self.quality_flags))
 
 
 @dataclass(frozen=True)
@@ -392,6 +430,7 @@ class EvidenceItem:
     independence_group: str | None
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, safety_flags=_tuple(self.safety_flags), supported_topics=_tuple(self.supported_topics))
         _require_enum(self.source_relation, SourceRelation, "source_relation")
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
@@ -401,10 +440,17 @@ class EvidenceItem:
 @dataclass(frozen=True)
 class EvidenceGapAnalysis:
     missing_claim_topics: tuple[str, ...]
-    weak_source_topics: tuple[str, ...]
-    conflict_groups: tuple[str, ...]
-    repairable: bool
+    conflict_group_ids: tuple[str, ...]
+    repair_eligible: bool
+    repair_purpose: str | None
     repair_reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, missing_claim_topics=_tuple(self.missing_claim_topics), conflict_group_ids=_tuple(self.conflict_group_ids), repair_reason_codes=_tuple(self.repair_reason_codes))
+        if self.repair_eligible and (not self.repair_purpose or not self.repair_reason_codes):
+            raise ValueError("eligible repair requires a purpose and reason code")
+        if not self.repair_eligible and self.repair_purpose is not None:
+            raise ValueError("ineligible repair cannot have a repair purpose")
 
 
 @dataclass(frozen=True)
@@ -425,6 +471,7 @@ class EvidenceBundle:
     limitations: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _normalize_fields(self, attempts=_tuple(self.attempts), initial_evidence_ids=_tuple(self.initial_evidence_ids), evidence_items=_tuple(self.evidence_items), missing_claim_topics=_tuple(self.missing_claim_topics), weak_source_topics=_tuple(self.weak_source_topics), conflict_groups=_tuple(self.conflict_groups), limitations=_tuple(self.limitations))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
 
 
@@ -449,6 +496,113 @@ class ProviderAttempt:
 
     def __post_init__(self) -> None:
         _require_enum(self.status, ProviderStatus, "status")
+        _require_safe_metadata(self.provider, "provider")
+        if type(self.count) is not int or self.count < 0:
+            raise ValueError("count must be a non-negative integer")
+        _require_number(self.latency_ms, "latency_ms")
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    provider: str
+    status: ProviderStatus
+    hits: tuple[ProviderHit, ...]
+    latency_ms: int | float
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, hits=_tuple(self.hits))
+        _require_safe_metadata(self.provider, "provider")
+        _require_enum(self.status, ProviderStatus, "status")
+        _require_number(self.latency_ms, "latency_ms")
+
+
+@dataclass(frozen=True)
+class FetchedDocument:
+    requested_url: str
+    final_url: str | None
+    content_type: str | None
+    title: str | None
+    excerpt: str | None
+    fetch_status: str
+    untrusted_content_flags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, untrusted_content_flags=_tuple(self.untrusted_content_flags))
+
+
+@dataclass(frozen=True)
+class EvidenceCandidate:
+    hit: ProviderHit
+    document: FetchedDocument | None
+    excerpt: str | None
+    excerpt_origin: ExcerptOrigin | None
+    extraction_status: str
+    safety_flags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, safety_flags=_tuple(self.safety_flags))
+        if self.excerpt_origin is not None:
+            _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
+
+
+@dataclass(frozen=True)
+class Claim:
+    claim_id: str
+    block_id: str
+    text: str
+    material: bool
+    evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, evidence_ids=_tuple(self.evidence_ids))
+
+
+@dataclass(frozen=True)
+class AnswerBlock:
+    block_id: str
+    kind: str
+    text: str
+    claim_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, claim_ids=_tuple(self.claim_ids))
+
+
+@dataclass(frozen=True)
+class GroundedDraft:
+    answer_blocks: tuple[AnswerBlock, ...]
+    claims: tuple[Claim, ...]
+    limitations: tuple[str, ...]
+    conflict_summary: tuple[str, ...]
+    used_knowledge_fallback: bool
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, answer_blocks=_tuple(self.answer_blocks), claims=_tuple(self.claims), limitations=_tuple(self.limitations), conflict_summary=_tuple(self.conflict_summary))
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    draft: GroundedDraft
+    retained_blocks: tuple[AnswerBlock, ...]
+    retained_claims: tuple[Claim, ...]
+    removed_block_ids: tuple[str, ...]
+    claim_labels: Mapping[str, SupportLabel]
+    limitations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, retained_blocks=_tuple(self.retained_blocks), retained_claims=_tuple(self.retained_claims), removed_block_ids=_tuple(self.removed_block_ids), claim_labels=MappingProxyType(dict(self.claim_labels)), limitations=_tuple(self.limitations))
+
+
+@dataclass(frozen=True)
+class RenderedReply:
+    text: str
+    chunks: tuple[str, ...]
+    used_evidence_ids: tuple[str, ...]
+    shown_source_urls: tuple[str, ...]
+    degradation_disclosures: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _normalize_fields(self, chunks=_tuple(self.chunks), used_evidence_ids=_tuple(self.used_evidence_ids), shown_source_urls=_tuple(self.shown_source_urls), degradation_disclosures=_tuple(self.degradation_disclosures))
 
 
 @dataclass
@@ -470,7 +624,7 @@ class SearchTrace:
     retrieval_round_count: int = 0
     executed_queries: tuple[SearchQuery | tuple[str, QueryPurpose], ...] = ()
     provider_configured: bool = False
-    provider_attempts: tuple[ProviderAttempt | Mapping[str, Any], ...] = ()
+    provider_attempts: tuple[ProviderAttempt, ...] = ()
     provider_invocation_started: bool = False
     provider_failures: tuple[SearchFailureCode, ...] = ()
     candidate_url_count: int = 0
@@ -499,6 +653,15 @@ class SearchTrace:
     retrieval_pipeline_latency_ms: int | float = 0
     total_response_latency_ms: int | float = 0
     content_read_count: int = 0
+
+    def __post_init__(self) -> None:
+        self.trigger_codes = _tuple(self.trigger_codes)
+        self.executed_queries = _tuple(self.executed_queries)
+        self.provider_attempts = _tuple(self.provider_attempts)
+        self.provider_failures = _tuple(self.provider_failures)
+        for attempt in self.provider_attempts:
+            if not isinstance(attempt, ProviderAttempt):
+                raise TypeError("provider_attempts must contain ProviderAttempt values")
 
     def to_log_dict(self) -> dict[str, Any]:
         values = {
@@ -567,6 +730,35 @@ class SearchPipelineResult:
     def __post_init__(self) -> None:
         if self.failure_code is not None:
             _require_enum(self.failure_code, SearchFailureCode, "failure_code")
+        if self.decision.route is SearchTier.SKIP:
+            if self.plan is not None or self.evidence is not None:
+                raise ValueError("skip results cannot include a plan or evidence")
+            if self.failure_code is not None and not (
+                self.failure_code is SearchFailureCode.USER_FORBID_WEB
+                and self.decision.skip_reason is SkipReason.USER_FORBID_WEB
+            ):
+                raise ValueError("skip results only permit user_forbid_web failure")
+            return
+        if self.plan is None:
+            raise ValueError("search results require a plan")
+        if self.evidence is None:
+            if self.failure_code not in {
+                SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+                SearchFailureCode.PROVIDER_UNAVAILABLE,
+                SearchFailureCode.PROVIDER_TIMEOUT,
+                SearchFailureCode.NO_RESULTS,
+                SearchFailureCode.CONTENT_UNREADABLE,
+            }:
+                raise ValueError("evidence-free search results require a pre-evidence failure")
+            return
+        state_failures = {
+            EvidenceState.SUFFICIENT: None,
+            EvidenceState.PARTIAL: SearchFailureCode.PARTIAL_EVIDENCE,
+            EvidenceState.CONFLICTING: SearchFailureCode.SOURCE_CONFLICT,
+            EvidenceState.INSUFFICIENT: SearchFailureCode.INSUFFICIENT_EVIDENCE,
+        }
+        if self.failure_code is not state_failures[self.evidence.evidence_state]:
+            raise ValueError("failure_code must match evidence state")
 
 
 def _query_metadata(query: SearchQuery | tuple[str, QueryPurpose] | None) -> dict[str, str] | None:
@@ -579,16 +771,10 @@ def _query_metadata(query: SearchQuery | tuple[str, QueryPurpose] | None) -> dic
     return {"query_id": query_id, "purpose": purpose.value}
 
 
-def _attempt_metadata(attempt: ProviderAttempt | Mapping[str, Any]) -> dict[str, Any]:
-    if isinstance(attempt, ProviderAttempt):
-        return {
-            "provider": attempt.provider,
-            "status": attempt.status,
-            "count": attempt.count,
-            "latency_ms": attempt.latency_ms,
-        }
-    permitted = {"provider", "status", "count", "latency_ms"}
-    return {key: value for key, value in attempt.items() if key in permitted}
+def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
+    if not isinstance(attempt, ProviderAttempt):
+        raise TypeError("provider attempts must be ProviderAttempt")
+    return {"provider": attempt.provider, "status": attempt.status, "count": attempt.count, "latency_ms": attempt.latency_ms}
 
 
 def _json_safe(value: Any) -> Any:
@@ -600,4 +786,8 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     if isinstance(value, (datetime, date)):
         return value.isoformat()
-    return value
+    if value is None or isinstance(value, (str, bool, int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("log values must be finite")
+        return value
+    raise TypeError(f"unsupported log value: {type(value).__name__}")

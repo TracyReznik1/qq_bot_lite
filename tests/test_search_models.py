@@ -1,8 +1,10 @@
 import importlib
 import importlib.util
 import json
+import math
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
+from decimal import Decimal
 
 
 def models():
@@ -235,16 +237,7 @@ class SearchModelContractTests(unittest.TestCase):
                 ("initial-1", m.QueryPurpose.DIRECT),
                 ("repair-1", m.QueryPurpose.REPAIR),
             ),
-            provider_attempts=(
-                {
-                    "provider": "fake",
-                    "status": m.ProviderStatus.SUCCESS,
-                    "count": 1,
-                    "latency_ms": 3,
-                    "exception": "https://example.invalid/private-error",
-                    "raw_query": "raw query text",
-                },
-            ),
+            provider_attempts=(m.ProviderAttempt("fake", m.ProviderStatus.SUCCESS, 1, 3),),
             evidence_state=m.EvidenceState.SUFFICIENT,
             provider_invocation_started=True,
             content_read_count=2,
@@ -265,6 +258,105 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertNotIn("https://example.invalid/private-error", payload)
         self.assertNotIn("raw query text", payload)
         json.dumps(logged)
+
+    def test_review_contracts_have_exact_public_fields_and_exports(self):
+        m = models()
+        expected_fields = {
+            "ProviderResult": ("provider", "status", "hits", "latency_ms"),
+            "FetchedDocument": (
+                "requested_url", "final_url", "content_type", "title", "excerpt",
+                "fetch_status", "untrusted_content_flags",
+            ),
+            "EvidenceCandidate": ("hit", "document", "excerpt", "excerpt_origin", "extraction_status", "safety_flags"),
+            "EvidenceGapAnalysis": (
+                "missing_claim_topics", "conflict_group_ids", "repair_eligible",
+                "repair_purpose", "repair_reason_codes",
+            ),
+            "Claim": ("claim_id", "block_id", "text", "material", "evidence_ids"),
+            "AnswerBlock": ("block_id", "kind", "text", "claim_ids"),
+            "GroundedDraft": ("answer_blocks", "claims", "limitations", "conflict_summary", "used_knowledge_fallback"),
+            "ValidationReport": ("draft", "retained_blocks", "retained_claims", "removed_block_ids", "claim_labels", "limitations"),
+            "RenderedReply": ("text", "chunks", "used_evidence_ids", "shown_source_urls", "degradation_disclosures"),
+        }
+        public = importlib.import_module("src.search").__all__
+        for name, expected in expected_fields.items():
+            with self.subTest(name=name):
+                contract = getattr(m, name, None)
+                self.assertIsNotNone(contract)
+                self.assertEqual(expected, tuple(item.name for item in fields(contract)))
+                self.assertIn(name, public)
+
+    def test_gap_analysis_enforces_authoritative_repair_shape(self):
+        m = models()
+        self.assertEqual(
+            ("topic",),
+            m.EvidenceGapAnalysis(("topic",), [], True, "find source", ["missing"]).missing_claim_topics,
+        )
+        for values in (
+            (("topic",), (), True, "", ("missing",)),
+            (("topic",), (), True, "find source", ()),
+            (("topic",), (), False, "find source", ()),
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    m.EvidenceGapAnalysis(*values)
+
+    def test_pipeline_result_rejects_ambiguous_search_and_skip_shapes(self):
+        m = models()
+        decision = self._search_decision(m)
+        trace = m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT)
+        with self.assertRaises(ValueError):
+            m.SearchPipelineResult(decision, None, None, trace)
+        skip = m.RetrievalDecision(
+            m.SearchTier.SKIP, m.SkipReason.PURE_MATH, False, (), frozenset(),
+            m.Factuality.NON_FACTUAL, False, m.Freshness.NONE, m.RiskLevel.LOW,
+            m.Actionability.NONE, m.PotentialHarm.NONE, None, None, (),
+        )
+        with self.assertRaises(ValueError):
+            m.SearchPipelineResult(skip, object(), None, trace)
+
+    def test_frozen_contracts_normalize_caller_owned_collections_and_budget_rejects_bools(self):
+        m = models()
+        triggers = [m.TriggerCode.FACTUAL_DEFAULT]
+        benefits = {m.BenefitDimension.ACCURACY}
+        decision = m.RetrievalDecision(
+            m.SearchTier.LIGHT, None, False, triggers, benefits, m.Factuality.FACTUAL,
+            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
+            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, triggers,
+        )
+        triggers.append(m.TriggerCode.EXPLICIT_SEARCH)
+        benefits.add(m.BenefitDimension.FRESHNESS)
+        self.assertEqual((m.TriggerCode.FACTUAL_DEFAULT,), decision.trigger_codes)
+        self.assertEqual(frozenset({m.BenefitDimension.ACCURACY}), decision.benefit_dimensions)
+        for index in range(7):
+            values = [1, 5, 2, 0, 1, 1, 8]
+            values[index] = True
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError):
+                    m.TierBudget(*values)
+
+    def test_trace_rejects_untyped_sensitive_or_non_json_provider_attempt_metadata(self):
+        m = models()
+        trace = m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT)
+        trace.provider_attempts = ({"provider": "https://private.invalid", "status": "success", "count": 1, "latency_ms": 1},)
+        with self.assertRaises((TypeError, ValueError)):
+            trace.to_log_dict()
+        with self.assertRaises(ValueError):
+            m.ProviderAttempt("api_key=secret", m.ProviderStatus.SUCCESS, 1, 1)
+        with self.assertRaises(ValueError):
+            m.ProviderAttempt("fake", m.ProviderStatus.SUCCESS, True, 1)
+        with self.assertRaises(ValueError):
+            m.ProviderAttempt("fake", m.ProviderStatus.SUCCESS, 1, math.inf)
+        with self.assertRaises(TypeError):
+            m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT, provider_attempts=(Decimal("1"),)).to_log_dict()
+
+    @staticmethod
+    def _search_decision(m):
+        return m.RetrievalDecision(
+            m.SearchTier.LIGHT, None, False, (), frozenset(), m.Factuality.FACTUAL,
+            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
+            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, (),
+        )
 
 
 if __name__ == "__main__":
