@@ -33,17 +33,6 @@ def _write_object(path: Path, data: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _facts(path: Path | None) -> list[str]:
-    if path is None or not path.exists():
-        return []
-    values = _read_object(path).get("facts", [])
-    if not isinstance(values, list):
-        raise ValueError(f"facts must be a list: {path}")
-    if any(not isinstance(item, str) for item in values):
-        raise ValueError(f"facts must contain only strings: {path}")
-    return [item.strip() for item in values if item.strip()]
-
-
 def _messages(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.exists():
         return []
@@ -58,33 +47,6 @@ def _messages(path: Path | None) -> list[dict[str, Any]]:
     return values
 
 
-def _copy_unknown_files(source: Path, staging: Path) -> None:
-    for path in source.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(source)
-        if len(relative.parts) == 2 and relative.parts[0] in {"memories", "history"} and path.suffix.lower() == ".json":
-            continue
-        destination = staging / relative
-        if destination.exists():
-            continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
-
-
-def _merge_memories(source: Path, target: Path, staging: Path, limit: int) -> None:
-    names = {
-        path.name for directory in (source / "memories", target / "memories")
-        if directory.exists() for path in directory.glob("*.json")
-    }
-    for name in names:
-        merged: list[str] = []
-        for fact in _facts(source / "memories" / name) + _facts(target / "memories" / name):
-            if fact not in merged:
-                merged.append(fact)
-        _write_object(staging / "memories" / name, {"facts": merged[-max(limit, 1):]})
-
-
 def _merge_history(source: Path, target: Path, staging: Path, turns: int) -> None:
     names = {
         path.name for directory in (source / "history", target / "history")
@@ -96,10 +58,7 @@ def _merge_history(source: Path, target: Path, staging: Path, turns: int) -> Non
         _write_object(staging / "history" / name, {"messages": merged[-limit:]})
 
 
-def _validate_known_json(staging: Path) -> None:
-    memory_paths = (staging / "memories").glob("*.json") if (staging / "memories").exists() else ()
-    for path in memory_paths:
-        _facts(path)
+def _validate_history_json(staging: Path) -> None:
     history_paths = (staging / "history").glob("*.json") if (staging / "history").exists() else ()
     for path in history_paths:
         _messages(path)
@@ -228,7 +187,6 @@ def migrate_legacy_data(
     source_dir: Path,
     target_dir: Path,
     history_turns: int,
-    memory_limit: int,
     *,
     timestamp: str | None = None,
 ) -> Path | None:
@@ -274,12 +232,10 @@ def migrate_legacy_data(
         staging.mkdir()
         if had_target:
             shutil.copytree(target, staging, dirs_exist_ok=True)
-        _validate_known_json(source)
-        _validate_known_json(target)
-        _copy_unknown_files(source, staging)
-        _merge_memories(source, target, staging, memory_limit)
+        _validate_history_json(source)
+        _validate_history_json(target)
         _merge_history(source, target, staging, history_turns)
-        _validate_known_json(staging)
+        _validate_history_json(staging)
 
         if had_target:
             target.replace(rollback)

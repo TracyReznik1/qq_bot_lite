@@ -14,7 +14,7 @@ from src.messaging import MessageQueue
 class MemoryEndToEndTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.temp_dir) / "test_memory.db"
+        self.db_path = Path(self.temp_dir) / "test_memory.sqlite3"
         self.store = MemoryStore(self.db_path)
         self.store.initialize()
 

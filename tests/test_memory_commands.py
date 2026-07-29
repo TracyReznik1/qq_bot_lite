@@ -23,7 +23,7 @@ from src.services.llm_types import ChatResponse
 class MemoryCommandsTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.temp_dir.name) / "memory.db"
+        self.db_path = Path(self.temp_dir.name) / "memory.sqlite3"
         self.store = MemoryStore(self.db_path)
         self.store.initialize()
         self.policy = MemoryPolicy(self.store)

@@ -138,7 +138,6 @@ class Config:
 
     search_max_results: int = env_int("SEARCH_MAX_RESULTS", 4)
     history_turns: int = env_int("HISTORY_TURNS", 8)
-    memory_limit: int = env_int("MEMORY_LIMIT", 30)
     persist_history: bool = env_bool("PERSIST_HISTORY", True)
     message_workers: int = field(default_factory=lambda: max(env_int("MESSAGE_WORKERS", 8), 1))
     request_timeout: float = env_float("REQUEST_TIMEOUT", 18.0)

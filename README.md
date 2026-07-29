@@ -173,7 +173,6 @@ Gemini 使用原生无状态 `generateContent` REST API，DeepSeek 继续使用 
 |---|---|---|---|
 | `DATA_DIR` | 可选 | `qqbot_data` | 数据目录；相对路径以项目根目录为基准。 |
 | `HISTORY_TURNS` | 可选 | `8` | 每个会话保留的最近对话轮数；内部按用户 / 助手两条消息计算。 |
-| `MEMORY_LIMIT` | 可选 | `30` | 每个记忆文件最多保留的事实数。 |
 | `PERSIST_HISTORY` | 可选 | `true` | 是否把历史写入磁盘；为假时历史只在当前进程内存在。 |
 | `MESSAGE_WORKERS` | 可选 | `8` | 同时处理的活跃会话工作线程数；小于 1 时按 1 处理。 |
 | `MAX_REPLY_CHARS` | 可选 | `1700` | 单段回复字符上限；源码最低按 200 处理，长回复会优先按换行或标点拆分。 |
@@ -213,10 +212,10 @@ Gemini 使用原生无状态 `generateContent` REST API，DeepSeek 继续使用 
 
 ## 数据、历史与结构化记忆
 
-默认数据位于 `qqbot_data/`：对话历史在 `qqbot_data/history/`，结构化记忆数据库位于 `qqbot_data/memory.db`。不要提交或公开这个目录。
+默认数据位于 `qqbot_data/`：对话历史在 `qqbot_data/history/`，结构化记忆数据库位于 `qqbot_data/memory.sqlite3`。不要提交或公开这个目录。
 
 - **历史：**最近 `HISTORY_TURNS` 轮用户 / 助手消息。私聊按 QQ 用户隔离，群聊按“群号 + QQ 用户”隔离。`PERSIST_HISTORY=true` 时重启后可恢复；为假时只保留内存状态。`/reset` 会清空当前会话的历史。
-- **结构化记忆 (SQLite)：**持久化在 `memory.db` 中，后台异步 Worker 自动把消息提取成带有发布者、作用域、生效时间的细粒度 Claim 记录。
+- **结构化记忆 (SQLite)：**持久化在 `DATA_DIR/memory.sqlite3` 中，后台异步 Worker 自动把消息提取成带有发布者、作用域、生效时间的细粒度 Claim 记录。
 - **作用域与隔离规则：**
   - **私聊记忆：**只有该 QQ 用户与机器人可见；
   - **群聊记忆：**属于该群聊共享，群内成员均可作为证据参考；

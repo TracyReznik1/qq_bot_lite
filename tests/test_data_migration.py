@@ -83,11 +83,9 @@ class DataMigrationTests(unittest.TestCase):
     def migrate(source: Path, target: Path):
         from src.utils.data_migration import migrate_legacy_data
 
-        return migrate_legacy_data(source, target, 8, 30, timestamp="fixed")
+        return migrate_legacy_data(source, target, 8, timestamp="fixed")
 
-    def test_merges_known_data_copies_missing_files_and_archives_source(self):
-        write_json(self.source / "memories" / "global.json", {"facts": ["旧一", "重复", "旧二"]})
-        write_json(self.target / "memories" / "global.json", {"facts": ["重复", "新一"]})
+    def test_migrates_history_only_and_archives_source(self):
         write_json(
             self.source / "history" / "private_1.json",
             {"messages": [{"role": "user", "content": "旧问题"}, {"role": "assistant", "content": "旧回答"}]},
@@ -96,7 +94,7 @@ class DataMigrationTests(unittest.TestCase):
             self.target / "history" / "private_1.json",
             {"messages": [{"role": "user", "content": "新问题"}, {"role": "assistant", "content": "新回答"}]},
         )
-        (self.source / "legacy-note.txt").write_text("旧文件", encoding="utf-8")
+        (self.source / "legacy-note.txt").write_text("不迁移", encoding="utf-8")
         (self.source / "same.txt").write_text("旧版本", encoding="utf-8")
         self.target.mkdir(parents=True, exist_ok=True)
         (self.target / "same.txt").write_text("新版本", encoding="utf-8")
@@ -107,23 +105,21 @@ class DataMigrationTests(unittest.TestCase):
             self.source,
             self.target,
             history_turns=2,
-            memory_limit=3,
             timestamp="20260714-120000",
         )
 
-        self.assertEqual(["重复", "旧二", "新一"], read_json(self.target / "memories" / "global.json")["facts"])
         self.assertEqual(
             ["旧问题", "旧回答", "新问题", "新回答"],
             [item["content"] for item in read_json(self.target / "history" / "private_1.json")["messages"]],
         )
-        self.assertEqual("旧文件", (self.target / "legacy-note.txt").read_text(encoding="utf-8"))
         self.assertEqual("新版本", (self.target / "same.txt").read_text(encoding="utf-8"))
+        self.assertFalse((self.target / "legacy-note.txt").exists())
         self.assertEqual(self.root / "atri_data.backup-20260714-120000", backup)
         self.assertTrue(backup.is_dir())
         self.assertEqual("旧版本", (backup / "same.txt").read_text(encoding="utf-8"))
         self.assertFalse(self.source.exists())
         snapshot = (self.target / "history" / "private_1.json").read_text(encoding="utf-8")
-        self.assertIsNone(migrate_legacy_data(self.source, self.target, 2, 3, timestamp="second"))
+        self.assertIsNone(migrate_legacy_data(self.source, self.target, 2, timestamp="second"))
         self.assertEqual(snapshot, (self.target / "history" / "private_1.json").read_text(encoding="utf-8"))
 
     def test_history_keeps_old_then_new_and_applies_turn_limit(self):
@@ -134,10 +130,62 @@ class DataMigrationTests(unittest.TestCase):
 
         from src.utils.data_migration import migrate_legacy_data
 
-        migrate_legacy_data(self.source, self.target, history_turns=2, memory_limit=30, timestamp="fixed")
+        migrate_legacy_data(self.source, self.target, history_turns=2, timestamp="fixed")
 
         contents = [item["content"] for item in read_json(self.target / "history" / "private_2.json")["messages"]]
         self.assertEqual(["新0", "新1", "新2", "新3"], contents)
+
+    def test_legacy_memory_sentinel_is_neither_read_nor_copied_during_migration(self):
+        sentinel = self.source / "memories" / "global.json"
+        write_json(sentinel, {"facts": ["不得导入"]})
+        write_json(
+            self.source / "history" / "private_1.json",
+            {"messages": [{"role": "user", "content": "保留历史"}]},
+        )
+
+        from src.utils import data_migration
+
+        original_read_text = Path.read_text
+        original_open = Path.open
+        original_copy2 = data_migration.shutil.copy2
+
+        def reject_sentinel_read(path, *args, **kwargs):
+            if Path(path) == sentinel:
+                raise AssertionError("legacy memory JSON was read")
+            return original_read_text(path, *args, **kwargs)
+
+        def reject_sentinel_open(path, *args, **kwargs):
+            if Path(path) == sentinel:
+                raise AssertionError("legacy memory JSON was opened")
+            return original_open(path, *args, **kwargs)
+
+        def reject_sentinel_copy(source, destination, *args, **kwargs):
+            if Path(source) == sentinel:
+                raise AssertionError("legacy memory JSON was copied")
+            return original_copy2(source, destination, *args, **kwargs)
+
+        with (
+            patch.object(Path, "read_text", reject_sentinel_read),
+            patch.object(Path, "open", reject_sentinel_open),
+            patch.object(data_migration.shutil, "copy2", reject_sentinel_copy),
+        ):
+            backup = data_migration.migrate_legacy_data(
+                self.source,
+                self.target,
+                history_turns=8,
+                timestamp="fixed",
+            )
+
+        self.assertIsNotNone(backup)
+        self.assertFalse((self.target / "memories").exists())
+        self.assertFalse((self.target / "memory.sqlite3").exists())
+        self.assertEqual(
+            ["保留历史"],
+            [
+                item["content"]
+                for item in read_json(self.target / "history" / "private_1.json")["messages"]
+            ],
+        )
 
     def test_existing_backup_name_gets_a_suffix(self):
         self.source.mkdir()
@@ -145,7 +193,7 @@ class DataMigrationTests(unittest.TestCase):
 
         from src.utils.data_migration import migrate_legacy_data
 
-        backup = migrate_legacy_data(self.source, self.target, 8, 30, timestamp="fixed")
+        backup = migrate_legacy_data(self.source, self.target, 8, timestamp="fixed")
 
         self.assertEqual(self.root / "atri_data.backup-fixed-1", backup)
 
@@ -156,7 +204,7 @@ class DataMigrationTests(unittest.TestCase):
 
         from src.utils.data_migration import migrate_legacy_data
 
-        self.assertIsNone(migrate_legacy_data(self.source, self.target, 8, 30, timestamp="fixed"))
+        self.assertIsNone(migrate_legacy_data(self.source, self.target, 8, timestamp="fixed"))
         self.assertEqual("保持", marker.read_text(encoding="utf-8"))
 
     def test_source_to_backup_failure_restores_original_target_and_allows_clean_retry(self):
@@ -180,8 +228,6 @@ class DataMigrationTests(unittest.TestCase):
 
     def test_partial_failed_cleanup_after_recovery_does_not_keep_transaction_locked(self):
         self.write_history_pair(self.source, self.target, had_target=True)
-        source_only = self.source / "source-only.txt"
-        source_only.write_text("只在旧源", encoding="utf-8")
 
         from src.utils import data_migration
 
@@ -190,7 +236,7 @@ class DataMigrationTests(unittest.TestCase):
 
         def partial_delete_then_fail(path, *args, **kwargs):
             path = Path(path)
-            redundant_file = path / "source-only.txt"
+            redundant_file = path / "history" / "private_1.json"
             if not deleted_from and redundant_file.exists():
                 redundant_file.unlink()
                 deleted_from.append(path.name)
@@ -207,7 +253,10 @@ class DataMigrationTests(unittest.TestCase):
             with self.assertRaises(data_migration.MigrationError):
                 self.migrate(self.source, self.target)
 
-        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["旧消息"],
+            [item["content"] for item in read_json(self.source / "history" / "private_1.json")["messages"]],
+        )
         self.assertEqual(
             ["新消息"],
             [
@@ -234,10 +283,6 @@ class DataMigrationTests(unittest.TestCase):
 
     def test_partial_staging_cleanup_failure_keeps_transaction_blocked(self):
         self.write_history_pair(self.source, self.target, had_target=True)
-        source_only = self.source / "source-only.txt"
-        target_only = self.target / "target-only.txt"
-        source_only.write_text("只在旧源", encoding="utf-8")
-        target_only.write_text("只在原目标", encoding="utf-8")
 
         from src.utils import data_migration
 
@@ -246,7 +291,7 @@ class DataMigrationTests(unittest.TestCase):
 
         def partial_delete_then_fail(path, *args, **kwargs):
             path = Path(path)
-            staged_file = path / "source-only.txt"
+            staged_file = path / "history" / "private_1.json"
             if path.name.startswith(".qqbot_data.migrating-") and staged_file.exists():
                 staged_file.unlink()
                 deleted_from.append(path.name)
@@ -268,8 +313,14 @@ class DataMigrationTests(unittest.TestCase):
         self.assertEqual(1, len(deleted_from))
         self.assertTrue(state.exists())
         self.assertEqual(1, len(staging))
-        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
-        self.assertEqual("只在原目标", target_only.read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["旧消息"],
+            [item["content"] for item in read_json(self.source / "history" / "private_1.json")["messages"]],
+        )
+        self.assertEqual(
+            ["新消息"],
+            [item["content"] for item in read_json(self.target / "history" / "private_1.json")["messages"]],
+        )
 
         with self.assertRaises(data_migration.MigrationError):
             self.migrate(self.source, self.target)
@@ -363,8 +414,6 @@ class DataMigrationTests(unittest.TestCase):
 
     def test_failed_to_cleanup_rename_failure_keeps_recovery_data_and_blocks(self):
         self.write_history_pair(self.source, self.target, had_target=True)
-        source_only = self.source / "source-only.txt"
-        source_only.write_text("只在旧源", encoding="utf-8")
 
         from src.utils.data_migration import MigrationError
 
@@ -385,8 +434,14 @@ class DataMigrationTests(unittest.TestCase):
         self.assertTrue(state.exists())
         self.assertTrue(self.source.exists())
         self.assertEqual(1, len(failed))
-        self.assertEqual("只在旧源", source_only.read_text(encoding="utf-8"))
-        self.assertEqual("只在旧源", (failed[0] / "source-only.txt").read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["旧消息"],
+            [item["content"] for item in read_json(self.source / "history" / "private_1.json")["messages"]],
+        )
+        self.assertEqual(
+            ["旧消息", "新消息"],
+            [item["content"] for item in read_json(failed[0] / "history" / "private_1.json")["messages"]],
+        )
         self.assertEqual(
             ["新消息"],
             [
@@ -557,9 +612,9 @@ class DataMigrationTests(unittest.TestCase):
         second_entered = threading.Event()
         call_lock = threading.Lock()
         call_count = 0
-        original_copy = data_migration._copy_unknown_files
+        original_merge = data_migration._merge_history
 
-        def blocking_copy(source, staging):
+        def blocking_merge(source, target, staging, turns):
             nonlocal call_count
             with call_lock:
                 call_count += 1
@@ -570,10 +625,10 @@ class DataMigrationTests(unittest.TestCase):
                     raise RuntimeError("test release timeout")
             else:
                 second_entered.set()
-            return original_copy(source, staging)
+            return original_merge(source, target, staging, turns)
 
         state = self.target.with_name(".qqbot_data.migration-state")
-        with patch.object(data_migration, "_copy_unknown_files", side_effect=blocking_copy):
+        with patch.object(data_migration, "_merge_history", side_effect=blocking_merge):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 first = executor.submit(self.migrate, self.source, self.target)
                 self.assertTrue(entered.wait(timeout=2))
@@ -589,23 +644,8 @@ class DataMigrationTests(unittest.TestCase):
 
         self.assertFalse(state.exists())
 
-    def test_invalid_known_json_keeps_source_and_original_target(self):
-        invalid = self.source / "memories" / "broken.json"
-        invalid.parent.mkdir(parents=True)
-        invalid.write_text("not-json", encoding="utf-8")
-        write_json(self.target / "memories" / "global.json", {"facts": ["保持"]})
-
-        from src.utils.data_migration import MigrationError, migrate_legacy_data
-
-        with self.assertRaises(MigrationError):
-            migrate_legacy_data(self.source, self.target, 8, 30, timestamp="fixed")
-
-        self.assertTrue(self.source.exists())
-        self.assertEqual(["保持"], read_json(self.target / "memories" / "global.json")["facts"])
-
     def test_invalid_known_items_keep_source_and_original_target(self):
         cases = (
-            ("non-string-fact", "memories/global.json", {"facts": ["有效", 7]}),
             ("missing-content", "history/private_1.json", {"messages": [{"role": "user"}]}),
             (
                 "non-string-content",
@@ -627,12 +667,10 @@ class DataMigrationTests(unittest.TestCase):
                     root = self.root / f"{case_name}-{invalid_side}"
                     source = root / "atri_data"
                     target = root / "qqbot_data"
-                    write_json(source / "memories" / "global.json", {"facts": ["旧"]})
                     write_json(
                         source / "history" / "private_1.json",
                         {"messages": [{"role": "user", "content": "旧消息"}]},
                     )
-                    write_json(target / "memories" / "global.json", {"facts": ["新"]})
                     write_json(
                         target / "history" / "private_1.json",
                         {"messages": [{"role": "assistant", "content": "新消息"}]},
@@ -643,7 +681,7 @@ class DataMigrationTests(unittest.TestCase):
                     write_json(invalid_root / relative, invalid_data)
 
                     with self.assertRaises(MigrationError):
-                        migrate_legacy_data(source, target, 8, 30, timestamp="fixed")
+                        migrate_legacy_data(source, target, 8, timestamp="fixed")
 
                     self.assertEqual("源", (source / "source-marker.txt").read_text(encoding="utf-8"))
                     self.assertEqual("目标", (target / "target-marker.txt").read_text(encoding="utf-8"))
@@ -651,6 +689,66 @@ class DataMigrationTests(unittest.TestCase):
 
 
 class StartupMigrationTests(unittest.TestCase):
+    def test_startup_does_not_open_or_import_legacy_memory_sentinel(self):
+        from src import main
+
+        previous_initialized = main._startup_initialized
+        self.addCleanup(setattr, main, "_startup_initialized", previous_initialized)
+        main._startup_initialized = False
+
+        with tempfile.TemporaryDirectory() as root:
+            base_dir = Path(root)
+            sentinel = base_dir / "atri_data" / "memories" / "global.json"
+            write_json(sentinel, {"facts": ["不得导入"]})
+            write_json(
+                base_dir / "atri_data" / "history" / "private_1.json",
+                {"messages": [{"role": "user", "content": "保留历史"}]},
+            )
+            fake_config = SimpleNamespace(
+                data_dir=base_dir / "qqbot_data",
+                history_turns=8,
+            )
+            started = []
+            original_read_text = Path.read_text
+            original_open = Path.open
+
+            def reject_sentinel_read(path, *args, **kwargs):
+                if Path(path) == sentinel:
+                    raise AssertionError("legacy memory JSON was read")
+                return original_read_text(path, *args, **kwargs)
+
+            def reject_sentinel_open(path, *args, **kwargs):
+                if Path(path) == sentinel:
+                    raise AssertionError("legacy memory JSON was opened")
+                return original_open(path, *args, **kwargs)
+
+            with (
+                patch.object(main, "BASE_DIR", base_dir),
+                patch.object(main, "config", fake_config),
+                patch.object(main, "get_persona"),
+                patch.object(
+                    main,
+                    "get_memory_service",
+                    return_value=SimpleNamespace(start=lambda: started.append(True)),
+                ),
+                patch.object(Path, "read_text", reject_sentinel_read),
+                patch.object(Path, "open", reject_sentinel_open),
+            ):
+                main.startup()
+
+            self.assertEqual([True], started)
+            self.assertFalse((fake_config.data_dir / "memories").exists())
+            self.assertFalse((fake_config.data_dir / "memory.sqlite3").exists())
+            self.assertEqual(
+                ["保留历史"],
+                [
+                    item["content"]
+                    for item in read_json(
+                        fake_config.data_dir / "history" / "private_1.json"
+                    )["messages"]
+                ],
+            )
+
     def test_startup_serializes_concurrent_initialization(self):
         from src import main
 
@@ -660,7 +758,6 @@ class StartupMigrationTests(unittest.TestCase):
         fake_config = SimpleNamespace(
             data_dir=main.BASE_DIR / "qqbot_data",
             history_turns=8,
-            memory_limit=30,
         )
         start = threading.Barrier(3)
         call_lock = threading.Lock()
@@ -694,7 +791,7 @@ class StartupMigrationTests(unittest.TestCase):
         self.assertEqual([], errors)
         self.assertEqual({"directory": 1}, calls)
 
-    def test_startup_migrates_default_data_before_legacy_memory_layout(self):
+    def test_startup_migrates_default_data_once_before_starting_memory_service(self):
         from src import main
 
         order = []
@@ -704,7 +801,6 @@ class StartupMigrationTests(unittest.TestCase):
         fake_config = SimpleNamespace(
             data_dir=main.BASE_DIR / "qqbot_data",
             history_turns=8,
-            memory_limit=30,
         )
         with (
             patch.object(main, "config", fake_config),
@@ -724,7 +820,6 @@ class StartupMigrationTests(unittest.TestCase):
         fake_config = SimpleNamespace(
             data_dir=main.BASE_DIR / "custom_data",
             history_turns=8,
-            memory_limit=30,
         )
         with (
             patch.object(main, "config", fake_config),

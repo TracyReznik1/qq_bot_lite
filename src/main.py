@@ -114,7 +114,6 @@ def startup() -> None:
                 BASE_DIR / LEGACY_DATA_DIR_NAME,
                 config.data_dir,
                 config.history_turns,
-                config.memory_limit,
             )
         get_memory_service().start()
         _startup_initialized = True

@@ -99,7 +99,6 @@ class ConfigMemoryPathTests(unittest.TestCase):
 
         self.assertEqual(data_dir / "memory.sqlite3", current.memory_database_path)
 
-
 class MemoryStoreTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.TemporaryDirectory()

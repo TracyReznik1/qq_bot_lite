@@ -71,7 +71,7 @@ class CommandRendererTests(unittest.TestCase):
 class CommandRenderingIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.store = MemoryStore(Path(self.temp_dir.name) / "memory.db")
+        self.store = MemoryStore(Path(self.temp_dir.name) / "memory.sqlite3")
         self.store.initialize()
 
     def tearDown(self):
@@ -166,7 +166,7 @@ class CommandRenderingIntegrationTests(unittest.TestCase):
 
     def test_already_rendered_search_result_is_not_rendered_again(self):
         class Renderer:
-            def render(self, _facts, _fallback):
+            def render(self, facts, fallback):
                 raise AssertionError("search output must not be rendered twice")
 
         with mock.patch(
