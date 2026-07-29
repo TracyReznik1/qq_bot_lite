@@ -219,6 +219,8 @@ def _normalize_fields(instance: Any, **values: Any) -> None:
 
 
 def _strings(values: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, (tuple, list, set, frozenset)):
+        raise TypeError(f"{field_name} must be a collection of strings")
     result = _tuple(values)
     if any(type(value) is not str for value in result):
         raise TypeError(f"{field_name} must contain strings")
@@ -230,6 +232,13 @@ def _records(values: Any, record_type: type[Any], field_name: str) -> tuple[Any,
     if any(not isinstance(value, record_type) for value in result):
         raise TypeError(f"{field_name} must contain {record_type.__name__}")
     return result
+
+
+def _require_record(value: Any, record_type: type[Any], field_name: str, *, optional: bool = False) -> None:
+    if value is None and optional:
+        return
+    if not isinstance(value, record_type):
+        raise TypeError(f"{field_name} must be a {record_type.__name__}")
 
 
 def _enum_set(values: Any, enum_type: type[StrEnum], field_name: str) -> frozenset[Any]:
@@ -390,6 +399,8 @@ class SearchPlan:
     budget: TierBudget
 
     def __post_init__(self) -> None:
+        _require_record(self.decision, RetrievalDecision, "decision")
+        _require_record(self.budget, TierBudget, "budget")
         time_window = None if self.time_window is None else _tuple(self.time_window)
         if time_window is not None and (len(time_window) != 2 or any(item is not None and not isinstance(item, date) for item in time_window)):
             raise ValueError("time_window must be a two-element date tuple")
@@ -494,6 +505,10 @@ class EvidenceBundle:
     limitations: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _require_record(self.decision, RetrievalDecision, "decision")
+        _require_record(self.plan, SearchPlan, "plan")
+        _require_record(self.gap_analysis, EvidenceGapAnalysis, "gap_analysis")
+        _require_record(self.repair_plan, RepairPlan, "repair_plan")
         _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
 
@@ -508,6 +523,10 @@ class ProviderReadiness:
     def __post_init__(self) -> None:
         if self.reason_code is not None:
             _require_enum(self.reason_code, SearchFailureCode, "reason_code")
+        if not self.configured and (self.available or self.reason_code is not SearchFailureCode.PROVIDER_NOT_CONFIGURED):
+            raise ValueError("unconfigured providers require provider_not_configured")
+        if self.configured and not self.available and self.reason_code is not SearchFailureCode.PROVIDER_UNAVAILABLE:
+            raise ValueError("configured unavailable providers require provider_unavailable")
         if self.available and not self.configured:
             raise ValueError("unconfigured providers cannot be available")
         if self.available and self.reason_code is not None:
@@ -574,6 +593,8 @@ class EvidenceCandidate:
     content_reads_consumed: int
 
     def __post_init__(self) -> None:
+        _require_record(self.hit, ProviderHit, "hit")
+        _require_record(self.document, FetchedDocument, "document", optional=True)
         _normalize_fields(self, safety_flags=_strings(self.safety_flags, "safety_flags"))
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
@@ -626,6 +647,7 @@ class ValidationReport:
     limitations: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        _require_record(self.draft, GroundedDraft, "draft")
         labels = dict(self.claim_labels)
         if any(type(key) is not str or not isinstance(value, SupportLabel) for key, value in labels.items()):
             raise TypeError("claim_labels must map strings to SupportLabel")
@@ -810,7 +832,8 @@ def _query_metadata(query: SearchQuery | tuple[str, QueryPurpose] | None) -> dic
 def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
     if not isinstance(attempt, ProviderAttempt):
         raise TypeError("provider attempts must be ProviderAttempt")
-    return {"provider": attempt.provider, "status": attempt.status, "count": attempt.count, "latency_ms": attempt.latency_ms}
+    provider = attempt.provider if attempt.provider in {"tavily", "ddgs"} else "[redacted]"
+    return {"provider": provider, "status": attempt.status, "count": attempt.count, "latency_ms": attempt.latency_ms}
 
 
 def _json_safe(value: Any) -> Any:
@@ -830,6 +853,7 @@ def _json_safe(value: Any) -> Any:
 
 
 def _safe_log_identifier(value: Any) -> str:
-    if not isinstance(value, str) or len(value) > 80 or _is_sensitive(value) or any(char.isspace() for char in value) or "@" in value or value.startswith(("sk-", "ghp_", "CQ:", "data:")):
+    import re
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[Qq][0-9]+|[a-z]+-[0-9]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,64})", value):
         return "[redacted]"
     return value
