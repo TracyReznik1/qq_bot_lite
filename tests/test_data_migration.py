@@ -1,4 +1,6 @@
+import builtins
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import json
 import sqlite3
 import tempfile
@@ -17,6 +19,81 @@ def write_json(path: Path, data):
 
 def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def legacy_memory_io_guards(data_migration, *legacy_roots: Path) -> ExitStack:
+    roots = {Path(root) for root in legacy_roots}
+
+    def is_memory_path(value) -> bool:
+        try:
+            return "memories" in Path(value).parts
+        except TypeError:
+            return False
+
+    def reject_open(path, *args, **kwargs):
+        if is_memory_path(path):
+            raise AssertionError(f"legacy memory path was opened: {path}")
+        return original_open(path, *args, **kwargs)
+
+    def reject_path_io(original, operation):
+        def guarded(path, *args, **kwargs):
+            if is_memory_path(path):
+                raise AssertionError(f"legacy memory path was {operation}: {path}")
+            return original(path, *args, **kwargs)
+
+        return guarded
+
+    def reject_copy(original, operation):
+        def guarded(source, destination, *args, **kwargs):
+            if is_memory_path(source) or is_memory_path(destination):
+                raise AssertionError(
+                    f"legacy memory path was {operation}: {source} -> {destination}"
+                )
+            return original(source, destination, *args, **kwargs)
+
+        return guarded
+
+    def reject_tree_copy(source, destination, *args, **kwargs):
+        if Path(source) in roots or is_memory_path(source) or is_memory_path(destination):
+            raise AssertionError(
+                f"legacy data tree was copied: {source} -> {destination}"
+            )
+        return original_copytree(source, destination, *args, **kwargs)
+
+    original_open = builtins.open
+    original_copytree = data_migration.shutil.copytree
+    stack = ExitStack()
+    stack.enter_context(patch("builtins.open", reject_open))
+    stack.enter_context(
+        patch.object(
+            Path,
+            "open",
+            reject_path_io(Path.open, "opened"),
+        )
+    )
+    for method, operation in (
+        ("read_text", "read"),
+        ("read_bytes", "read"),
+        ("write_text", "written"),
+        ("write_bytes", "written"),
+    ):
+        original = getattr(Path, method)
+        stack.enter_context(
+            patch.object(Path, method, reject_path_io(original, operation))
+        )
+    for method in ("copy", "copy2", "copyfile"):
+        original = getattr(data_migration.shutil, method)
+        stack.enter_context(
+            patch.object(
+                data_migration.shutil,
+                method,
+                reject_copy(original, method),
+            )
+        )
+    stack.enter_context(
+        patch.object(data_migration.shutil, "copytree", reject_tree_copy)
+    )
+    return stack
 
 
 class DataMigrationTests(unittest.TestCase):
@@ -52,6 +129,21 @@ class DataMigrationTests(unittest.TestCase):
                 target / "history" / "private_1.json",
                 {"messages": [{"role": "assistant", "content": "新消息"}]},
             )
+
+    @staticmethod
+    def write_memory_sentinels(source: Path, target: Path) -> None:
+        write_json(source / "memories" / "global.json", {"facts": ["源记忆"]})
+        write_json(target / "memories" / "private.json", {"facts": ["目标记忆"]})
+
+    def assert_memory_sentinels_unchanged(self, source: Path, target: Path) -> None:
+        self.assertEqual(
+            {"facts": ["源记忆"]},
+            read_json(source / "memories" / "global.json"),
+        )
+        self.assertEqual(
+            {"facts": ["目标记忆"]},
+            read_json(target / "memories" / "private.json"),
+        )
 
     def assert_clean_retry(self, source: Path, target: Path, *, had_target: bool) -> None:
         state = target.with_name(f".{target.name}.migration-state")
@@ -152,36 +244,10 @@ class DataMigrationTests(unittest.TestCase):
 
         from src.utils import data_migration
 
-        original_read_text = Path.read_text
-        original_open = Path.open
-        original_copy2 = data_migration.shutil.copy2
-        original_copytree = data_migration.shutil.copytree
-
-        def reject_sentinel_read(path, *args, **kwargs):
-            if Path(path) in {source_sentinel, target_sentinel}:
-                raise AssertionError("legacy memory JSON was read")
-            return original_read_text(path, *args, **kwargs)
-
-        def reject_sentinel_open(path, *args, **kwargs):
-            if Path(path) in {source_sentinel, target_sentinel}:
-                raise AssertionError("legacy memory JSON was opened")
-            return original_open(path, *args, **kwargs)
-
-        def reject_sentinel_copy(source, destination, *args, **kwargs):
-            if Path(source) in {source_sentinel, target_sentinel}:
-                raise AssertionError("legacy memory JSON was copied")
-            return original_copy2(source, destination, *args, **kwargs)
-
-        def reject_target_tree_copy(source, destination, *args, **kwargs):
-            if Path(source) in {self.source, self.target}:
-                raise AssertionError("legacy data directory was copied")
-            return original_copytree(source, destination, *args, **kwargs)
-
-        with (
-            patch.object(Path, "read_text", reject_sentinel_read),
-            patch.object(Path, "open", reject_sentinel_open),
-            patch.object(data_migration.shutil, "copy2", reject_sentinel_copy),
-            patch.object(data_migration.shutil, "copytree", reject_target_tree_copy),
+        with legacy_memory_io_guards(
+            data_migration,
+            self.source,
+            self.target,
         ):
             backup = data_migration.migrate_legacy_data(
                 self.source,
@@ -244,8 +310,116 @@ class DataMigrationTests(unittest.TestCase):
 
                 self.assert_clean_retry(source, target, had_target=had_target)
 
+    def test_active_history_backup_failure_preserves_everything_and_allows_retry(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        self.write_memory_sentinels(self.source, self.target)
+
+        from src.utils.data_migration import MigrationError
+
+        active = self.target / "history" / "private_1.json"
+        with self.patch_replace_failure(
+            lambda path, destination: path == active
+            and destination.parent.parent.name.startswith(".qqbot_data.rollback-")
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_memory_sentinels_unchanged(self.source, self.target)
+        self.assertEqual(
+            ["旧消息"],
+            [item["content"] for item in read_json(self.source / "history" / "private_1.json")["messages"]],
+        )
+        self.assertEqual(
+            ["新消息"],
+            [item["content"] for item in read_json(active)["messages"]],
+        )
+        self.assertFalse(self.target.with_name(".qqbot_data.migration-state").exists())
+        self.assertEqual([], list(self.root.glob("atri_data.backup-*")))
+        self.assertEqual([], list(self.root.glob(".qqbot_data.*-*")))
+
+        self.assertIsNotNone(self.migrate(self.source, self.target))
+        self.assertEqual(
+            ["旧消息", "新消息"],
+            [item["content"] for item in read_json(active)["messages"]],
+        )
+        self.assertEqual(
+            {"facts": ["目标记忆"]},
+            read_json(self.target / "memories" / "private.json"),
+        )
+
+    def test_mid_install_failure_restores_all_history_files_and_leaves_memory_untouched(self):
+        for name in ("private_1.json", "private_2.json"):
+            write_json(
+                self.source / "history" / name,
+                {"messages": [{"role": "user", "content": f"源-{name}"}]},
+            )
+            write_json(
+                self.target / "history" / name,
+                {"messages": [{"role": "assistant", "content": f"目标-{name}"}]},
+            )
+        self.write_memory_sentinels(self.source, self.target)
+
+        from src.utils.data_migration import MigrationError
+
+        failed_name = "private_2.json"
+        with self.patch_replace_failure(
+            lambda path, destination: path.name == failed_name
+            and path.parent.parent.name.startswith(".qqbot_data.migrating-")
+            and destination == self.target / "history" / failed_name
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_memory_sentinels_unchanged(self.source, self.target)
+        for name in ("private_1.json", "private_2.json"):
+            self.assertEqual(
+                [f"源-{name}"],
+                [item["content"] for item in read_json(self.source / "history" / name)["messages"]],
+            )
+            self.assertEqual(
+                [f"目标-{name}"],
+                [item["content"] for item in read_json(self.target / "history" / name)["messages"]],
+            )
+        self.assertFalse(self.target.with_name(".qqbot_data.migration-state").exists())
+        self.assertEqual([], list(self.root.glob(".qqbot_data.*-*")))
+        self.assertEqual([], list(self.root.glob("atri_data.backup-*")))
+
+    def test_persistent_staging_cleanup_failure_preserves_recovery_material(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        self.write_memory_sentinels(self.source, self.target)
+
+        from src.utils import data_migration
+
+        original_rmtree = data_migration.shutil.rmtree
+
+        def fail_staging_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith(".qqbot_data.migrating-"):
+                raise OSError("persistent staging cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with patch.object(data_migration.shutil, "rmtree", side_effect=fail_staging_cleanup):
+            with self.assertRaises(data_migration.MigrationError):
+                self.migrate(self.source, self.target)
+
+        self.assert_memory_sentinels_unchanged(self.source, self.target)
+        self.assertEqual(
+            ["旧消息"],
+            [item["content"] for item in read_json(self.source / "history" / "private_1.json")["messages"]],
+        )
+        self.assertEqual(
+            ["新消息"],
+            [item["content"] for item in read_json(self.target / "history" / "private_1.json")["messages"]],
+        )
+        self.assertTrue(self.target.with_name(".qqbot_data.migration-state").exists())
+        self.assertEqual(1, len(list(self.root.glob(".qqbot_data.migrating-*"))))
+        self.assertEqual([], list(self.root.glob("atri_data.backup-*")))
+
+        with self.assertRaises(data_migration.MigrationError):
+            self.migrate(self.source, self.target)
+
     def test_failed_history_restore_keeps_original_history_for_manual_recovery(self):
         self.write_history_pair(self.source, self.target, had_target=True)
+        self.write_memory_sentinels(self.source, self.target)
 
         from src.utils.data_migration import MigrationError
 
@@ -265,6 +439,10 @@ class DataMigrationTests(unittest.TestCase):
 
         rollback = list(self.root.glob(".qqbot_data.rollback-*"))
         self.assertEqual(1, len(rollback))
+        self.assert_memory_sentinels_unchanged(self.source, self.target)
+        self.assertTrue(self.source.exists())
+        self.assertFalse((self.target / "history" / "private_1.json").exists())
+        self.assertTrue(self.target.with_name(".qqbot_data.migration-state").exists())
         self.assertEqual(
             ["新消息"],
             [
@@ -274,6 +452,95 @@ class DataMigrationTests(unittest.TestCase):
                 )["messages"]
             ],
         )
+
+    def test_rollback_cleanup_rename_failure_keeps_committed_history_and_marker(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        self.write_memory_sentinels(self.source, self.target)
+
+        from src.utils.data_migration import MigrationError
+
+        with self.patch_replace_failure(
+            lambda path, destination: path.name.startswith(".qqbot_data.rollback-")
+            and destination.name.startswith(".qqbot_data.cleanup-")
+        ):
+            with self.assertRaises(MigrationError):
+                self.migrate(self.source, self.target)
+
+        backup = list(self.root.glob("atri_data.backup-*"))
+        rollback = list(self.root.glob(".qqbot_data.rollback-*"))
+        self.assertEqual(1, len(backup))
+        self.assertEqual(1, len(rollback))
+        self.assertFalse(self.source.exists())
+        self.assertEqual(
+            {"facts": ["源记忆"]},
+            read_json(backup[0] / "memories" / "global.json"),
+        )
+        self.assertEqual(
+            {"facts": ["目标记忆"]},
+            read_json(self.target / "memories" / "private.json"),
+        )
+        self.assertEqual(
+            ["旧消息", "新消息"],
+            [
+                item["content"]
+                for item in read_json(
+                    self.target / "history" / "private_1.json"
+                )["messages"]
+            ],
+        )
+        self.assertTrue(self.target.with_name(".qqbot_data.migration-state").exists())
+        with self.assertRaises(MigrationError):
+            self.migrate(self.source, self.target)
+
+    def test_partial_commit_cleanup_keeps_committed_data_and_cleanup_artifact(self):
+        self.write_history_pair(self.source, self.target, had_target=True)
+        self.write_memory_sentinels(self.source, self.target)
+
+        from src.utils import data_migration
+
+        original_rmtree = data_migration.shutil.rmtree
+        cleaned = []
+
+        def partially_delete_cleanup(path, *args, **kwargs):
+            path = Path(path)
+            old_history = path / "history" / "private_1.json"
+            if path.name.startswith(".qqbot_data.cleanup-") and old_history.exists():
+                old_history.unlink()
+                cleaned.append(path)
+                raise OSError("partial post-commit cleanup failure")
+            return original_rmtree(path, *args, **kwargs)
+
+        with patch.object(
+            data_migration.shutil,
+            "rmtree",
+            side_effect=partially_delete_cleanup,
+        ):
+            backup = self.migrate(self.source, self.target)
+
+        self.assertTrue(backup.exists())
+        self.assertFalse(self.source.exists())
+        self.assertEqual(1, len(cleaned))
+        self.assertEqual(
+            {"facts": ["源记忆"]},
+            read_json(backup / "memories" / "global.json"),
+        )
+        self.assertEqual(
+            {"facts": ["目标记忆"]},
+            read_json(self.target / "memories" / "private.json"),
+        )
+        self.assertEqual(
+            ["旧消息", "新消息"],
+            [
+                item["content"]
+                for item in read_json(
+                    self.target / "history" / "private_1.json"
+                )["messages"]
+            ],
+        )
+        self.assertFalse(self.target.with_name(".qqbot_data.migration-state").exists())
+        cleanup = list(self.root.glob(".qqbot_data.cleanup-*"))
+        self.assertEqual(1, len(cleanup))
+        self.assertFalse((cleanup[0] / "history" / "private_1.json").exists())
 
     def test_partial_failed_cleanup_after_recovery_does_not_keep_transaction_locked(self):
         self.write_history_pair(self.source, self.target, had_target=True)
@@ -519,33 +786,8 @@ class StartupMigrationTests(unittest.TestCase):
             )
             store = MemoryStore(fake_config.data_dir / "memory.sqlite3")
             service = MemoryService(store=store)
-            original_read_text = Path.read_text
-            original_open = Path.open
 
             from src.utils import data_migration
-
-            original_copytree = data_migration.shutil.copytree
-            original_copy2 = data_migration.shutil.copy2
-
-            def reject_sentinel_read(path, *args, **kwargs):
-                if Path(path) in {source_sentinel, target_sentinel}:
-                    raise AssertionError("legacy memory JSON was read")
-                return original_read_text(path, *args, **kwargs)
-
-            def reject_sentinel_open(path, *args, **kwargs):
-                if Path(path) in {source_sentinel, target_sentinel}:
-                    raise AssertionError("legacy memory JSON was opened")
-                return original_open(path, *args, **kwargs)
-
-            def reject_target_tree_copy(source, destination, *args, **kwargs):
-                if Path(source) in {base_dir / "atri_data", fake_config.data_dir}:
-                    raise AssertionError("legacy data directory was copied")
-                return original_copytree(source, destination, *args, **kwargs)
-
-            def reject_sentinel_copy(source, destination, *args, **kwargs):
-                if Path(source) in {source_sentinel, target_sentinel}:
-                    raise AssertionError("legacy memory JSON was copied")
-                return original_copy2(source, destination, *args, **kwargs)
 
             try:
                 with (
@@ -553,10 +795,11 @@ class StartupMigrationTests(unittest.TestCase):
                     patch.object(main, "config", fake_config),
                     patch.object(main, "get_persona"),
                     patch.object(main, "get_memory_service", return_value=service),
-                    patch.object(Path, "read_text", reject_sentinel_read),
-                    patch.object(Path, "open", reject_sentinel_open),
-                    patch.object(data_migration.shutil, "copytree", reject_target_tree_copy),
-                    patch.object(data_migration.shutil, "copy2", reject_sentinel_copy),
+                    legacy_memory_io_guards(
+                        data_migration,
+                        base_dir / "atri_data",
+                        fake_config.data_dir,
+                    ),
                 ):
                     main.startup()
             finally:
