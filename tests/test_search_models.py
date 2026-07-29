@@ -267,7 +267,7 @@ class SearchModelContractTests(unittest.TestCase):
                 "requested_url", "final_url", "content_type", "title", "excerpt",
                 "fetch_status", "untrusted_content_flags",
             ),
-            "EvidenceCandidate": ("hit", "document", "excerpt", "excerpt_origin", "extraction_status", "safety_flags"),
+            "EvidenceCandidate": ("hit", "document", "excerpt", "excerpt_origin", "extraction_status", "safety_flags", "content_reads_consumed"),
             "EvidenceGapAnalysis": (
                 "missing_claim_topics", "conflict_group_ids", "repair_eligible",
                 "repair_purpose", "repair_reason_codes",
@@ -349,6 +349,27 @@ class SearchModelContractTests(unittest.TestCase):
             m.ProviderAttempt("fake", m.ProviderStatus.SUCCESS, 1, math.inf)
         with self.assertRaises(TypeError):
             m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT, provider_attempts=(Decimal("1"),)).to_log_dict()
+
+    def test_trace_final_boundary_redacts_all_identifier_locations(self):
+        m = models()
+        probes = ("https://private.invalid/a", "sk-live-secret", "qq=123456789", "raw query text", "a@b.com")
+        for probe in probes:
+            with self.subTest(probe=probe):
+                trace = m.SearchTrace(probe, m.RequestSource.CHAT, m.SearchTier.LIGHT, adaptive_repair_query=(probe, m.QueryPurpose.REPAIR), executed_queries=((probe, m.QueryPurpose.DIRECT),))
+                payload = json.dumps(trace.to_log_dict())
+                self.assertNotIn(probe, payload)
+                self.assertIn("[redacted]", payload)
+
+    def test_evidence_candidate_read_accounting_is_closed(self):
+        m = models()
+        hit = m.ProviderHit("p", "q", "t", "https://example.com", None, None, None, None, ())
+        for consumed in (0, 1):
+            candidate = m.EvidenceCandidate(hit, None, None, None, "snippet", (), consumed)
+            self.assertEqual(consumed, candidate.content_reads_consumed)
+        for consumed in (2, True, -1):
+            with self.subTest(consumed=consumed):
+                with self.assertRaises(ValueError):
+                    m.EvidenceCandidate(hit, None, None, None, "snippet", (), consumed)
 
     @staticmethod
     def _search_decision(m):

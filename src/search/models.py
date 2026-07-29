@@ -370,7 +370,10 @@ class SearchPlan:
     budget: TierBudget
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, entities=_tuple(self.entities), initial_queries=_tuple(self.initial_queries), required_topics=_tuple(self.required_topics), required_source_relations=_frozenset(self.required_source_relations), query_redaction_codes=_tuple(self.query_redaction_codes))
+        time_window = None if self.time_window is None else _tuple(self.time_window)
+        if time_window is not None and (len(time_window) != 2 or any(item is not None and not isinstance(item, date) for item in time_window)):
+            raise ValueError("time_window must be a two-element date tuple")
+        _normalize_fields(self, entities=_tuple(self.entities), time_window=time_window, initial_queries=_tuple(self.initial_queries), required_topics=_tuple(self.required_topics), required_source_relations=_frozenset(self.required_source_relations), query_redaction_codes=_tuple(self.query_redaction_codes))
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
 
@@ -485,6 +488,12 @@ class ProviderReadiness:
     def __post_init__(self) -> None:
         if self.reason_code is not None:
             _require_enum(self.reason_code, SearchFailureCode, "reason_code")
+        if self.available and not self.configured:
+            raise ValueError("unconfigured providers cannot be available")
+        if self.available and self.reason_code is not None:
+            raise ValueError("available providers cannot have a failure reason")
+        if not self.available and self.reason_code is None:
+            raise ValueError("unavailable providers require a failure reason")
 
 
 @dataclass(frozen=True)
@@ -514,6 +523,10 @@ class ProviderResult:
         _require_safe_metadata(self.provider, "provider")
         _require_enum(self.status, ProviderStatus, "status")
         _require_number(self.latency_ms, "latency_ms")
+        if self.status is ProviderStatus.SUCCESS and not self.hits:
+            raise ValueError("successful provider result requires hits")
+        if self.status is not ProviderStatus.SUCCESS and self.hits:
+            raise ValueError("non-success provider result cannot contain hits")
 
 
 @dataclass(frozen=True)
@@ -538,11 +551,14 @@ class EvidenceCandidate:
     excerpt_origin: ExcerptOrigin | None
     extraction_status: str
     safety_flags: tuple[str, ...]
+    content_reads_consumed: int
 
     def __post_init__(self) -> None:
         _normalize_fields(self, safety_flags=_tuple(self.safety_flags))
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
+        if type(self.content_reads_consumed) is not int or self.content_reads_consumed not in (0, 1):
+            raise ValueError("content_reads_consumed must be 0 or 1")
 
 
 @dataclass(frozen=True)
@@ -665,7 +681,7 @@ class SearchTrace:
 
     def to_log_dict(self) -> dict[str, Any]:
         values = {
-            "request_id": self.request_id,
+            "request_id": _safe_log_identifier(self.request_id),
             "request_source": self.request_source,
             "route": self.route,
             "skip_reason": self.skip_reason,
@@ -742,13 +758,7 @@ class SearchPipelineResult:
         if self.plan is None:
             raise ValueError("search results require a plan")
         if self.evidence is None:
-            if self.failure_code not in {
-                SearchFailureCode.PROVIDER_NOT_CONFIGURED,
-                SearchFailureCode.PROVIDER_UNAVAILABLE,
-                SearchFailureCode.PROVIDER_TIMEOUT,
-                SearchFailureCode.NO_RESULTS,
-                SearchFailureCode.CONTENT_UNREADABLE,
-            }:
+            if self.failure_code is not SearchFailureCode.PROVIDER_NOT_CONFIGURED:
                 raise ValueError("evidence-free search results require a pre-evidence failure")
             return
         state_failures = {
@@ -757,7 +767,10 @@ class SearchPipelineResult:
             EvidenceState.CONFLICTING: SearchFailureCode.SOURCE_CONFLICT,
             EvidenceState.INSUFFICIENT: SearchFailureCode.INSUFFICIENT_EVIDENCE,
         }
-        if self.failure_code is not state_failures[self.evidence.evidence_state]:
+        allowed = {state_failures[self.evidence.evidence_state]}
+        if self.evidence.evidence_state is EvidenceState.INSUFFICIENT:
+            allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}
+        if self.failure_code not in allowed:
             raise ValueError("failure_code must match evidence state")
 
 
@@ -765,10 +778,10 @@ def _query_metadata(query: SearchQuery | tuple[str, QueryPurpose] | None) -> dic
     if query is None:
         return None
     if isinstance(query, SearchQuery):
-        return {"query_id": query.query_id, "purpose": query.purpose.value}
+        return {"query_id": _safe_log_identifier(query.query_id), "purpose": query.purpose.value}
     query_id, purpose = query
     _require_enum(purpose, QueryPurpose, "query purpose")
-    return {"query_id": query_id, "purpose": purpose.value}
+    return {"query_id": _safe_log_identifier(query_id), "purpose": purpose.value}
 
 
 def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
@@ -791,3 +804,9 @@ def _json_safe(value: Any) -> Any:
             raise ValueError("log values must be finite")
         return value
     raise TypeError(f"unsupported log value: {type(value).__name__}")
+
+
+def _safe_log_identifier(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 80 or _is_sensitive(value) or any(char.isspace() for char in value) or "@" in value or value.startswith(("sk-", "ghp_", "CQ:", "data:")):
+        return "[redacted]"
+    return value
