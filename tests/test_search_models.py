@@ -371,6 +371,39 @@ class SearchModelContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     m.EvidenceCandidate(hit, None, None, None, "snippet", (), consumed)
 
+    def test_every_failure_code_pipeline_shape_is_closed(self):
+        m = models()
+        decision = self._search_decision(m)
+        trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT)
+        for code in m.SearchFailureCode:
+            with self.subTest(code=code):
+                if code is m.SearchFailureCode.PROVIDER_NOT_CONFIGURED:
+                    m.SearchPipelineResult(decision, object(), None, trace, code)
+                else:
+                    with self.assertRaises(ValueError):
+                        m.SearchPipelineResult(decision, object(), None, trace, code)
+        for code in (m.SearchFailureCode.PROVIDER_UNAVAILABLE, m.SearchFailureCode.PROVIDER_TIMEOUT, m.SearchFailureCode.NO_RESULTS, m.SearchFailureCode.CONTENT_UNREADABLE):
+            bundle = type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})()
+            m.SearchPipelineResult(decision, object(), bundle, trace, code)
+        for state, code in ((m.EvidenceState.SUFFICIENT, None), (m.EvidenceState.PARTIAL, m.SearchFailureCode.PARTIAL_EVIDENCE), (m.EvidenceState.CONFLICTING, m.SearchFailureCode.SOURCE_CONFLICT), (m.EvidenceState.INSUFFICIENT, m.SearchFailureCode.INSUFFICIENT_EVIDENCE)):
+            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": state})(), trace, code)
+        with self.assertRaises(ValueError):
+            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})(), trace, m.SearchFailureCode.VALIDATION_FAILED)
+
+    def test_provider_readiness_and_result_state_tables(self):
+        m = models()
+        for values in ((True, True, None), (False, False, m.SearchFailureCode.PROVIDER_NOT_CONFIGURED), (True, False, m.SearchFailureCode.PROVIDER_UNAVAILABLE)):
+            m.ProviderReadiness("provider", *values)
+        for values in ((False, True, None), (True, True, m.SearchFailureCode.PROVIDER_UNAVAILABLE), (False, False, None)):
+            with self.assertRaises(ValueError):
+                m.ProviderReadiness("provider", *values)
+        hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, ())
+        m.ProviderResult("p", m.ProviderStatus.SUCCESS, [hit], 1)
+        m.ProviderResult("p", m.ProviderStatus.EMPTY, [], 1)
+        for status, hits in ((m.ProviderStatus.SUCCESS, []), (m.ProviderStatus.EMPTY, [hit]), (m.ProviderStatus.ERROR, [hit])):
+            with self.assertRaises(ValueError):
+                m.ProviderResult("p", status, hits, 1)
+
     @staticmethod
     def _search_decision(m):
         return m.RetrievalDecision(
