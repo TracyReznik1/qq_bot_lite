@@ -110,6 +110,59 @@ def _best_effort_cleanup(path: Path) -> None:
         logger.warning("Migration cleanup remains at %s", path)
 
 
+def _restore_history(
+    *,
+    target: Path,
+    rollback: Path,
+    failed: Path,
+    names: list[str],
+    installed: list[str],
+    created_target: bool,
+    created_history: bool,
+) -> list[Exception]:
+    errors: list[Exception] = []
+    history = target / "history"
+
+    for name in reversed(installed):
+        active = history / name
+        if not active.exists():
+            continue
+        try:
+            destination = failed / "history" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            active.replace(destination)
+        except Exception as error:
+            errors.append(error)
+
+    for name in names:
+        original = rollback / "history" / name
+        if not original.exists():
+            continue
+        try:
+            history.mkdir(parents=True, exist_ok=True)
+            original.replace(history / name)
+        except Exception as error:
+            errors.append(error)
+
+    if not errors:
+        try:
+            _remove_tree(rollback)
+        except Exception as error:
+            errors.append(error)
+
+    if created_history and history.exists():
+        try:
+            history.rmdir()
+        except OSError as error:
+            errors.append(error)
+    if created_target and target.exists():
+        try:
+            target.rmdir()
+        except OSError as error:
+            errors.append(error)
+    return errors
+
+
 def _rollback_transaction(
     *,
     state: Path,
@@ -120,8 +173,10 @@ def _rollback_transaction(
     rollback: Path,
     failed: Path,
     cleanup: Path,
-    had_target: bool,
-    installed_staging: bool,
+    names: list[str],
+    installed: list[str],
+    created_target: bool,
+    created_history: bool,
 ) -> bool:
     recovery_errors: list[Exception] = []
 
@@ -131,45 +186,41 @@ def _rollback_transaction(
         except Exception as error:
             recovery_errors.append(error)
 
-    if installed_staging and target.exists():
-        try:
-            target.replace(failed)
-        except Exception as error:
-            recovery_errors.append(error)
-
-    if had_target and rollback.exists():
-        try:
-            rollback.replace(target)
-        except Exception as error:
-            recovery_errors.append(error)
+    recovery_errors.extend(
+        _restore_history(
+            target=target,
+            rollback=rollback,
+            failed=failed,
+            names=names,
+            installed=installed,
+            created_target=created_target,
+            created_history=created_history,
+        )
+    )
 
     try:
         _remove_tree(staging)
     except Exception as error:
         recovery_errors.append(error)
 
-    original_target_restored = (
-        target.exists() and not rollback.exists()
-        if had_target
-        else not target.exists() and not rollback.exists()
+    recovered = (
+        not recovery_errors
+        and source.exists()
+        and not backup.exists()
+        and not staging.exists()
+        and not rollback.exists()
     )
-    if source.exists() and original_target_restored:
+    if recovered:
         if failed.exists():
             try:
                 failed.replace(cleanup)
             except Exception as error:
                 recovery_errors.append(error)
-
-    recovered = (
-        not recovery_errors
-        and source.exists()
-        and not backup.exists()
-        and original_target_restored
-        and not staging.exists()
-        and not rollback.exists()
-        and not failed.exists()
-    )
-    if recovered:
+                recovered = False
+        if not recovered:
+            for error in recovery_errors:
+                logger.error("Data migration recovery step failed: %s", error)
+            return False
         try:
             state.unlink()
         except Exception as error:
@@ -209,8 +260,17 @@ def migrate_legacy_data(
     rollback = target.with_name(f".{target.name}.rollback-{token}")
     failed = target.with_name(f".{target.name}.failed-{token}")
     cleanup = target.with_name(f".{target.name}.cleanup-{token}")
-    had_target = target.exists()
-    installed_staging = False
+    names = sorted(
+        {
+            path.name
+            for directory in (source / "history", target / "history")
+            if directory.exists()
+            for path in directory.glob("*.json")
+        }
+    )
+    created_target = not target.exists()
+    created_history = not (target / "history").exists()
+    installed: list[str] = []
     stamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = _backup_path(source, stamp)
 
@@ -224,23 +284,26 @@ def migrate_legacy_data(
             "failed": str(failed),
             "cleanup": str(cleanup),
             "backup": str(backup),
-            "had_target": had_target,
+            "history_names": names,
         },
     )
 
     try:
         staging.mkdir()
-        if had_target:
-            shutil.copytree(target, staging, dirs_exist_ok=True)
-        _validate_history_json(source)
-        _validate_history_json(target)
         _merge_history(source, target, staging, history_turns)
         _validate_history_json(staging)
-
-        if had_target:
-            target.replace(rollback)
-        staging.replace(target)
-        installed_staging = True
+        target_history = target / "history"
+        if names:
+            target_history.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            active = target_history / name
+            if active.exists():
+                original = rollback / "history" / name
+                original.parent.mkdir(parents=True, exist_ok=True)
+                active.replace(original)
+            (staging / "history" / name).replace(active)
+            installed.append(name)
+        _remove_tree(staging)
         source.replace(backup)
     except Exception as error:
         recovered = _rollback_transaction(
@@ -252,8 +315,10 @@ def migrate_legacy_data(
             rollback=rollback,
             failed=failed,
             cleanup=cleanup,
-            had_target=had_target,
-            installed_staging=installed_staging,
+            names=names,
+            installed=installed,
+            created_target=created_target,
+            created_history=created_history,
         )
         if not recovered:
             logger.error(
@@ -271,7 +336,6 @@ def migrate_legacy_data(
     if (
         source.exists()
         or not backup.exists()
-        or not target.exists()
         or staging.exists()
         or rollback.exists()
         or failed.exists()
