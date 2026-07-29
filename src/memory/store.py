@@ -890,7 +890,7 @@ class MemoryStore:
                 or target.subject_type != "qq_user"
                 or target.subject_id != actor_qq
                 or target.speaker_qq == actor_qq
-                or target.status != "active"
+                or target.status not in ("active", "disputed")
             ):
                 return None
             connection.execute(

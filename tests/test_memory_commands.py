@@ -479,6 +479,81 @@ class MemoryCommandsTests(unittest.TestCase):
         }
         self.assertNotIn(target.id, answer_ids)
 
+    def test_group_claim_subject_can_suppress_current_disputed_claim(self):
+        target = self.create_claim(
+            scope_type="group",
+            scope_id="2001",
+            speaker="1002",
+            subject="1001",
+            predicate="likes",
+            value="已存在其他冲突",
+            status="disputed",
+        )
+        memory_context = MemoryContext(
+            user_id="1001",
+            session_key="group:2001:1001",
+            is_group=True,
+            group_id="2001",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key=memory_context.session_key,
+            raw_message=f"/forget {target.id}",
+            memory_context=memory_context,
+            message_id="forget-disputed-as-subject",
+        )
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=str(target.id),
+        )
+
+        result = handle_command(route, context, store=self.store)
+
+        self.assertEqual("disputed", result.outcome.status)
+        self.assertEqual("subject_dispute", result.outcome.cause)
+        self.assertEqual("disputed", self.store.get_claim(target.id).status)
+        self.assertIn(
+            target.id,
+            self.store.subject_dispute_suppressed_ids((target.id,)),
+        )
+        answer_ids = {
+            item.claim.id
+            for item in MemoryRetriever(self.store).retrieve(
+                memory_context,
+                "已存在其他冲突",
+            )
+        }
+        self.assertNotIn(target.id, answer_ids)
+
+    def test_subject_dispute_rejects_noncurrent_group_claim_statuses(self):
+        for status in ("retracted", "superseded", "archived"):
+            with self.subTest(status=status):
+                target = self.create_claim(
+                    scope_type="group",
+                    scope_id="2001",
+                    speaker="1002",
+                    subject="1001",
+                    predicate=f"status-{status}",
+                    value=f"不可争议-{status}",
+                    status=status,
+                )
+
+                disputed = self.store.register_subject_dispute(
+                    target.id,
+                    actor_qq="1001",
+                    group_id="2001",
+                    source_message_id=f"dispute-{status}",
+                )
+
+                self.assertIsNone(disputed)
+                self.assertEqual(status, self.store.get_claim(target.id).status)
+                self.assertNotIn(
+                    target.id,
+                    self.store.subject_dispute_suppressed_ids((target.id,)),
+                )
+
     def test_committed_author_retraction_cannot_be_overwritten_by_subject_dispute(self):
         target = self.create_claim(
             scope_type="group",
@@ -820,6 +895,142 @@ class MemoryCommandsTests(unittest.TestCase):
         self.assertEqual("failed", result.outcome.status)
         self.assertEqual("store_unavailable", result.outcome.cause)
         self.assertIn("retryable=true", result.outcome.facts)
+        self.assertIsNotNone(self.store.get_claim(target.id))
+
+    def test_forget_get_claim_error_returns_persona_aware_store_unavailable(self):
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                return f"persona::{fallback}"
+
+        renderer = Renderer()
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query="42",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/forget 42",
+            message_id="forget-get-claim-error",
+        )
+
+        with mock.patch.object(
+            self.store,
+            "get_claim",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = handle_command(
+                route,
+                context,
+                store=self.store,
+                renderer=renderer,
+            )
+
+        self.assertEqual("failed", result.outcome.status)
+        self.assertEqual("store_unavailable", result.outcome.cause)
+        self.assertIn("retryable=true", result.outcome.facts)
+        self.assertTrue(result.reply.startswith("persona::"))
+        self.assertEqual("failed", renderer.facts.status)
+
+    def test_forget_pending_lookup_error_returns_persona_aware_store_unavailable(self):
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                return f"persona::{fallback}"
+
+        renderer = Renderer()
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query="4242",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/forget 4242",
+            message_id="forget-pending-lookup-error",
+        )
+
+        with mock.patch.object(
+            self.store,
+            "retry_pending_delete_cleanup",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = handle_command(
+                route,
+                context,
+                store=self.store,
+                renderer=renderer,
+            )
+
+        self.assertEqual("failed", result.outcome.status)
+        self.assertEqual("store_unavailable", result.outcome.cause)
+        self.assertIn("retryable=true", result.outcome.facts)
+        self.assertIn(
+            "本次未能确认或执行记忆变更",
+            result.outcome.fallback_reply,
+        )
+        self.assertTrue(result.reply.startswith("persona::"))
+        self.assertEqual("failed", renderer.facts.status)
+
+    def test_forget_description_lookup_error_returns_persona_aware_store_unavailable(self):
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                return f"persona::{fallback}"
+
+        target = self.create_claim(
+            scope_type="private",
+            scope_id="1001",
+            speaker="1001",
+            subject="1001",
+            predicate="likes",
+            value="描述查询故障保护",
+        )
+        renderer = Renderer()
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query="查询故障",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message="/forget 查询故障",
+            message_id="forget-description-lookup-error",
+        )
+
+        with mock.patch.object(
+            self.store,
+            "find_claims_exact",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = handle_command(
+                route,
+                context,
+                store=self.store,
+                renderer=renderer,
+            )
+
+        self.assertEqual("failed", result.outcome.status)
+        self.assertEqual("store_unavailable", result.outcome.cause)
+        self.assertIn("retryable=true", result.outcome.facts)
+        self.assertTrue(result.reply.startswith("persona::"))
+        self.assertEqual("failed", renderer.facts.status)
         self.assertIsNotNone(self.store.get_claim(target.id))
 
     def test_operational_error_after_delete_commit_reports_partial_and_retries(self):

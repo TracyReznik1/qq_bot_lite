@@ -399,16 +399,21 @@ def _permitted_claims(
 
 
 def _store_unavailable_forget_result(
-    claim_id: int,
+    claim_reference: int | str,
     claim_scope: str,
 ) -> CommandResult:
+    reference_label = (
+        f"ID: {claim_reference}"
+        if str(claim_reference).isdigit()
+        else f"目标: {claim_reference}"
+    )
     reply = (
-        f"记忆存储暂时不可用，尚未删除记忆 (ID: {claim_id})："
+        f"记忆存储暂时不可用，本次未能确认或执行记忆变更 ({reference_label})："
         f"scope={claim_scope}；status=failed；cause=store_unavailable。"
     )
     outcome = CommandOutcome(
         code="forget_failed",
-        facts=(str(claim_id), "retryable=true"),
+        facts=(str(claim_reference), "retryable=true"),
         fallback_reply=reply,
         status="failed",
         scope=claim_scope,
@@ -432,58 +437,64 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
         return CommandResult(handled=True, reply=reply, outcome=outcome)
 
     matched_claims: list[MemoryClaim] = []
-    if target.isdigit():
-        exact = store.get_claim(int(target))
-        if exact is not None and _claim_is_permitted(context, exact):
-            matched_claims = [exact]
-        elif exact is None:
-            retry = store.retry_pending_delete_cleanup(
-                int(target),
-                actor_qq=context.uid,
-                is_admin=context.is_admin,
-            )
-            if retry is not None:
-                deletion, claim_scope = retry
-                if deletion.status == "cleanup_completed":
-                    prefix = "已完成记忆隐私清理"
-                    cause = "privacy_cleanup_completed"
-                else:
-                    prefix = "记忆正文已删除但隐私清理仍待重试"
-                    cause = "privacy_cleanup_pending"
-                reply = (
-                    f"{prefix} (ID: {target})：scope={claim_scope}；"
-                    f"status={deletion.status}；cause={cause}。"
+    try:
+        if target.isdigit():
+            exact = store.get_claim(int(target))
+            if exact is not None and _claim_is_permitted(context, exact):
+                matched_claims = [exact]
+            elif exact is None:
+                retry = store.retry_pending_delete_cleanup(
+                    int(target),
+                    actor_qq=context.uid,
+                    is_admin=context.is_admin,
                 )
-                outcome = CommandOutcome(
-                    code=(
-                        "forget_cleanup_completed"
-                        if deletion.cleanup_complete
-                        else "forget_partial"
-                    ),
-                    facts=(
-                        target,
-                        f"retryable={str(deletion.retryable).lower()}",
-                    ),
-                    fallback_reply=reply,
-                    status=deletion.status,
-                    scope=claim_scope,
-                    cause=cause,
+                if retry is not None:
+                    deletion, claim_scope = retry
+                    if deletion.status == "cleanup_completed":
+                        prefix = "已完成记忆隐私清理"
+                        cause = "privacy_cleanup_completed"
+                    else:
+                        prefix = "记忆正文已删除但隐私清理仍待重试"
+                        cause = "privacy_cleanup_pending"
+                    reply = (
+                        f"{prefix} (ID: {target})：scope={claim_scope}；"
+                        f"status={deletion.status}；cause={cause}。"
+                    )
+                    outcome = CommandOutcome(
+                        code=(
+                            "forget_cleanup_completed"
+                            if deletion.cleanup_complete
+                            else "forget_partial"
+                        ),
+                        facts=(
+                            target,
+                            f"retryable={str(deletion.retryable).lower()}",
+                        ),
+                        fallback_reply=reply,
+                        status=deletion.status,
+                        scope=claim_scope,
+                        cause=cause,
+                    )
+                    return CommandResult(
+                        handled=True,
+                        reply=reply,
+                        outcome=outcome,
+                    )
+        else:
+            low_target = target.lower()
+            matched_claims = [
+                claim
+                for claim in _permitted_claims(context, store)
+                if (
+                    low_target in claim.value.lower()
+                    or low_target in claim.predicate.lower()
                 )
-                return CommandResult(
-                    handled=True,
-                    reply=reply,
-                    outcome=outcome,
-                )
-    else:
-        low_target = target.lower()
-        matched_claims = [
-            claim
-            for claim in _permitted_claims(context, store)
-            if (
-                low_target in claim.value.lower()
-                or low_target in claim.predicate.lower()
-            )
-        ]
+            ]
+    except sqlite3.Error:
+        return _store_unavailable_forget_result(
+            target,
+            _context_scope(context),
+        )
 
     if not matched_claims:
         reply = "未找到匹配的记忆。"
