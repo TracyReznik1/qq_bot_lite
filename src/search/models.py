@@ -218,6 +218,26 @@ def _normalize_fields(instance: Any, **values: Any) -> None:
         object.__setattr__(instance, name, value)
 
 
+def _strings(values: Any, field_name: str) -> tuple[str, ...]:
+    result = _tuple(values)
+    if any(type(value) is not str for value in result):
+        raise TypeError(f"{field_name} must contain strings")
+    return result
+
+
+def _records(values: Any, record_type: type[Any], field_name: str) -> tuple[Any, ...]:
+    result = _tuple(values)
+    if any(not isinstance(value, record_type) for value in result):
+        raise TypeError(f"{field_name} must contain {record_type.__name__}")
+    return result
+
+
+def _enum_set(values: Any, enum_type: type[StrEnum], field_name: str) -> frozenset[Any]:
+    result = _frozenset(values)
+    _require_enum_values(result, enum_type, field_name)
+    return result
+
+
 def _require_number(value: Any, field_name: str, *, non_negative: bool = True) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"{field_name} must be a finite number")
@@ -264,7 +284,7 @@ class RetrievalDecision:
     final_reason_codes: tuple[TriggerCode, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, trigger_codes=_tuple(self.trigger_codes), benefit_dimensions=_frozenset(self.benefit_dimensions), final_reason_codes=_tuple(self.final_reason_codes))
+        _normalize_fields(self, trigger_codes=_tuple(self.trigger_codes), benefit_dimensions=_enum_set(self.benefit_dimensions, BenefitDimension, "benefit_dimensions"), final_reason_codes=_tuple(self.final_reason_codes))
         _require_enum(self.route, SearchTier, "route")
         if self.skip_reason is not None:
             _require_enum(self.skip_reason, SkipReason, "skip_reason")
@@ -351,7 +371,7 @@ class SearchQuery:
     exclude_domains: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, include_domains=_tuple(self.include_domains), exclude_domains=_tuple(self.exclude_domains))
+        _normalize_fields(self, include_domains=_strings(self.include_domains, "include_domains"), exclude_domains=_strings(self.exclude_domains, "exclude_domains"))
         _require_enum(self.round_kind, SearchRoundKind, "round_kind")
         _require_enum(self.purpose, QueryPurpose, "purpose")
 
@@ -373,7 +393,7 @@ class SearchPlan:
         time_window = None if self.time_window is None else _tuple(self.time_window)
         if time_window is not None and (len(time_window) != 2 or any(item is not None and not isinstance(item, date) for item in time_window)):
             raise ValueError("time_window must be a two-element date tuple")
-        _normalize_fields(self, entities=_tuple(self.entities), time_window=time_window, initial_queries=_tuple(self.initial_queries), required_topics=_tuple(self.required_topics), required_source_relations=_frozenset(self.required_source_relations), query_redaction_codes=_tuple(self.query_redaction_codes))
+        _normalize_fields(self, entities=_strings(self.entities, "entities"), time_window=time_window, initial_queries=_records(self.initial_queries, SearchQuery, "initial_queries"), required_topics=_strings(self.required_topics, "required_topics"), required_source_relations=_enum_set(self.required_source_relations, SourceRelation, "required_source_relations"), query_redaction_codes=_strings(self.query_redaction_codes, "query_redaction_codes"))
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
 
@@ -385,7 +405,7 @@ class RepairPlan:
     repair_query: SearchQuery | None
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, gap_codes=_tuple(self.gap_codes))
+        _normalize_fields(self, gap_codes=_strings(self.gap_codes, "gap_codes"))
         if self.triggered != (self.repair_query is not None):
             raise ValueError("repair_query must be present exactly when repair is triggered")
 
@@ -403,7 +423,7 @@ class ProviderHit:
     quality_flags: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, quality_flags=_tuple(self.quality_flags))
+        _normalize_fields(self, quality_flags=_strings(self.quality_flags, "quality_flags"))
 
 
 @dataclass(frozen=True)
@@ -433,7 +453,7 @@ class EvidenceItem:
     independence_group: str | None
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, safety_flags=_tuple(self.safety_flags), supported_topics=_tuple(self.supported_topics))
+        _normalize_fields(self, safety_flags=_strings(self.safety_flags, "safety_flags"), supported_topics=_strings(self.supported_topics, "supported_topics"))
         _require_enum(self.source_relation, SourceRelation, "source_relation")
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
@@ -449,7 +469,7 @@ class EvidenceGapAnalysis:
     repair_reason_codes: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, missing_claim_topics=_tuple(self.missing_claim_topics), conflict_group_ids=_tuple(self.conflict_group_ids), repair_reason_codes=_tuple(self.repair_reason_codes))
+        _normalize_fields(self, missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), conflict_group_ids=_strings(self.conflict_group_ids, "conflict_group_ids"), repair_reason_codes=_strings(self.repair_reason_codes, "repair_reason_codes"))
         if self.repair_eligible and (not self.repair_purpose or not self.repair_reason_codes):
             raise ValueError("eligible repair requires a purpose and reason code")
         if not self.repair_eligible and self.repair_purpose is not None:
@@ -474,7 +494,7 @@ class EvidenceBundle:
     limitations: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, attempts=_tuple(self.attempts), initial_evidence_ids=_tuple(self.initial_evidence_ids), evidence_items=_tuple(self.evidence_items), missing_claim_topics=_tuple(self.missing_claim_topics), weak_source_topics=_tuple(self.weak_source_topics), conflict_groups=_tuple(self.conflict_groups), limitations=_tuple(self.limitations))
+        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
 
 
@@ -519,7 +539,7 @@ class ProviderResult:
     latency_ms: int | float
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, hits=_tuple(self.hits))
+        _normalize_fields(self, hits=_records(self.hits, ProviderHit, "hits"))
         _require_safe_metadata(self.provider, "provider")
         _require_enum(self.status, ProviderStatus, "status")
         _require_number(self.latency_ms, "latency_ms")
@@ -540,7 +560,7 @@ class FetchedDocument:
     untrusted_content_flags: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, untrusted_content_flags=_tuple(self.untrusted_content_flags))
+        _normalize_fields(self, untrusted_content_flags=_strings(self.untrusted_content_flags, "untrusted_content_flags"))
 
 
 @dataclass(frozen=True)
@@ -554,7 +574,7 @@ class EvidenceCandidate:
     content_reads_consumed: int
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, safety_flags=_tuple(self.safety_flags))
+        _normalize_fields(self, safety_flags=_strings(self.safety_flags, "safety_flags"))
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
         if type(self.content_reads_consumed) is not int or self.content_reads_consumed not in (0, 1):
@@ -570,7 +590,7 @@ class Claim:
     evidence_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, evidence_ids=_tuple(self.evidence_ids))
+        _normalize_fields(self, evidence_ids=_strings(self.evidence_ids, "evidence_ids"))
 
 
 @dataclass(frozen=True)
@@ -581,7 +601,7 @@ class AnswerBlock:
     claim_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, claim_ids=_tuple(self.claim_ids))
+        _normalize_fields(self, claim_ids=_strings(self.claim_ids, "claim_ids"))
 
 
 @dataclass(frozen=True)
@@ -593,7 +613,7 @@ class GroundedDraft:
     used_knowledge_fallback: bool
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, answer_blocks=_tuple(self.answer_blocks), claims=_tuple(self.claims), limitations=_tuple(self.limitations), conflict_summary=_tuple(self.conflict_summary))
+        _normalize_fields(self, answer_blocks=_records(self.answer_blocks, AnswerBlock, "answer_blocks"), claims=_records(self.claims, Claim, "claims"), limitations=_strings(self.limitations, "limitations"), conflict_summary=_strings(self.conflict_summary, "conflict_summary"))
 
 
 @dataclass(frozen=True)
@@ -606,7 +626,10 @@ class ValidationReport:
     limitations: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, retained_blocks=_tuple(self.retained_blocks), retained_claims=_tuple(self.retained_claims), removed_block_ids=_tuple(self.removed_block_ids), claim_labels=MappingProxyType(dict(self.claim_labels)), limitations=_tuple(self.limitations))
+        labels = dict(self.claim_labels)
+        if any(type(key) is not str or not isinstance(value, SupportLabel) for key, value in labels.items()):
+            raise TypeError("claim_labels must map strings to SupportLabel")
+        _normalize_fields(self, retained_blocks=_records(self.retained_blocks, AnswerBlock, "retained_blocks"), retained_claims=_records(self.retained_claims, Claim, "retained_claims"), removed_block_ids=_strings(self.removed_block_ids, "removed_block_ids"), claim_labels=MappingProxyType(labels), limitations=_strings(self.limitations, "limitations"))
 
 
 @dataclass(frozen=True)
@@ -618,7 +641,7 @@ class RenderedReply:
     degradation_disclosures: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, chunks=_tuple(self.chunks), used_evidence_ids=_tuple(self.used_evidence_ids), shown_source_urls=_tuple(self.shown_source_urls), degradation_disclosures=_tuple(self.degradation_disclosures))
+        _normalize_fields(self, chunks=_strings(self.chunks, "chunks"), used_evidence_ids=_strings(self.used_evidence_ids, "used_evidence_ids"), shown_source_urls=_strings(self.shown_source_urls, "shown_source_urls"), degradation_disclosures=_strings(self.degradation_disclosures, "degradation_disclosures"))
 
 
 @dataclass

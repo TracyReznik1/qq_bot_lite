@@ -404,6 +404,24 @@ class SearchModelContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.ProviderResult("p", status, hits, 1)
 
+    def test_collection_element_type_closure_for_shared_contract_patterns(self):
+        m = models()
+        hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, [])
+        result = m.ProviderResult("p", m.ProviderStatus.SUCCESS, [hit], 1)
+        mutable_hits = [hit]
+        result = m.ProviderResult("p", m.ProviderStatus.SUCCESS, mutable_hits, 1)
+        mutable_hits.clear()
+        self.assertEqual((hit,), result.hits)
+        with self.assertRaises(TypeError):
+            m.ProviderResult("p", m.ProviderStatus.SUCCESS, [{"title": "not a hit"}], 1)
+        query = m.SearchQuery("q", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "text", include_domains=["example.com"])
+        domains = ["example.com"]
+        query = m.SearchQuery("q", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "text", include_domains=domains)
+        domains.append("changed.example")
+        self.assertEqual(("example.com",), query.include_domains)
+        with self.assertRaises(TypeError):
+            m.SearchQuery("q", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "text", include_domains=[{}])
+
     @staticmethod
     def _search_decision(m):
         return m.RetrievalDecision(
