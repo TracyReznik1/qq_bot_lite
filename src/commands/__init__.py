@@ -402,10 +402,16 @@ def _store_unavailable_forget_result(
     claim_reference: int | str,
     claim_scope: str,
 ) -> CommandResult:
+    is_claim_id = str(claim_reference).isdigit()
     reference_label = (
         f"ID: {claim_reference}"
-        if str(claim_reference).isdigit()
-        else f"目标: {claim_reference}"
+        if is_claim_id
+        else "内容描述"
+    )
+    facts = (
+        (str(claim_reference), "retryable=true")
+        if is_claim_id
+        else ("retryable=true",)
     )
     reply = (
         f"记忆存储暂时不可用，本次未能确认或执行记忆变更 ({reference_label})："
@@ -413,7 +419,7 @@ def _store_unavailable_forget_result(
     )
     outcome = CommandOutcome(
         code="forget_failed",
-        facts=(str(claim_reference), "retryable=true"),
+        facts=facts,
         fallback_reply=reply,
         status="failed",
         scope=claim_scope,

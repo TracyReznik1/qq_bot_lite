@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import tempfile
 import threading
@@ -1032,6 +1033,79 @@ class MemoryCommandsTests(unittest.TestCase):
         self.assertTrue(result.reply.startswith("persona::"))
         self.assertEqual("failed", renderer.facts.status)
         self.assertIsNotNone(self.store.get_claim(target.id))
+
+    def test_forget_description_error_never_exposes_raw_target(self):
+        secret = "SECRET-FORGET-TARGET-7f3c91"
+
+        class Renderer:
+            def __init__(self):
+                self.facts = None
+                self.fallback = None
+
+            def render(self, facts, fallback):
+                self.facts = facts
+                self.fallback = fallback
+                return f"persona::{fallback}"
+
+        class RecordingHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.messages = []
+
+            def emit(self, record):
+                self.messages.append(self.format(record))
+
+        renderer = Renderer()
+        log_handler = RecordingHandler()
+        command_logger = logging.getLogger("qq-bot")
+        command_logger.addHandler(log_handler)
+        route = Route(
+            handler="command",
+            action="command",
+            command="forget",
+            query=f"请忘记 {secret}",
+        )
+        context = CommandContext(
+            uid="1001",
+            session_key="private:1001",
+            raw_message=f"/forget 请忘记 {secret}",
+            message_id="forget-secret-description-error",
+        )
+
+        try:
+            with mock.patch.object(
+                self.store,
+                "find_claims_exact",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                result = handle_command(
+                    route,
+                    context,
+                    store=self.store,
+                    renderer=renderer,
+                )
+        finally:
+            command_logger.removeHandler(log_handler)
+
+        self.assertEqual("failed", result.outcome.status)
+        self.assertEqual("store_unavailable", result.outcome.cause)
+        self.assertEqual("failed", renderer.facts.status)
+        self.assertEqual("private:1001", renderer.facts.scope)
+        self.assertEqual("store_unavailable", renderer.facts.cause)
+        leak_surfaces = {
+            "fallback": result.outcome.fallback_reply,
+            "outcome facts": repr(result.outcome.facts),
+            "final reply": result.reply,
+            "renderer facts": repr(renderer.facts),
+            "renderer fallback": renderer.fallback,
+            "logs": "\n".join(log_handler.messages),
+        }
+        for surface, text in leak_surfaces.items():
+            with self.subTest(surface=surface):
+                self.assertNotIn(secret, text)
+        self.assertEqual(("retryable=true",), result.outcome.facts)
+        self.assertEqual(("retryable=true",), renderer.facts.details)
+        self.assertIn("内容描述", result.outcome.fallback_reply)
 
     def test_operational_error_after_delete_commit_reports_partial_and_retries(self):
         target = self.create_claim(
