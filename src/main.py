@@ -120,7 +120,20 @@ def startup() -> None:
         message_queue.ensure_sequence_at_least(
             memory_service.store.max_job_sequence()
         )
+        _log_search_readiness()
         _startup_initialized = True
+
+
+def _log_search_readiness() -> None:
+    readiness = _search_readiness()
+    available = [item.provider for item in readiness if item.available]
+    if available:
+        logger.info("search_ready=true providers=%s", ",".join(available))
+    else:
+        logger.warning(
+            "search_ready=false providers=%s; closed-context tasks continue, factual requests return provider_not_configured",
+            ",".join(item.provider for item in readiness),
+        )
 
 
 def strip_bot_mention(raw_msg: str, self_id: str) -> tuple[bool, str]:
@@ -423,6 +436,7 @@ def onebot_event() -> dict[str, str] | tuple[dict[str, str], int]:
 @app.route("/health", methods=["GET"])
 def health() -> dict[str, Any]:
     persona = get_persona()
+    readiness = _search_readiness()
     return {
         "status": "ok",
         "bot_name": persona.name,
@@ -434,7 +448,23 @@ def health() -> dict[str, Any]:
         "deepseek_configured": bool(config.deepseek_api_key),
         "onebot_url": config.onebot_url,
         "require_group_at": config.require_group_at,
+        "search_ready": any(item.available for item in readiness),
+        "search_providers": [
+            {
+                "provider": item.provider,
+                "configured": item.configured,
+                "available": item.available,
+            }
+            for item in readiness
+        ],
     }
+
+
+def _search_readiness() -> list[Any]:
+    from src.search import get_search_orchestrator
+    orchestrator = get_search_orchestrator()
+    providers = getattr(orchestrator, "_providers", ()) or ()
+    return [provider.readiness() for provider in providers]
 
 
 def run() -> None:

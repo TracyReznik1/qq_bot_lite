@@ -168,6 +168,14 @@ def reset_runtime_singletons() -> None:
     if main_module is not None:
         main_module._startup_initialized = False
 
+    search_module = sys.modules.get("src.search")
+    if search_module is not None and hasattr(search_module, "reset_search_orchestrator"):
+        search_module.reset_search_orchestrator()
+
+    chat_search = sys.modules.get("src.chat.chat_service")
+    if chat_search is not None and hasattr(chat_search, "reset_chat_search_orchestrator"):
+        chat_search.reset_chat_search_orchestrator()
+
 
 @dataclass
 class IsolatedRuntime:

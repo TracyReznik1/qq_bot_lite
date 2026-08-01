@@ -116,6 +116,7 @@ class Config:
             memory_models = chat_models
         object.__setattr__(self, "chat_models", chat_models)
         object.__setattr__(self, "memory_models", memory_models)
+        object.__setattr__(self, "search_max_results", max(int(self.search_max_results), 1))
     onebot_url: str = os.getenv("ONEBOT_API_URL", "http://127.0.0.1:3000").rstrip("/")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
     callback_secret: str = os.getenv("CALLBACK_SECRET", "")
