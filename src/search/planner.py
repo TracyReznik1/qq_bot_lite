@@ -363,7 +363,7 @@ class SearchPlanner:
 
         if decision.route is SearchTier.LIGHT:
             query = SearchQuery(
-                query_id="initial-1",
+                query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.DIRECT,
                 text=direct_text,
@@ -375,7 +375,7 @@ class SearchPlanner:
                 planning_status=status,
                 entities=(),
                 time_window=None,
-                initial_queries=(query,),
+                initial_queries=_assign_initial_query_ids((query,)),
                 required_topics=required_topics,
                 required_source_relations=frozenset(),
                 query_redaction_codes=redaction_codes,
@@ -399,7 +399,7 @@ class SearchPlanner:
                 planning_status=PlanningStatus.DEGRADED if degraded_due_to_model else PlanningStatus.NORMAL,
                 entities=_extract_entities(original),
                 time_window=_time_window_for_decision(original, decision, self._today()),
-                initial_queries=fallback,
+                initial_queries=_assign_initial_query_ids(fallback),
                 required_topics=required_topics,
                 required_source_relations=required_relations,
                 query_redaction_codes=redaction_codes,
@@ -410,17 +410,16 @@ class SearchPlanner:
         seen_fingerprints: set[str] = set()
         # Always retain the redacted original natural-language question as the
         # first direct query; the model may supplement, never replace it.
-        direct_index = 1
         redacted_queries.append(
             SearchQuery(
-                query_id=f"initial-{direct_index}",
+                query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.DIRECT,
                 text=direct_text,
             )
         )
         seen_fingerprints.add(_query_fingerprint(direct_text))
-        for index, query in enumerate(planned, 1):
+        for query in planned:
             cleaned, codes, degraded = self._clean_query(query, original)
             redaction_codes = tuple(dict.fromkeys((*redaction_codes, *codes)))
             if _query_fingerprint(cleaned) in seen_fingerprints:
@@ -428,7 +427,7 @@ class SearchPlanner:
             seen_fingerprints.add(_query_fingerprint(cleaned))
             redacted_queries.append(
                 SearchQuery(
-                    query_id=f"initial-{direct_index + index}",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=query.purpose,
                     text=cleaned,
@@ -448,7 +447,7 @@ class SearchPlanner:
         if needs_time_bounded_query:
             today = self._today()
             time_bounded = SearchQuery(
-                query_id=f"initial-{len(redacted_queries) + 1}",
+                query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.TIME_BOUNDED,
                 text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
@@ -468,7 +467,7 @@ class SearchPlanner:
                     len(redacted_queries) - 1,
                 )
                 time_bounded = SearchQuery(
-                    query_id=f"initial-{replacement_index + 1}",
+                    query_id="",
                     round_kind=time_bounded.round_kind,
                     purpose=time_bounded.purpose,
                     text=time_bounded.text,
@@ -488,7 +487,7 @@ class SearchPlanner:
             planning_status=status,
             entities=tuple(entities),
             time_window=time_window,
-            initial_queries=tuple(redacted_queries),
+            initial_queries=_assign_initial_query_ids(redacted_queries),
             required_topics=required_topics,
             required_source_relations=required_relations,
             query_redaction_codes=redaction_codes,
@@ -613,7 +612,7 @@ class SearchPlanner:
         today = self._today()
         queries: list[SearchQuery] = [
             SearchQuery(
-                query_id="initial-1",
+                query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.DIRECT,
                 text=direct_text,
@@ -623,7 +622,7 @@ class SearchPlanner:
             location_hint = _deep_location_hint(direct_text)
             queries.append(
                 SearchQuery(
-                    query_id="initial-2",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.TIME_BOUNDED,
                     text=f"{location_hint} {today.isoformat()} 新闻 重要事件",
@@ -633,7 +632,7 @@ class SearchPlanner:
             )
             queries.append(
                 SearchQuery(
-                    query_id="initial-3",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.PRIMARY,
                     text=f"{location_hint} {today.isoformat()} 官方 通报",
@@ -641,7 +640,7 @@ class SearchPlanner:
             )
             queries.append(
                 SearchQuery(
-                    query_id="initial-4",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.INDEPENDENT,
                     text=f"{location_hint} {today.isoformat()} 新闻 重要事件 独立报道",
@@ -650,7 +649,7 @@ class SearchPlanner:
         elif decision.route is SearchTier.STANDARD:
             queries.append(
                 SearchQuery(
-                    query_id="initial-2",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.PRIMARY,
                     text=f"{direct_text} Rust 官方文档 Go 官方文档"
@@ -660,7 +659,7 @@ class SearchPlanner:
             )
             queries.append(
                 SearchQuery(
-                    query_id="initial-3",
+                    query_id="",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.INDEPENDENT,
                     text=f"{direct_text} 独立技术对比",
@@ -748,6 +747,23 @@ def _is_genuine_time_bounded_query(query: SearchQuery) -> bool:
     return (
         query.date_from.isoformat() in query.text
         and query.date_to.isoformat() in query.text
+    )
+
+
+def _assign_initial_query_ids(queries: Sequence[SearchQuery]) -> tuple[SearchQuery, ...]:
+    """Assign deterministic IDs only after the complete initial plan is fixed."""
+    return tuple(
+        SearchQuery(
+            query_id=f"initial-{index}",
+            round_kind=query.round_kind,
+            purpose=query.purpose,
+            text=query.text,
+            date_from=query.date_from,
+            date_to=query.date_to,
+            include_domains=query.include_domains,
+            exclude_domains=query.exclude_domains,
+        )
+        for index, query in enumerate(queries, 1)
     )
 
 

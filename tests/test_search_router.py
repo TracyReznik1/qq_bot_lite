@@ -248,6 +248,41 @@ class RouterConflictAndFloorTests(unittest.TestCase):
             with self.subTest(kind="quoted", question=question):
                 self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
 
+    def test_advisor_failure_handles_structural_safety_scope_and_unseen_variants(self):
+        actionable_cases = (
+            "扑热息痛一次吃几毫克？",
+            "这个药应该间隔多久再吃？",
+            "我突然嘴角歪斜、单侧无力，怎么办？",
+            "洁厕灵弄进眼里了，怎么办？",
+            "胸痛时应该采取什么急救措施？",
+            "漂白剂进眼睛为什么很疼，该怎么办？",
+            "这瓶家用液体溅进眼里了，该怎么处理？",
+        )
+        for question in actionable_cases:
+            with self.subTest(kind="actionable", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+        stable_concepts = (
+            "什么是药物剂量？",
+            "清洁剂会刺激眼睛吗？",
+            "漂白剂刺激眼睛的机制是什么？",
+        )
+        for question in stable_concepts:
+            with self.subTest(kind="concept", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+
+        excluded_or_harmless = (
+            "薯片每次吃几片比较合适？",
+            "我没有胸痛，不需要问怎么办。",
+            "“胸痛怎么办”这几个字用于测试。",
+            "“胸痛怎么办（示例文本）",
+            "请把“洁厕灵弄进眼里怎么办”翻译成英文。",
+            "我没有眼部暴露，也不打算采取急救措施。",
+        )
+        for question in excluded_or_harmless:
+            with self.subTest(kind="excluded", question=question):
+                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+
     def test_stable_version_definition_is_not_deep(self):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)

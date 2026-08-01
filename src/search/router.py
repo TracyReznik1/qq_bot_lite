@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -313,13 +314,12 @@ _MEDICATION_CONTEXT_MARKERS = (
     "药物",
     "药品",
     "泰诺",
+    "扑热息痛",
     "布洛芬",
     "阿司匹林",
     "抗生素",
     "退烧",
     "发烧",
-    "片",
-    "粒",
     "胶囊",
     "口服液",
 )
@@ -339,6 +339,8 @@ _ACUTE_SYMPTOM_MARKERS = (
     "意识不清",
     "半边脸麻",
     "说话含糊",
+    "嘴角歪",
+    "单侧无力",
 )
 
 _URGENT_HELP_MARKERS = (
@@ -367,7 +369,6 @@ _EXPOSURE_ROUTE_MARKERS = (
     "溅到眼里",
     "溅到眼睛",
     "进眼睛",
-    "眼睛",
     "吸入",
     "吸进去",
     "误吞",
@@ -376,47 +377,97 @@ _EXPOSURE_ROUTE_MARKERS = (
     "入口",
 )
 
+_ACTION_OR_TRIAGE_MARKERS = (
+    "怎么办",
+    "该怎么",
+    "怎么处理",
+    "如何处理",
+    "急救",
+    "急诊",
+    "就医",
+    "采取什么",
+    "应该采取",
+    "怎么做",
+)
+
+_FOOD_CONTEXT_MARKERS = ("薯片", "鱼片", "零食", "饼干", "面包", "蛋糕", "水果")
+_NEGATION_MARKERS = ("没有", "没", "不需要", "无需", "不用", "不必", "不是", "并非", "不要", "别")
+_QUOTE_SPAN_PATTERNS = (
+    re.compile(r"“[^”]*”"),
+    re.compile(r'"[^"]*"'),
+    re.compile(r"‘[^’]*’"),
+    re.compile(r"'[^']*'"),
+)
+
 
 def _safety_normalized_text(question: str) -> str:
-    return re.sub(r"\s+", "", question).casefold()
+    normalized = unicodedata.normalize("NFKC", str(question or ""))
+    return re.sub(r"\s+", "", normalized).casefold()
+
+
+def _safety_match_text(question: str) -> str:
+    """Normalize input and exclude quoted or negated clauses before matching.
+
+    The fallback intentionally reasons only over the remaining user request, so
+    an example, quotation, or explicit negation cannot become an emergency.
+    """
+    text = unicodedata.normalize("NFKC", str(question or ""))
+    for pattern in _QUOTE_SPAN_PATTERNS:
+        text = pattern.sub(" ", text)
+    for opening in ("“", "\"", "‘", "'"):
+        if opening in text:
+            text = text.split(opening, 1)[0]
+    active_clauses = [
+        clause
+        for clause in re.split(r"[，,。；;！？!?]", text)
+        if clause and not any(marker in clause for marker in _NEGATION_MARKERS)
+    ]
+    return _safety_normalized_text(" ".join(active_clauses))
+
+
+def _has_action_or_triage_intent(text: str) -> bool:
+    return any(marker in text for marker in _ACTION_OR_TRIAGE_MARKERS)
+
+
+def _has_dose_or_interval_semantics(text: str) -> bool:
+    return bool(re.search(
+        r"(?:\d+(?:mg|毫克|克|ml|毫升|微克|片|粒)|几(?:毫克|克|毫升|片|粒)|一次|每次|每天|每日|一日|每隔|间隔|多久再|剂量|用量)",
+        text,
+    ))
+
+
+def _has_exposure_event(text: str) -> bool:
+    event = any(marker in text for marker in ("溅", "弄", "进", "滴", "喷", "沾", "吸入", "误吞", "吞下", "喝下"))
+    route = any(marker in text for marker in ("眼里", "眼睛", "进眼", "吸入", "口", "皮肤"))
+    return event and route
 
 
 def _is_stable_or_nonpersonal_safety_text(question: str) -> bool:
     """Keep definitions, mechanisms, quotations, and negated examples out of
     the emergency/action fallback without suppressing an actual help request."""
-    compact = _safety_normalized_text(question)
+    compact = _safety_match_text(question)
     is_definition = any(pattern in compact for pattern in _FOUNDATION_PATTERNS)
-    is_mechanism = any(marker in compact for marker in ("为什么", "为何", "原理", "机制"))
-    quoted_explanation = (
-        any(mark in question for mark in ("\"", "“", "”", "'", "‘", "’"))
-        and any(marker in compact for marker in ("这句话", "什么意思", "怎么理解", "引用"))
-    )
-    negated_example = any(marker in compact for marker in ("不是在问", "不需要用药建议", "不要给我用药建议"))
-    if quoted_explanation:
-        return True
-    if negated_example and (is_definition or is_mechanism):
-        return True
     if is_definition:
         return True
-    return is_mechanism and any(marker in compact for marker in _CHEMICAL_EXPOSURE_MARKERS)
+    is_mechanism = any(marker in compact for marker in ("为什么", "为何", "原理", "机制", "刺激"))
+    return is_mechanism and not _has_action_or_triage_intent(compact)
 
 
 def _has_actionable_high_consequence_signal(question: str) -> bool:
     """Recognize concrete safety actions without treating domain words alone as urgent."""
     if _is_stable_or_nonpersonal_safety_text(question):
         return False
-    lowered = _safety_normalized_text(question)
-    medication_action = any(marker in lowered for marker in _MEDICATION_ADMINISTRATION_MARKERS)
+    lowered = _safety_match_text(question)
+    if any(marker in lowered for marker in _FOOD_CONTEXT_MARKERS):
+        return False
     medication_context = any(marker in lowered for marker in _MEDICATION_CONTEXT_MARKERS)
-    if medication_action and medication_context:
+    dose_or_interval = _has_dose_or_interval_semantics(lowered)
+    medication_action = any(marker in lowered for marker in _MEDICATION_ADMINISTRATION_MARKERS)
+    if medication_context and (dose_or_interval or medication_action):
         return True
-    if any(marker in lowered for marker in _ACUTE_SYMPTOM_MARKERS) and any(
-        marker in lowered for marker in _URGENT_HELP_MARKERS
-    ):
+    if any(marker in lowered for marker in _ACUTE_SYMPTOM_MARKERS) and _has_action_or_triage_intent(lowered):
         return True
-    return any(marker in lowered for marker in _CHEMICAL_EXPOSURE_MARKERS) and any(
-        marker in lowered for marker in _EXPOSURE_ROUTE_MARKERS
-    )
+    return _has_exposure_event(lowered) and _has_action_or_triage_intent(lowered)
 
 
 def _detect_personalized_high_consequence(question: str) -> TriggerCode | None:
@@ -1109,6 +1160,8 @@ def _conservative_uncertain_floor(question: str) -> SearchTier | None:
     lowered = question.casefold()
     if _is_stable_or_nonpersonal_safety_text(question):
         if any(marker in question for marker in _REGULATED_DOMAIN_FOUNDATION_WORDS):
+            return SearchTier.STANDARD
+        if any(marker in _safety_match_text(question) for marker in _CHEMICAL_EXPOSURE_MARKERS):
             return SearchTier.STANDARD
         if _detect_external_explanation_or_comparison(question, True) is not None:
             return SearchTier.STANDARD

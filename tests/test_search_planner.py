@@ -18,6 +18,7 @@ from src.search.models import (
     RiskLevel,
     SearchTier,
     SearchRoundKind,
+    SearchTrace,
     SkipReason,
     TriggerCode,
 )
@@ -498,6 +499,45 @@ class PlannerDegradationTests(unittest.TestCase):
                     and query.date_to.isoformat() in query.text
                 ]
                 self.assertEqual(len(genuine), 1)
+
+    def test_deep_plan_assigns_unique_final_ids_after_dedupe_and_time_replacement(self):
+        model = StaticPlannerModel(
+            {
+                "planning_status": "normal",
+                "entities": [],
+                "initial_queries": [
+                    {"purpose": "direct", "text": "北京今天有什么新闻"},
+                    {"purpose": "primary", "text": "北京官方来源"},
+                ],
+            }
+        )
+        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
+            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
+            True, Freshness.HIGH, RiskLevel.LOW,
+            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
+            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
+            SearchTier.DEEP, None, (),
+        )
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+        plan = planner.plan(request("北京今天有什么新闻"), d)
+        self.assertEqual("北京今天有什么新闻", plan.initial_queries[0].text)
+        self.assertEqual(
+            [f"initial-{index}" for index in range(1, len(plan.initial_queries) + 1)],
+            [query.query_id for query in plan.initial_queries],
+        )
+        time_bounded = next(query for query in plan.initial_queries if query.purpose is QueryPurpose.TIME_BOUNDED)
+        from src.search.models import ProviderHit
+        hit = ProviderHit(
+            "tavily", time_bounded.query_id, "title", "https://example.com/time",
+            "snippet", None, None, None, (),
+        )
+        orchestrator = importlib.import_module("src.search.orchestrator")
+        self.assertEqual(time_bounded, orchestrator._query_for_hit(plan, hit))
+        trace = SearchTrace(
+            "req-ids", RequestSource.CHAT, SearchTier.DEEP,
+            executed_queries=tuple(plan.initial_queries),
+        )
+        self.assertEqual(len(plan.initial_queries), trace.to_log_dict()["semantic_query_count"])
 
 
 class PlannerQueryCapTests(unittest.TestCase):
