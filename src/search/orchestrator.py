@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from dataclasses import replace
 from typing import Any, Callable, Sequence
 
 from src.config import config
@@ -25,7 +27,6 @@ from src.search.models import (
     SearchPipelineResult,
     SearchPlan,
     SearchQuery,
-    SearchRoundKind,
     SearchTier,
     SearchTrace,
     SkipReason,
@@ -95,15 +96,25 @@ class SearchOrchestrator:
         # One monotonic hard deadline per tier starts before planning, so
         # planner and Evidence-judge latency count toward the retrieval budget.
         budget = DEFAULT_TIER_BUDGETS[decision.route]
-        deadline = self._monotonic() + budget.hard_timeout_seconds
+        deadline = self._monotonic() + float(budget.hard_timeout_seconds)
 
         trace.orchestrator_started = True
         plan_started = self._monotonic()
-        plan = self._planner.plan(request, decision, deadline=deadline)
+        plan_completed, plan = self._call_until_deadline(
+            self._invoke_planner,
+            deadline,
+            request,
+            decision,
+            deadline,
+        )
+        if not plan_completed or not isinstance(plan, SearchPlan):
+            plan = self._degraded_plan(request, decision)
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
         trace.initial_query_count = len(plan.initial_queries)
-        trace.executed_queries = _query_metadata(plan.initial_queries)
         trace.initial_query_redaction_codes = plan.query_redaction_codes
+
+        if self._expired(deadline):
+            return self._timeout_result(decision, plan, trace, started)
 
         trace.provider_configured = any(
             provider.readiness().configured for provider in self._providers
@@ -123,6 +134,9 @@ class SearchOrchestrator:
         trace.initial_provider_search_latency_ms = self._elapsed_ms(initial_round_started)
         trace.provider_search_total_latency_ms = trace.initial_provider_search_latency_ms
 
+        if self._expired(deadline):
+            return self._timeout_result(decision, plan, trace, started)
+
         if not provider_results or all(
             result.status in {ProviderStatus.NOT_CONFIGURED, ProviderStatus.UNAVAILABLE, ProviderStatus.ERROR, ProviderStatus.TIMEOUT, ProviderStatus.EMPTY}
             for result in provider_results
@@ -133,7 +147,12 @@ class SearchOrchestrator:
             )
             failure = _failure_for_status(status)
             trace.degradation_reason = failure
-            evidence = None if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED else _empty_bundle(plan)
+            evidence = None if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED else _empty_bundle(
+                plan,
+                attempts=trace.provider_attempts,
+                retrieval_round_count=trace.retrieval_round_count,
+            )
+            trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
             return SearchPipelineResult(
                 decision=decision,
                 plan=plan,
@@ -143,19 +162,33 @@ class SearchOrchestrator:
             )
 
         content_started = self._monotonic()
-        candidates, candidate_url_count, reads = self._extract_candidates(
+        candidates, candidate_keys, reads = self._extract_candidates(
             plan, provider_results, budget, deadline, trace,
         )
         trace.initial_content_read_latency_ms = self._elapsed_ms(content_started)
         trace.content_read_total_latency_ms = trace.initial_content_read_latency_ms
-        trace.candidate_url_count = candidate_url_count
+        trace.candidate_url_count = len(candidate_keys)
+
+        if self._expired(deadline):
+            return self._timeout_result(decision, plan, trace, started)
 
         evidence_started = self._monotonic()
-        bundle = self._assembler().assemble(plan, candidates)
+        assembled, bundle = self._call_until_deadline(
+            self._assembler().assemble,
+            deadline,
+            plan,
+            candidates,
+            timeout_seconds=self._remaining(deadline),
+        )
+        if not assembled or not isinstance(bundle, EvidenceBundle):
+            bundle = self._assembler_with_rejecting_judge().assemble(plan, candidates, timeout_seconds=0.0)
         trace.initial_evidence_assembly_latency_ms = self._elapsed_ms(evidence_started)
         trace.evidence_assembly_total_latency_ms = trace.initial_evidence_assembly_latency_ms
         trace.citable_evidence_count = sum(1 for item in bundle.evidence_items if item.citable)
         trace.evidence_state = bundle.evidence_state
+
+        if self._expired(deadline):
+            return self._timeout_result(decision, plan, trace, started, bundle=bundle)
 
         if not bundle.evidence_items and any(
             result.status is ProviderStatus.SUCCESS and result.hits
@@ -165,7 +198,11 @@ class SearchOrchestrator:
             return SearchPipelineResult(
                 decision=decision,
                 plan=plan,
-                evidence=_empty_bundle(plan),
+                evidence=_empty_bundle(
+                    plan,
+                    attempts=trace.provider_attempts,
+                    retrieval_round_count=trace.retrieval_round_count,
+                ),
                 trace=trace,
                 failure_code=SearchFailureCode.CONTENT_UNREADABLE,
             )
@@ -173,15 +210,28 @@ class SearchOrchestrator:
         gap_started = self._monotonic()
         gap = self._assembler().analyze_gap(plan, bundle)
         trace.gap_analysis_latency_ms = self._elapsed_ms(gap_started)
+        initial_canonical_urls = {
+            item.canonical_url for item in bundle.evidence_items if item.canonical_url
+        }
+        repair = RepairPlan(False, gap.repair_reason_codes, None)
 
         repair_already_planned = False
-        if _repair_allowed(plan, decision) and gap.repair_eligible:
+        if _repair_allowed(plan, decision) and gap.repair_eligible and not self._expired(deadline):
             repair_started = self._monotonic()
-            repair = self._planner.plan_repair(plan, gap, repair_already_planned=repair_already_planned)
+            repair_completed, planned_repair = self._call_until_deadline(
+                self._invoke_repair_planner,
+                deadline,
+                plan,
+                gap,
+                repair_already_planned,
+                deadline,
+            )
+            if repair_completed and isinstance(planned_repair, RepairPlan):
+                repair = planned_repair
             if repair.triggered and repair.repair_query is not None:
                 repair_already_planned = True
                 trace.adaptive_repair_round_started = True
-                trace.adaptive_repair_query = (repair.repair_query.query_id, repair.repair_query.purpose)
+                trace.adaptive_repair_query = repair.repair_query
                 trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
                 trace.retrieval_round_count = 2
                 repair_result = self._run_repair_query(
@@ -191,29 +241,63 @@ class SearchOrchestrator:
                     deadline,
                     trace,
                 )
-                repair_candidates, more_urls, more_reads = self._extract_candidates(
+                repair_provider_finished = self._monotonic()
+                trace.provider_search_total_latency_ms += self._elapsed_ms(repair_started)
+                repair_candidates, repair_keys, more_reads = self._extract_candidates(
                     plan,
                     repair_result,
                     budget,
                     deadline,
                     trace,
-                    round_kind=SearchRoundKind.REPAIR,
-                    existing_candidate_count=len(candidates),
+                    additional_queries=(repair.repair_query,),
+                    existing_candidate_keys=candidate_keys,
                     existing_read_count=reads,
                 )
-                candidate_url_count = min(candidate_url_count + more_urls, budget.max_candidate_urls)
+                candidate_keys.update(repair_keys)
                 reads = min(reads + more_reads, budget.max_content_reads)
-                trace.candidate_url_count = candidate_url_count
+                trace.candidate_url_count = len(candidate_keys)
                 trace.content_read_count = reads
-                bundle = self._assembler().assemble(plan, (*candidates, *repair_candidates))
-                trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_started)
+                trace.content_read_total_latency_ms += self._elapsed_ms(repair_provider_finished)
+                repair_evidence_started = self._monotonic()
+                assembled, repaired_bundle = self._call_until_deadline(
+                    self._assembler().assemble,
+                    deadline,
+                    plan,
+                    (*candidates, *repair_candidates),
+                    previous=bundle,
+                    timeout_seconds=self._remaining(deadline),
+                )
+                if assembled and isinstance(repaired_bundle, EvidenceBundle):
+                    bundle = repaired_bundle
+                trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_evidence_started)
                 trace.evidence_state = bundle.evidence_state
                 trace.repair_used = True
             trace.adaptive_repair_latency_ms = self._elapsed_ms(repair_started)
 
+        if self._expired(deadline):
+            return self._timeout_result(
+                decision,
+                plan,
+                trace,
+                started,
+                bundle=bundle,
+                gap=gap,
+                repair=repair,
+                initial_canonical_urls=initial_canonical_urls,
+            )
+
+        final_gap = self._assembler().analyze_gap(plan, bundle)
+        bundle = self._seal_bundle(
+            bundle,
+            trace,
+            final_gap,
+            repair,
+            initial_canonical_urls,
+        )
+
         trace.evidence_state = bundle.evidence_state
         trace.citable_evidence_count = sum(1 for item in bundle.evidence_items if item.citable)
-        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(plan_started)
+        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
 
         failure_code = _failure_for_state(bundle.evidence_state)
         return SearchPipelineResult(
@@ -262,38 +346,58 @@ class SearchOrchestrator:
         *,
         mark_repair: bool = False,
     ) -> list[ProviderResult]:
+        del mark_repair
         results: list[ProviderResult] = []
-        with ThreadPoolExecutor(max_workers=min(len(queries), 4)) as executor:
-            futures = {}
+        if not queries:
+            return results
+        dispatch_started = self._monotonic()
+        executor = ThreadPoolExecutor(max_workers=min(len(queries), 4), thread_name_prefix="search-provider")
+        futures: dict[Any, SearchQuery] = {}
+        has_available_provider = any(
+            provider.readiness().available for provider in self._providers
+        )
+        try:
             for query in queries:
-                if self._monotonic() >= deadline:
-                    trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
                     break
-                remaining = max(deadline - self._monotonic(), 0.0)
+                trace.executed_queries = (*trace.executed_queries, (query.query_id, query.purpose))
+                if has_available_provider:
+                    trace.provider_invocation_started = True
                 future = executor.submit(
                     self._search_one,
                     query,
                     decision,
                     min(config.request_timeout, remaining),
-                    trace,
                 )
                 futures[future] = query
-            for future in as_completed(futures, timeout=max(deadline - self._monotonic(), 0.01)):
-                query = futures[future]
-                try:
-                    result = future.result()
-                except Exception:
-                    logger.debug("query dispatch failed for %s", query.query_id, exc_info=True)
-                    result = ProviderResult(
-                        provider="tavily",
-                        status=ProviderStatus.ERROR,
-                        hits=(),
-                        latency_ms=0,
+            try:
+                for future in as_completed(futures, timeout=self._remaining(deadline)):
+                    query = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception:
+                        logger.debug("query dispatch failed for %s", query.query_id, exc_info=True)
+                        result = ProviderResult("tavily", ProviderStatus.ERROR, (), 0)
+                    self._record_provider_result(trace, result)
+                    results.append(result)
+            except FuturesTimeoutError:
+                trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
+                for future, query in futures.items():
+                    if future.done():
+                        continue
+                    future.cancel()
+                    provider = self._first_available_provider_name()
+                    timeout_attempt = ProviderAttempt(
+                        provider,
+                        ProviderStatus.TIMEOUT,
+                        1,
+                        self._elapsed_ms(dispatch_started),
+                        query_id=query.query_id,
                     )
-                if mark_repair:
-                    trace.executed_queries = (*trace.executed_queries, _query_metadata((query,)))
-                results.append(result)
-            # Cancel any pending futures without waiting past the deadline.
+                    trace.provider_attempts = (*trace.provider_attempts, timeout_attempt)
+                results.append(ProviderResult("tavily", ProviderStatus.TIMEOUT, (), 0))
+        finally:
             executor.shutdown(wait=False, cancel_futures=True)
         return results
 
@@ -302,25 +406,14 @@ class SearchOrchestrator:
         query: SearchQuery,
         decision: Any,
         timeout: float,
-        trace: SearchTrace,
     ) -> ProviderResult:
         max_results = max(int(config.search_max_results or 1), 1)
-        started = self._monotonic()
-        result = self._registry.search(
+        return self._registry.search(
             query,
             tier=decision.route,
             max_results=max_results,
             timeout_seconds=timeout,
         )
-        latency = self._elapsed_ms(started)
-        for attempt in getattr(self._registry, "last_attempts", ()) or ():
-            status = getattr(attempt, "status", ProviderStatus.ERROR)
-            provider = getattr(attempt, "provider", "unknown")
-            trace.provider_attempts = (*trace.provider_attempts, ProviderAttempt(provider, status, 1, latency))
-            trace.provider_invocation_started = True
-            if status is not ProviderStatus.SUCCESS:
-                trace.provider_failures = (*trace.provider_failures, _failure_for_status(status))
-        return result
 
     def _extract_candidates(
         self,
@@ -330,40 +423,232 @@ class SearchOrchestrator:
         deadline: float,
         trace: SearchTrace,
         *,
-        round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
-        existing_candidate_count: int = 0,
+        additional_queries: Sequence[SearchQuery] = (),
+        existing_candidate_keys: set[str] | None = None,
         existing_read_count: int = 0,
-    ) -> tuple[list[Any], int, int]:
+    ) -> tuple[list[Any], set[str], int]:
         hits: list[Any] = []
         for result in results:
             if result.status is ProviderStatus.SUCCESS:
                 hits.extend(result.hits)
-        candidate_url_total = min(existing_candidate_count + len(hits), budget.max_candidate_urls)
-        hits = hits[: max(budget.max_candidate_urls - existing_candidate_count, 0)]
+        existing_keys = set(existing_candidate_keys or ())
+        new_keys: set[str] = set()
+        unique_hits: list[Any] = []
+        for hit in hits:
+            key = str(hit.url or "").strip()
+            if not key or key in existing_keys or key in new_keys:
+                continue
+            if len(existing_keys) + len(new_keys) >= budget.max_candidate_urls:
+                break
+            new_keys.add(key)
+            unique_hits.append(hit)
 
         candidates: list[Any] = []
-        reads = existing_read_count
-        for hit in hits:
-            if self._monotonic() >= deadline:
-                break
-            if reads >= budget.max_content_reads:
-                break
-            remaining = max(deadline - self._monotonic(), 0.0)
-            try:
-                candidate = self._extractor.extract(
+        remaining_read_budget = max(budget.max_content_reads - existing_read_count, 0)
+        read_hits = unique_hits[:remaining_read_budget]
+        if not read_hits:
+            return candidates, new_keys, 0
+        executor = ThreadPoolExecutor(
+            max_workers=min(len(read_hits), 4),
+            thread_name_prefix="search-reader",
+        )
+        futures: dict[Any, Any] = {}
+        try:
+            for hit in read_hits:
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
+                    break
+                future = executor.submit(
+                    self._extractor.extract,
                     hit,
-                    _query_for_hit(plan, hit, round_kind=round_kind),
+                    _query_for_hit(plan, hit, additional_queries=additional_queries),
                     allow_network_read=True,
                     timeout_seconds=min(config.request_timeout, remaining),
                 )
-            except Exception:
-                logger.debug("extraction failed for %s", hit.url, exc_info=True)
-                continue
-            if candidate is not None and candidate.excerpt:
-                candidates.append(candidate)
-                reads += candidate.content_reads_consumed
-        trace.content_read_count = reads
-        return candidates, candidate_url_total, reads
+                futures[future] = hit
+            try:
+                for future in as_completed(futures, timeout=self._remaining(deadline)):
+                    try:
+                        candidate = future.result()
+                    except Exception:
+                        logger.debug("extraction failed", exc_info=True)
+                        continue
+                    if candidate is not None and candidate.excerpt:
+                        candidates.append(candidate)
+            except FuturesTimeoutError:
+                trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
+                for future in futures:
+                    future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        reads_attempted = len(futures)
+        trace.content_read_count = existing_read_count + reads_attempted
+        return candidates, new_keys, reads_attempted
+
+    def _invoke_planner(
+        self,
+        request: RetrievalRequest,
+        decision: Any,
+        deadline: float,
+    ) -> SearchPlan:
+        return _call_with_supported_kwargs(
+            self._planner.plan,
+            request,
+            decision,
+            deadline=deadline,
+            timeout_seconds=self._remaining(deadline),
+        )
+
+    def _invoke_repair_planner(
+        self,
+        plan: SearchPlan,
+        gap: Any,
+        repair_already_planned: bool,
+        deadline: float,
+    ) -> RepairPlan:
+        return _call_with_supported_kwargs(
+            self._planner.plan_repair,
+            plan,
+            gap,
+            repair_already_planned=repair_already_planned,
+            deadline=deadline,
+            timeout_seconds=self._remaining(deadline),
+        )
+
+    def _degraded_plan(self, request: RetrievalRequest, decision: Any) -> SearchPlan:
+        class _UnavailableModel:
+            def chat(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise TimeoutError("planner deadline expired")
+
+        fallback = SearchPlanner(_UnavailableModel()).plan(
+            request,
+            decision,
+            deadline=self._monotonic(),
+        )
+        return replace(fallback, planning_status=PlanningStatus.DEGRADED)
+
+    def _call_until_deadline(
+        self,
+        method: Callable[..., Any],
+        deadline: float,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, Any]:
+        remaining = self._remaining(deadline)
+        if remaining <= 0:
+            return False, None
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-bounded")
+        future = executor.submit(method, *args, **kwargs)
+        try:
+            return True, future.result(timeout=remaining)
+        except FuturesTimeoutError:
+            future.cancel()
+            return False, None
+        except Exception:
+            logger.debug("bounded retrieval stage failed", exc_info=True)
+            return True, None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _record_provider_result(self, trace: SearchTrace, result: Any) -> None:
+        for attempt in getattr(result, "attempts", ()):
+            trace.provider_attempts = (*trace.provider_attempts, attempt)
+            if attempt.invocation_started:
+                trace.provider_invocation_started = True
+            if attempt.status is not ProviderStatus.SUCCESS:
+                trace.provider_failures = (
+                    *trace.provider_failures,
+                    _failure_for_status(attempt.status),
+                )
+
+    def _first_available_provider_name(self) -> str:
+        for provider in self._providers:
+            if provider.readiness().available:
+                return provider.name
+        return "tavily"
+
+    def _assembler_with_rejecting_judge(self) -> EvidenceAssembler:
+        class _RejectingJudge:
+            def judge(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+                return {}
+
+        return EvidenceAssembler(_RejectingJudge())
+
+    def _seal_bundle(
+        self,
+        bundle: EvidenceBundle,
+        trace: SearchTrace,
+        gap: Any,
+        repair: RepairPlan,
+        initial_canonical_urls: set[str],
+    ) -> EvidenceBundle:
+        initial_ids = tuple(
+            item.evidence_id
+            for item in bundle.evidence_items
+            if item.canonical_url in initial_canonical_urls
+        )
+        return replace(
+            bundle,
+            attempts=trace.provider_attempts,
+            initial_evidence_ids=initial_ids,
+            gap_analysis=gap,
+            repair_plan=repair,
+            retrieval_round_count=trace.retrieval_round_count,
+        )
+
+    def _timeout_result(
+        self,
+        decision: Any,
+        plan: SearchPlan,
+        trace: SearchTrace,
+        started: float,
+        *,
+        bundle: EvidenceBundle | None = None,
+        gap: Any = None,
+        repair: RepairPlan | None = None,
+        initial_canonical_urls: set[str] | None = None,
+    ) -> SearchPipelineResult:
+        trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
+        trace.degradation_reason = SearchFailureCode.PROVIDER_TIMEOUT
+        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
+        if bundle is None:
+            bundle = _empty_bundle(
+                plan,
+                attempts=trace.provider_attempts,
+                retrieval_round_count=trace.retrieval_round_count,
+                limitation="hard_deadline_exceeded",
+            )
+        else:
+            bundle = replace(
+                bundle,
+                evidence_state=EvidenceState.INSUFFICIENT,
+                missing_claim_topics=tuple(plan.required_topics) or ("material_claim",),
+                limitations=tuple(dict.fromkeys((*bundle.limitations, "hard_deadline_exceeded"))),
+            )
+            bundle = self._seal_bundle(
+                bundle,
+                trace,
+                gap if gap is not None else bundle.gap_analysis,
+                repair if repair is not None else bundle.repair_plan,
+                initial_canonical_urls
+                if initial_canonical_urls is not None
+                else {item.canonical_url for item in bundle.evidence_items if item.canonical_url},
+            )
+        trace.evidence_state = EvidenceState.INSUFFICIENT
+        trace.citable_evidence_count = 0
+        return SearchPipelineResult(
+            decision=decision,
+            plan=plan,
+            evidence=bundle,
+            trace=trace,
+            failure_code=SearchFailureCode.PROVIDER_TIMEOUT,
+        )
+
+    def _remaining(self, deadline: float) -> float:
+        return max(deadline - self._monotonic(), 0.0)
+
+    def _expired(self, deadline: float) -> bool:
+        return self._remaining(deadline) <= 0
 
     def _assembler(self) -> EvidenceAssembler:
         return EvidenceAssembler(self._judge)
@@ -377,12 +662,14 @@ class SearchOrchestrator:
         return int((self._monotonic() - started) * 1000)
 
 
-def _query_metadata(queries: Sequence[SearchQuery]) -> tuple[tuple[str, object], ...]:
-    return tuple((query.query_id, query.purpose) for query in queries)
-
-
-def _candidate_url_count(results: Sequence[ProviderResult]) -> int:
-    return sum(len(result.hits) for result in results if result.status is ProviderStatus.SUCCESS)
+def _call_with_supported_kwargs(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    parameters = inspect.signature(method).parameters.values()
+    accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    names = {parameter.name for parameter in parameters}
+    supported = {
+        key: value for key, value in kwargs.items() if accepts_kwargs or key in names
+    }
+    return method(*args, **supported)
 
 
 def _repair_allowed(plan: SearchPlan, decision: Any) -> bool:
@@ -394,13 +681,9 @@ def _query_for_hit(
     plan: SearchPlan,
     hit: Any,
     *,
-    round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
+    additional_queries: Sequence[SearchQuery] = (),
 ) -> SearchQuery:
-    if round_kind is SearchRoundKind.REPAIR:
-        if hit.query_id and hit.query_id.startswith("repair"):
-            return plan.initial_queries[0]
-        return plan.initial_queries[0]
-    for query in plan.initial_queries:
+    for query in (*plan.initial_queries, *additional_queries):
         if query.query_id == hit.query_id:
             return query
     return plan.initial_queries[0]
@@ -419,23 +702,29 @@ def _failure_for_state(state: EvidenceState) -> SearchFailureCode | None:
     }.get(state)
 
 
-def _empty_bundle(plan: SearchPlan) -> EvidenceBundle:
+def _empty_bundle(
+    plan: SearchPlan,
+    *,
+    attempts: Sequence[ProviderAttempt] = (),
+    retrieval_round_count: int = 1,
+    limitation: str = "provider_failure",
+) -> EvidenceBundle:
     from src.search.models import EvidenceGapAnalysis, RepairPlan
     return EvidenceBundle(
         request_id="req-empty",
         decision=plan.decision,
         plan=plan,
-        attempts=(),
+        attempts=tuple(attempts),
         initial_evidence_ids=(),
         gap_analysis=EvidenceGapAnalysis((), (), False, None, ()),
         repair_plan=RepairPlan(False, (), None),
-        retrieval_round_count=1,
+        retrieval_round_count=retrieval_round_count,
         evidence_items=(),
         evidence_state=EvidenceState.INSUFFICIENT,
         missing_claim_topics=tuple(plan.required_topics),
         weak_source_topics=(),
         conflict_groups=(),
-        limitations=("provider_failure",),
+        limitations=(limitation,),
     )
 
 

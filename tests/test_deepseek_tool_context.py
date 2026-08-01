@@ -50,6 +50,20 @@ SEARCH_TOOL = {
 
 
 class DeepSeekToolContextTests(unittest.TestCase):
+    def test_call_timeout_is_capped_by_remaining_retrieval_time(self):
+        response = FakeResponse({"content": "普通回答"})
+        with mock.patch(
+            "src.services.deepseek_client.try_proxied_post",
+            return_value=response,
+        ) as post:
+            DeepSeekClient(config()).chat(
+                [{"role": "user", "content": "查一下"}],
+                model="deepseek-v4-flash",
+                timeout_seconds=0.25,
+            )
+
+        self.assertEqual(post.call_args.kwargs["timeout"], 0.25)
+
     def test_auto_sends_tools_without_tool_choice(self):
         response = FakeResponse({"content": "普通回答"})
 

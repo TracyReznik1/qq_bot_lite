@@ -498,6 +498,9 @@ class EvidenceItem:
     safety_flags: tuple[str, ...]
     supported_topics: tuple[str, ...]
     independence_group: str | None
+    conflict_key: str | None = None
+    conflict_value: str | None = None
+    conflict_relation: str | None = None
 
     def __post_init__(self) -> None:
         _normalize_fields(self, safety_flags=_strings(self.safety_flags, "safety_flags"), supported_topics=_strings(self.supported_topics, "supported_topics"))
@@ -505,6 +508,41 @@ class EvidenceItem:
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
         _require_enum(self.freshness_state, Freshness, "freshness_state")
+        if self.conflict_relation not in {None, "contradicts", "claims_supersession"}:
+            raise ValueError("conflict_relation must be a closed conflict relation")
+
+
+@dataclass(frozen=True)
+class EvidenceConflictMember:
+    evidence_id: str
+    value: str
+    published_at: datetime | None
+    relation: str
+
+    def __post_init__(self) -> None:
+        _require_safe_metadata(self.evidence_id, "evidence_id")
+        if not str(self.value or "").strip():
+            raise ValueError("conflict member value is required")
+        if self.relation not in {"contradicts", "claims_supersession"}:
+            raise ValueError("unknown conflict member relation")
+
+
+@dataclass(frozen=True)
+class EvidenceConflict:
+    conflict_id: str
+    conflict_key: str
+    members: tuple[EvidenceConflictMember, ...]
+
+    def __post_init__(self) -> None:
+        _require_safe_metadata(self.conflict_id, "conflict_id")
+        if not str(self.conflict_key or "").strip():
+            raise ValueError("conflict_key is required")
+        _normalize_fields(
+            self,
+            members=_records(self.members, EvidenceConflictMember, "members"),
+        )
+        if len(self.members) < 2:
+            raise ValueError("a conflict requires at least two members")
 
 
 @dataclass(frozen=True)
@@ -539,13 +577,14 @@ class EvidenceBundle:
     weak_source_topics: tuple[str, ...]
     conflict_groups: tuple[str, ...]
     limitations: tuple[str, ...]
+    conflicts: tuple[EvidenceConflict, ...] = ()
 
     def __post_init__(self) -> None:
         _require_record(self.decision, RetrievalDecision, "decision")
         _require_record(self.plan, SearchPlan, "plan")
         _require_record(self.gap_analysis, EvidenceGapAnalysis, "gap_analysis")
         _require_record(self.repair_plan, RepairPlan, "repair_plan")
-        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"))
+        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
 
 
@@ -577,13 +616,21 @@ class ProviderAttempt:
     status: ProviderStatus
     count: int
     latency_ms: int | float
+    query_id: str = ""
+    configured: bool = True
+    available: bool = True
+    invocation_started: bool = True
 
     def __post_init__(self) -> None:
         _require_enum(self.status, ProviderStatus, "status")
         _require_safe_metadata(self.provider, "provider")
+        if self.query_id:
+            _require_safe_metadata(self.query_id, "query_id")
         if type(self.count) is not int or self.count < 0:
             raise ValueError("count must be a non-negative integer")
         _require_number(self.latency_ms, "latency_ms")
+        if not all(type(value) is bool for value in (self.configured, self.available, self.invocation_started)):
+            raise TypeError("provider readiness and invocation fields must be booleans")
 
 
 @dataclass(frozen=True)
@@ -879,7 +926,16 @@ def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
     if not isinstance(attempt, ProviderAttempt):
         raise TypeError("provider attempts must be ProviderAttempt")
     provider = attempt.provider if attempt.provider in {"tavily", "ddgs"} else "[redacted]"
-    return {"provider": provider, "status": attempt.status, "count": attempt.count, "latency_ms": attempt.latency_ms}
+    return {
+        "provider": provider,
+        "status": attempt.status,
+        "count": attempt.count,
+        "latency_ms": attempt.latency_ms,
+        "query_id": _safe_log_identifier(attempt.query_id),
+        "configured": attempt.configured,
+        "available": attempt.available,
+        "invocation_started": attempt.invocation_started,
+    }
 
 
 def _json_safe(value: Any) -> Any:

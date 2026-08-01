@@ -118,6 +118,20 @@ class PlannerStandardTests(unittest.TestCase):
         direct = next(q for q in plan.initial_queries if q.purpose is QueryPurpose.DIRECT)
         self.assertEqual(direct.text, "Rust 和 Go 的并发模型有什么区别")
 
+    def test_planner_passes_the_smaller_remaining_time_to_model(self):
+        model = StaticPlannerModel()
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+
+        planner.plan(
+            request("Rust 和 Go 的并发模型有什么区别"),
+            standard_decision(),
+            timeout_seconds=0.25,
+        )
+
+        timeout = model.calls[0][1]["timeout_seconds"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 0.25)
+
     def test_standard_fallback_adds_primary_and_independent(self):
         plan = self._plan()
         texts = [q.text for q in plan.initial_queries]

@@ -58,6 +58,7 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ChatResponse:
         if not self._cfg.deepseek_api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not configured")
@@ -83,7 +84,9 @@ class DeepSeekClient:
                 "Authorization": f"Bearer {self._cfg.deepseek_api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=self._cfg.request_timeout,
+            timeout=min(self._cfg.request_timeout, timeout_seconds)
+            if timeout_seconds is not None
+            else self._cfg.request_timeout,
         )
         response.raise_for_status()
         data = response.json()

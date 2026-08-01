@@ -212,6 +212,30 @@ class SearchExtractorTests(unittest.TestCase):
         self.assertEqual(candidate.extraction_status, "search_result_snippet")
         self.assertEqual(candidate.content_reads_consumed, 0)
 
+    def test_failed_page_read_then_snippet_still_consumes_read_budget(self):
+        failed = self.module.url_fetch.UrlDocumentResult(
+            ok=False,
+            status="request_error",
+            requested_url="https://example.com/page",
+            final_url="https://example.com/page",
+            title="",
+            content_type="",
+            text="",
+        )
+        with mock.patch.object(self.module.url_fetch, "fetch_document", return_value=failed):
+            candidate = self._extractor().extract(
+                hit(raw_content=None, content="provider snippet"),
+                query(),
+                allow_network_read=True,
+                timeout_seconds=0.2,
+            )
+
+        self.assertEqual(candidate.excerpt, "provider snippet")
+        self.assertEqual(candidate.content_reads_consumed, 1)
+        self.assertEqual(candidate.extraction_status, "search_result_snippet_after_fetch_failure")
+        self.assertIsNotNone(candidate.document)
+        self.assertEqual(candidate.document.fetch_status, "request_error")
+
     def test_page_extract_when_network_allowed(self):
         response = _response(text="<html><head><title>光合作用</title></head><body><p>光合作用依赖光能。</p></body></html>")
         with (

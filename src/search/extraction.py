@@ -60,6 +60,7 @@ class SearchExtractor:
 
         # When a network read is allowed, fetch the page so a snippet never
         # blocks the underlying readable content (deep-tier DDGS requires it).
+        document = None
         if allow_network_read and hit.url:
             document = self._fetch_document(hit.url, timeout_seconds=timeout_seconds)
             if document.fetch_status == "success" and document.excerpt:
@@ -86,22 +87,26 @@ class SearchExtractor:
             safety_flags = _detect_safety_flags(snippet)
             return EvidenceCandidate(
                 hit=hit,
-                document=None,
+                document=document,
                 excerpt=excerpt,
                 excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
-                extraction_status="search_result_snippet",
+                extraction_status=(
+                    "search_result_snippet_after_fetch_failure"
+                    if document is not None
+                    else "search_result_snippet"
+                ),
                 safety_flags=safety_flags,
-                content_reads_consumed=0,
+                content_reads_consumed=1 if document is not None else 0,
             )
 
         return EvidenceCandidate(
             hit=hit,
-            document=None,
+            document=document,
             excerpt=None,
             excerpt_origin=None,
             extraction_status="no_content",
             safety_flags=(),
-            content_reads_consumed=0,
+            content_reads_consumed=1 if document is not None else 0,
         )
 
     def _fetch_document(self, url: str, *, timeout_seconds: float) -> FetchedDocument:

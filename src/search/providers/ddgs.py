@@ -52,7 +52,8 @@ class DDGSSearchProvider(SearchProvider):
                 latency_ms=0,
             )
         try:
-            with DDGS(proxy=self._proxy_url or None, timeout=self._timeout_seconds) as client:
+            per_call_timeout = min(self._timeout_seconds, max(float(timeout_seconds), 0.001))
+            with DDGS(proxy=self._proxy_url or None, timeout=per_call_timeout) as client:
                 raw_results = client.text(
                     query.text,
                     max_results=max_results,

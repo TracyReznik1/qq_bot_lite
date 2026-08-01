@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable, Mapping, Sequence
@@ -355,6 +356,7 @@ class SearchPlanner:
         decision: RetrievalDecision,
         *,
         deadline: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> SearchPlan:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         original = str(request.question or "")
@@ -382,7 +384,12 @@ class SearchPlanner:
                 budget=budget,
             )
 
-        payload = self._ask_model(request, decision, deadline=deadline)
+        payload = self._ask_model(
+            request,
+            decision,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+        )
         planned = _model_initial_queries(payload, budget)
         degraded_due_to_model = payload is None or planned is None
         required_relations = frozenset(
@@ -581,6 +588,7 @@ class SearchPlanner:
         decision: RetrievalDecision,
         *,
         deadline: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any] | None:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         payload = {
@@ -597,12 +605,24 @@ class SearchPlanner:
             },
         ]
         try:
+            remaining = timeout_seconds
+            if deadline is not None:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                if timeout_seconds is not None:
+                    remaining = min(remaining, timeout_seconds)
+            if remaining is not None and remaining <= 0:
+                return None
+            kwargs: dict[str, Any] = {
+                "temperature": 0.0,
+                "max_tokens": 1024,
+                "tools": None,
+                "tool_choice": "none",
+            }
+            if remaining is not None:
+                kwargs["timeout_seconds"] = max(float(remaining), 0.001)
             response = self._model.chat(
                 messages,
-                temperature=0.0,
-                max_tokens=1024,
-                tools=None,
-                tool_choice="none",
+                **kwargs,
             )
         except Exception:
             return None

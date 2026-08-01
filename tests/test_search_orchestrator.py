@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import time
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from datetime import date
 from unittest import mock
 
@@ -388,6 +391,220 @@ class OrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(result.failure_code, SearchFailureCode.CONTENT_UNREADABLE)
 
 
+class OrchestratorDeadlineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = orchestrator_module()
+        original = DEFAULT_TIER_BUDGETS[SearchTier.LIGHT]
+        self.short_budget = SimpleNamespace(
+            max_initial_queries=original.max_initial_queries,
+            max_candidate_urls=original.max_candidate_urls,
+            max_content_reads=original.max_content_reads,
+            max_repair_queries=original.max_repair_queries,
+            max_total_queries=original.max_total_queries,
+            max_retrieval_rounds=original.max_retrieval_rounds,
+            hard_timeout_seconds=0.05,
+        )
+        self.budgets = dict(DEFAULT_TIER_BUDGETS)
+        self.budgets[SearchTier.LIGHT] = self.short_budget
+
+    def _run_with_short_budget(self, orchestrator):
+        started = time.monotonic()
+        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", self.budgets):
+            try:
+                result = orchestrator.run(request())
+            except TimeoutError as exc:  # hard deadline must be contained
+                self.fail(f"deadline leaked TimeoutError: {exc}")
+        return result, time.monotonic() - started
+
+    def test_provider_deadline_returns_without_waiting_for_running_future(self):
+        class SlowProvider(_FakeProvider):
+            def search(self, query, *, tier, max_results, timeout_seconds):
+                self.calls.append((query, timeout_seconds))
+                time.sleep(0.25)
+                return super().search(
+                    query, tier=tier, max_results=max_results, timeout_seconds=timeout_seconds
+                )
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(SlowProvider(hits=[_hit(raw_content="正文")]),),
+            extractor=_FakeExtractor(),
+        )
+
+        result, elapsed = self._run_with_short_budget(orchestrator)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertTrue(result.trace.provider_invocation_started)
+
+    def test_planner_is_bounded_by_same_deadline_and_degrades(self):
+        class SlowPlanner:
+            def plan(self, *_args, **_kwargs):
+                time.sleep(0.25)
+                return _make_planner().plan(*_args, **_kwargs)
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=SlowPlanner(),
+            judge=_FakeJudge(),
+            providers=(),
+            extractor=_FakeExtractor(),
+        )
+
+        result, elapsed = self._run_with_short_budget(orchestrator)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertIsNotNone(result.plan)
+        self.assertEqual(result.plan.planning_status.value, "degraded")
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+
+    def test_judge_is_bounded_by_same_deadline_and_cannot_admit(self):
+        class SlowJudge:
+            def judge(self, *_args, **_kwargs):
+                time.sleep(0.25)
+                return {"C1": {"relevance": "direct"}}
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=SlowJudge(),
+            providers=(_FakeProvider(hits=[_hit(raw_content="光合作用正文")]),),
+            extractor=_FakeExtractor(),
+        )
+
+        result, elapsed = self._run_with_short_budget(orchestrator)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(result.evidence.evidence_items, ())
+
+    def test_reader_is_bounded_and_cleanup_does_not_delay_return(self):
+        class SlowExtractor:
+            def extract(self, *_args, **_kwargs):
+                time.sleep(0.25)
+                return _FakeExtractor().extract(*_args, **_kwargs)
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(_FakeProvider(hits=[_hit(raw_content="光合作用正文")]),),
+            extractor=SlowExtractor(),
+        )
+
+        result, elapsed = self._run_with_short_budget(orchestrator)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+
+
+class OrchestratorAccountingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = orchestrator_module()
+
+    def test_every_failed_fetch_then_snippet_attempt_consumes_aggregate_read_budget(self):
+        from src.search.models import EvidenceCandidate, ExcerptOrigin, ProviderHit, ProviderResult
+
+        class ManyHitsProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                hits = tuple(
+                    ProviderHit(
+                        "tavily", search_query.query_id, f"h{i}",
+                        f"https://example.com/{search_query.query_id}/{i}",
+                        "provider snippet", None, None, None, (),
+                    )
+                    for i in range(6)
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, hits, 1)
+
+        class FailedFetchSnippetExtractor:
+            def __init__(self):
+                self.calls = []
+
+            def extract(self, provider_hit, search_query, **_kwargs):
+                self.calls.append((provider_hit, search_query))
+                return EvidenceCandidate(
+                    provider_hit, None, provider_hit.snippet,
+                    ExcerptOrigin.PROVIDER_SNIPPET,
+                    "search_result_snippet_after_fetch_failure", (), 1,
+                )
+
+        extractor = FailedFetchSnippetExtractor()
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("standard")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topics=("定义",)),
+            providers=(ManyHitsProvider(),),
+            extractor=extractor,
+        )
+
+        result = orchestrator.run(request("什么是光合作用"))
+
+        self.assertEqual(len(extractor.calls), DEFAULT_TIER_BUDGETS[SearchTier.STANDARD].max_content_reads)
+        self.assertEqual(result.trace.content_read_count, DEFAULT_TIER_BUDGETS[SearchTier.STANDARD].max_content_reads)
+
+    def test_repair_counts_are_deltas_and_hit_keeps_actual_repair_query(self):
+        from src.search.models import EvidenceCandidate, ExcerptOrigin, ProviderHit, ProviderResult
+        from src.search.planner import _derive_required_topics
+
+        class PerQueryProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                provider_hit = ProviderHit(
+                    "tavily", search_query.query_id, search_query.query_id,
+                    f"https://example.com/{search_query.query_id}",
+                    "正文", None, None, "正文", (),
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
+
+        class RecordingExtractor:
+            def __init__(self):
+                self.query_ids = []
+
+            def extract(self, provider_hit, search_query, **_kwargs):
+                self.query_ids.append(search_query.query_id)
+                return EvidenceCandidate(
+                    provider_hit, None, "正文", ExcerptOrigin.PROVIDER_SNIPPET,
+                    "provider_raw_content", (), 1,
+                )
+
+        question = "Rust 和 Go 的并发模型有什么区别"
+        topics = _derive_required_topics(question)
+        extractor = RecordingExtractor()
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("standard")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topics=()),
+            providers=(PerQueryProvider(),),
+            extractor=extractor,
+        )
+
+        result = orchestrator.run(request(question))
+
+        self.assertEqual(result.trace.candidate_url_count, 4)
+        self.assertEqual(result.trace.content_read_count, 4)
+        self.assertEqual(extractor.query_ids[-1], "repair-1")
+        self.assertEqual(
+            [query_id for query_id, _purpose in result.trace.executed_queries],
+            ["initial-1", "initial-2", "initial-3", "repair-1"],
+        )
+        self.assertEqual(result.evidence.retrieval_round_count, 2)
+        self.assertTrue(result.evidence.repair_plan.triggered)
+        self.assertEqual(result.evidence.attempts, result.trace.provider_attempts)
+        self.assertEqual(result.evidence.gap_analysis, self.module.EvidenceAssembler(_FakeJudge()).analyze_gap(result.plan, result.evidence))
+
+
 class OrchestratorTraceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = orchestrator_module()
@@ -424,6 +641,11 @@ class OrchestratorTraceTests(unittest.TestCase):
         self.assertTrue(trace.orchestrator_started)
         self.assertTrue(trace.provider_invocation_started)
         self.assertIs(trace.evidence_state, EvidenceState.SUFFICIENT)
+        attempt = trace.to_log_dict()["provider_attempts"][0]
+        self.assertEqual(attempt["query_id"], "initial-1")
+        self.assertTrue(attempt["configured"])
+        self.assertTrue(attempt["available"])
+        self.assertTrue(attempt["invocation_started"])
 
     def test_request_local_redaction_audit_flows_from_plan_and_repair_to_trace(self):
         provider = _FakeProvider(hits=[_hit()] * 3)

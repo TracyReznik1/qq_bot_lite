@@ -14,6 +14,7 @@ dumping a raw traceback into the QQ chat.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import requests
@@ -123,11 +124,13 @@ class FallbackLLMClient:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> ChatResponse:
         has_tools = bool(tools)
         has_images = _messages_have_images(messages)
         affinity = _tool_affinity(messages)
 
+        started = time.monotonic()
         for spec in self._chain:
             if affinity is not None and affinity != (spec.provider, spec.model):
                 continue
@@ -142,6 +145,11 @@ class FallbackLLMClient:
             client = self._get_client(spec)
 
             try:
+                remaining = timeout_seconds
+                if timeout_seconds is not None:
+                    remaining = max(timeout_seconds - (time.monotonic() - started), 0.0)
+                    if remaining <= 0:
+                        raise TimeoutError("LLM deadline expired")
                 result = client.chat(
                     messages,
                     model=spec.model,
@@ -149,6 +157,7 @@ class FallbackLLMClient:
                     max_tokens=max_tokens,
                     tools=tools,
                     tool_choice=tool_choice,
+                    timeout_seconds=remaining,
                 )
                 # Guard against responses that are structurally broken:
                 # content is empty AND tool_calls is empty → treat as failure.

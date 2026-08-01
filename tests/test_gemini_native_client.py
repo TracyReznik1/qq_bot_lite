@@ -43,6 +43,22 @@ SEARCH_TOOL = {
 
 
 class GeminiNativeRequestTests(unittest.TestCase):
+    def test_call_timeout_is_capped_by_remaining_retrieval_time(self):
+        response = FakeResponse(
+            {"candidates": [{"content": {"parts": [{"text": "回答"}]}}]}
+        )
+        with mock.patch(
+            "src.services.gemini_client.try_proxied_post",
+            return_value=response,
+        ) as post:
+            GeminiClient(config()).chat(
+                [{"role": "user", "content": "你好"}],
+                model="gemini:model/one",
+                timeout_seconds=0.25,
+            )
+
+        self.assertEqual(post.call_args.kwargs["timeout"], 0.25)
+
     def test_uses_native_url_api_key_header_and_generation_config(self):
         response = FakeResponse(
             {

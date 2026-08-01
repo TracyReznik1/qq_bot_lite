@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
@@ -11,6 +13,8 @@ from urllib.parse import urlparse
 from src.search.models import (
     CandidateRelevance,
     EvidenceBundle,
+    EvidenceConflict,
+    EvidenceConflictMember,
     EvidenceGapAnalysis,
     EvidenceItem,
     EvidenceState,
@@ -40,7 +44,9 @@ Return a JSON object mapping each candidate_id to a verdict:
     "publisher_entity_match": true or false,
     "ownership_basis": "non-empty only when the page publisher is the entity named in the query",
     "supported_topics": ["topic names"],
-    "conflict_key": null or "a short conflict grouping key"
+    "conflict_key": null or "a short conflict grouping key",
+    "conflict_value": null or "the exact value asserted for that key",
+    "conflict_relation": "contradicts|claims_supersession"
   }
 }
 
@@ -50,6 +56,8 @@ Rules:
 - primary requires the page publisher to actually be the query entity
 - a docs/developer domain or /docs path alone never proves ownership
 - keep supported topics to those the excerpt actually states
+- prefer the supplied required_topics labels when they match the excerpt
+- conflict_value must contain the actual version/date/value, not prose
 """
 
 
@@ -60,9 +68,17 @@ class LLMEvidenceJudge:
         self._llm = llm
         self._max_tokens = max_tokens
 
-    def judge(self, question: str, candidates: Sequence[EvidenceCandidate]) -> dict[str, dict[str, Any]]:
+    def judge(
+        self,
+        question: str,
+        candidates: Sequence[EvidenceCandidate],
+        *,
+        required_topics: Sequence[str] = (),
+        timeout_seconds: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
         payload = {
             "question": question,
+            "required_topics": list(required_topics),
             "candidates": [
                 {
                     "candidate_id": f"C{index}",
@@ -83,12 +99,17 @@ class LLMEvidenceJudge:
             },
         ]
         try:
+            kwargs: dict[str, Any] = {
+                "temperature": 0.0,
+                "max_tokens": self._max_tokens,
+                "tools": None,
+                "tool_choice": "none",
+            }
+            if timeout_seconds is not None:
+                kwargs["timeout_seconds"] = max(float(timeout_seconds), 0.001)
             response = self._llm.chat(
                 messages,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
-                tools=None,
-                tool_choice="none",
+                **kwargs,
             )
         except Exception:
             return {}
@@ -135,6 +156,12 @@ def _parse_verdict(raw: Any) -> dict[str, Any]:
     conflict_key = raw.get("conflict_key")
     if isinstance(conflict_key, str) and conflict_key.strip():
         result["conflict_key"] = conflict_key.strip()[:80]
+    conflict_value = raw.get("conflict_value")
+    if isinstance(conflict_value, (str, int, float)) and str(conflict_value).strip():
+        result["conflict_value"] = str(conflict_value).strip()[:160]
+    conflict_relation = raw.get("conflict_relation")
+    if conflict_relation in {"contradicts", "claims_supersession"}:
+        result["conflict_relation"] = conflict_relation
     return result
 
 
@@ -209,24 +236,25 @@ class EvidenceAssembler:
         candidates: Sequence[EvidenceCandidate],
         *,
         previous: EvidenceBundle | None = None,
+        timeout_seconds: float | None = None,
     ) -> EvidenceBundle:
         del previous
         indexed = {
             f"C{index}": candidate for index, candidate in enumerate(candidates, 1)
         }
-        judged = self._judge_output(plan, indexed)
+        judged = self._judge_output(plan, indexed, timeout_seconds=timeout_seconds)
         verdicts = {
             key: _parse_verdict(judged.get(key)) for key in indexed
         }
 
         admitted: list[EvidenceItem] = []
-        grouped: dict[str, str] = {}
+        groups: list[dict[str, Any]] = []
         seen_canonical: set[str] = set()
         for key in indexed:
             candidate = indexed[key]
             verdict = verdicts.get(key) or _fallback_verdict(candidate)
             relevance = verdict.get("relevance")
-            if relevance is CandidateRelevance.IRRELEVANT:
+            if relevance is not CandidateRelevance.DIRECT:
                 continue
             # Use the validated final URL when a fetch redirected; otherwise the
             # requested URL is the best available source URL.
@@ -236,10 +264,7 @@ class EvidenceAssembler:
                 continue
             seen_canonical.add(canonical)
             domain = _domain_of(final_url)
-            independence = _independence_key(candidate.excerpt or "", final_url)
-            if independence not in grouped:
-                grouped[independence] = f"g{len(grouped) + 1}"
-            group_label = grouped[independence]
+            group_label = _independence_group(candidate, final_url, groups)
 
             relation = verdict.get("relation", SourceRelation.UNKNOWN)
             if relation is SourceRelation.PRIMARY:
@@ -272,6 +297,18 @@ class EvidenceAssembler:
                 safety_flags=candidate.safety_flags,
                 supported_topics=tuple(verdict.get("supported_topics", ())),
                 independence_group=group_label,
+                conflict_key=verdict.get("conflict_key"),
+                conflict_value=(
+                    verdict.get("conflict_value")
+                    or _extract_conflict_value(candidate.excerpt or "")
+                    if verdict.get("conflict_key")
+                    else None
+                ),
+                conflict_relation=(
+                    verdict.get("conflict_relation", "contradicts")
+                    if verdict.get("conflict_key")
+                    else None
+                ),
             )
             admitted.append(item)
 
@@ -285,12 +322,7 @@ class EvidenceAssembler:
         plan: SearchPlan,
         bundle: EvidenceBundle,
     ) -> EvidenceGapAnalysis:
-        supported_topics: set[str] = set()
-        for item in bundle.evidence_items:
-            supported_topics.update(item.supported_topics)
-        missing = tuple(
-            topic for topic in plan.required_topics if topic not in supported_topics
-        )
+        missing = tuple(bundle.missing_claim_topics)
         repairable = bool(missing) or bool(bundle.conflict_groups)
         reason_codes: tuple[str, ...] = ()
         if missing:
@@ -315,9 +347,20 @@ class EvidenceAssembler:
         self,
         plan: SearchPlan,
         indexed: Mapping[str, EvidenceCandidate],
+        *,
+        timeout_seconds: float | None,
     ) -> dict[str, Any]:
         try:
-            judged = self._judge.judge(plan.original_question, list(indexed.values()))
+            method = self._judge.judge
+            parameters = inspect.signature(method).parameters.values()
+            accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+            names = {parameter.name for parameter in parameters}
+            kwargs: dict[str, Any] = {}
+            if accepts_kwargs or "required_topics" in names:
+                kwargs["required_topics"] = plan.required_topics
+            if accepts_kwargs or "timeout_seconds" in names:
+                kwargs["timeout_seconds"] = timeout_seconds
+            judged = method(plan.original_question, list(indexed.values()), **kwargs)
         except Exception:
             return {}
         if not isinstance(judged, dict):
@@ -331,17 +374,7 @@ class EvidenceAssembler:
     ) -> EvidenceBundle:
         required = set(plan.required_topics)
         citable_items = [item for item in items if item.citable]
-        supported: set[str] = set()
-        strong_supported: set[str] = set()
-        for item in citable_items:
-            supported.update(item.supported_topics)
-            if _strong_support(item, plan):
-                strong_supported.update(item.supported_topics)
-
-        # For deep dynamic topics, a bare DDGS availability-fallback snippet
-        # alone cannot establish sufficiency.
-        if plan.decision.route is SearchTier.DEEP:
-            supported = strong_supported
+        supported = _supported_required_topics(plan, citable_items)
 
         # Zero citable Evidence is unconditionally insufficient: a bundle with
         # no readable content cannot support any material claim.
@@ -366,7 +399,8 @@ class EvidenceAssembler:
 
         missing = tuple(topic for topic in plan.required_topics if topic not in supported)
 
-        conflict_groups = _detect_conflict_groups(items)
+        conflicts = _detect_conflicts(items)
+        conflict_groups = tuple(conflict.conflict_id for conflict in conflicts)
         weaknesses = _weak_source_topics(items, plan, required, supported)
 
         if conflict_groups:
@@ -379,8 +413,7 @@ class EvidenceAssembler:
         limitations: list[str] = []
         if plan.decision.route in {SearchTier.STANDARD, SearchTier.DEEP}:
             if state in {EvidenceState.SUFFICIENT, EvidenceState.PARTIAL}:
-                primary_count = sum(1 for item in items if item.source_relation is SourceRelation.PRIMARY)
-                if primary_count <= 1:
+                if _uses_authoritative_single_source(plan, citable_items):
                     limitations.append("single_source_authority")
         if weaknesses:
             limitations.append("weak_source_topics")
@@ -400,6 +433,7 @@ class EvidenceAssembler:
             weak_source_topics=tuple(sorted(weaknesses)),
             conflict_groups=conflict_groups,
             limitations=tuple(limitations),
+            conflicts=conflicts,
         )
 
 
@@ -423,24 +457,61 @@ def _citable(candidate: EvidenceCandidate, plan: SearchPlan) -> bool:
 
 def _strong_support(item: EvidenceItem, plan: SearchPlan) -> bool:
     """A dynamic/deep topic needs readable content, not a bare fallback snippet."""
-    if plan.decision.route is not SearchTier.DEEP:
+    high_consequence = (
+        plan.decision.route is SearchTier.DEEP
+        or plan.decision.risk.value == "high"
+        or plan.decision.potential_harm.value == "high"
+    )
+    if not high_consequence:
         return True
-    if item.provider == "ddgs":
-        return item.extraction_status in {
-            "provider_raw_content",
-            "page_extract",
-            "document_extract",
+    return item.extraction_status in {
+        "provider_raw_content",
+        "page_extract",
+        "document_extract",
+    }
+
+
+def _independence_group(
+    candidate: EvidenceCandidate,
+    url: str,
+    groups: list[dict[str, Any]],
+) -> str:
+    """Group by source/domain provenance, and collapse syndicated copies.
+
+    Different wording on one domain is never independent. Near-identical text
+    across domains is also one provenance group.
+    """
+    domain = _domain_of(url) or _canonical_url(url)
+    normalized = re.sub(r"[^a-z0-9一-鿿]+", "", (candidate.excerpt or "").casefold())[:600]
+    canonical_marker = next(
+        (
+            flag.split(":", 1)[1]
+            for flag in candidate.hit.quality_flags
+            if flag.startswith("canonical_source:") and ":" in flag
+        ),
+        None,
+    )
+    for group in groups:
+        if domain and domain in group["domains"]:
+            group["domains"].add(domain)
+            return group["id"]
+        if canonical_marker and canonical_marker == group["canonical_marker"]:
+            group["domains"].add(domain)
+            return group["id"]
+        prior = group["normalized"]
+        if len(normalized) >= 12 and len(prior) >= 12 and SequenceMatcher(None, normalized, prior).ratio() >= 0.92:
+            group["domains"].add(domain)
+            return group["id"]
+    label = f"g{len(groups) + 1}"
+    groups.append(
+        {
+            "id": label,
+            "domains": {domain},
+            "normalized": normalized,
+            "canonical_marker": canonical_marker,
         }
-    return item.excerpt_origin is not None or item.extraction_status == "provider_raw_content"
-
-
-def _independence_key(excerpt: str, url: str) -> str:
-    """Near-identical syndicated excerpts share one independence group."""
-    domain = _domain_of(url) or ""
-    normalized = re.sub(r"\s+", "", (excerpt or "")).casefold()
-    if len(normalized) < 12:
-        return domain or url
-    return f"x:{normalized[:160]}"
+    )
+    return label
 
 
 def _order_by_relevance(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
@@ -489,6 +560,9 @@ def _assign_evidence_ids(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
         safety_flags=item.safety_flags,
         supported_topics=item.supported_topics,
         independence_group=item.independence_group,
+        conflict_key=item.conflict_key,
+        conflict_value=item.conflict_value,
+        conflict_relation=item.conflict_relation,
     ) for index, item in enumerate(items, 1)]
 
 
@@ -520,19 +594,100 @@ def _conflicting_values(excerpts: Sequence[str]) -> bool:
     return False
 
 
-def _detect_conflict_groups(items: Sequence[EvidenceItem]) -> tuple[str, ...]:
-    groups: set[str] = set()
+def _detect_conflicts(items: Sequence[EvidenceItem]) -> tuple[EvidenceConflict, ...]:
+    conflicts: list[EvidenceConflict] = []
     seen: dict[str, list[EvidenceItem]] = {}
     for item in items:
-        if item.supported_topics and len(item.supported_topics) >= 1:
-            key = "|".join(sorted(item.supported_topics))
-            seen.setdefault(key, []).append(item)
+        if item.conflict_key and item.conflict_value:
+            seen.setdefault(item.conflict_key, []).append(item)
     for key, members in seen.items():
-        if len(members) >= 2:
-            excerpts = [m.excerpt or "" for m in members]
-            if _conflicting_values(excerpts):
-                groups.add(f"conflict:{key}")
-    return tuple(sorted(groups))
+        values = {member.conflict_value for member in members if member.conflict_value}
+        if len(members) < 2 or len(values) < 2:
+            continue
+        conflicts.append(
+            EvidenceConflict(
+                conflict_id=f"conflict:{key}",
+                conflict_key=key,
+                members=tuple(
+                    EvidenceConflictMember(
+                        evidence_id=member.evidence_id,
+                        value=member.conflict_value or "",
+                        published_at=member.published_at,
+                        relation=member.conflict_relation or "contradicts",
+                    )
+                    for member in members
+                ),
+            )
+        )
+    return tuple(sorted(conflicts, key=lambda conflict: conflict.conflict_id))
+
+
+def _extract_conflict_value(excerpt: str) -> str | None:
+    for pattern in (_VERSION_PATTERN, _DATE_PATTERN):
+        match = pattern.search(excerpt or "")
+        if match:
+            return match.group(0)
+    if any(mark in (excerpt or "") for mark in ("￥", "元", "$")):
+        match = _NUMBER_PATTERN.search(excerpt or "")
+        if match:
+            return match.group(0)
+    return None
+
+
+def _normalized_topic(value: str) -> str:
+    return re.sub(r"[^a-z0-9一-鿿]+", "", str(value or "").casefold())
+
+
+def _topic_matches(required: str, supported: str) -> bool:
+    required_key = _normalized_topic(required)
+    supported_key = _normalized_topic(supported)
+    if not required_key or not supported_key:
+        return False
+    return supported_key in required_key or required_key in supported_key
+
+
+def _item_supports_topic(item: EvidenceItem, topic: str) -> bool:
+    return any(_topic_matches(topic, supported) for supported in item.supported_topics)
+
+
+def _has_independent_corroboration(primary: EvidenceItem, items: Sequence[EvidenceItem]) -> bool:
+    return any(
+        item.source_relation is SourceRelation.INDEPENDENT
+        and item.evidence_id != primary.evidence_id
+        and item.independence_group != primary.independence_group
+        and item.domain != primary.domain
+        for item in items
+    )
+
+
+def _supported_required_topics(plan: SearchPlan, items: Sequence[EvidenceItem]) -> set[str]:
+    supported: set[str] = set()
+    for topic in plan.required_topics:
+        topic_items = [item for item in items if _item_supports_topic(item, topic)]
+        if plan.decision.route is SearchTier.DEEP:
+            topic_items = [item for item in topic_items if _strong_support(item, plan)]
+            primary_items = [item for item in topic_items if item.source_relation is SourceRelation.PRIMARY]
+            if not primary_items:
+                continue
+            if any(_has_independent_corroboration(primary, topic_items) for primary in primary_items):
+                supported.add(topic)
+                continue
+            # The confirmed design permits an explicit authoritative-single-
+            # source limitation when direct primary support is all that exists.
+            supported.add(topic)
+            continue
+        if topic_items:
+            supported.add(topic)
+    return supported
+
+
+def _uses_authoritative_single_source(plan: SearchPlan, items: Sequence[EvidenceItem]) -> bool:
+    for topic in plan.required_topics:
+        topic_items = [item for item in items if _item_supports_topic(item, topic) and _strong_support(item, plan)]
+        primaries = [item for item in topic_items if item.source_relation is SourceRelation.PRIMARY]
+        if primaries and not any(_has_independent_corroboration(primary, topic_items) for primary in primaries):
+            return True
+    return False
 
 
 def _weak_source_topics(

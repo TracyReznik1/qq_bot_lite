@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import importlib
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from typing import Any
 from unittest import mock
 
 from src.search.models import (
+    ProviderHit,
     ProviderReadiness,
+    ProviderResult,
     ProviderStatus,
     QueryPurpose,
     SearchQuery,
@@ -92,6 +96,25 @@ def _ddgs_hit(**overrides):
     }
     item.update(overrides)
     return item
+
+
+def _provider_result(provider="tavily", *, status=ProviderStatus.SUCCESS, query_id="q1", latency_ms=0):
+    hits = ()
+    if status is ProviderStatus.SUCCESS:
+        hits = (
+            ProviderHit(
+                provider,
+                query_id,
+                "result",
+                f"https://example.com/{provider}/{query_id}",
+                "result",
+                None,
+                None,
+                None,
+                (),
+            ),
+        )
+    return ProviderResult(provider, status, hits, latency_ms)
 
 class TavilyAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -277,6 +300,32 @@ class DDGSAdapterTests(unittest.TestCase):
         result = adapter.search(query(), tier=SearchTier.STANDARD, max_results=8, timeout_seconds=20.0)
         self.assertEqual(result.status, ProviderStatus.ERROR)
 
+    def test_each_call_uses_the_smaller_remaining_timeout(self):
+        client = FakeDDGSClient(results=[_ddgs_hit()])
+        constructor_kwargs = []
+        patcher = mock.patch.object(
+            self.module.ddgs,
+            "DDGS",
+            lambda **kwargs: constructor_kwargs.append(kwargs) or client,
+        )
+        if self._stack is not None:
+            self._stack.stop()
+        patcher.start()
+        self._stack = patcher
+        adapter = self.module.ddgs.DDGSSearchProvider(
+            proxy_url="http://proxy:8080",
+            timeout_seconds=18.0,
+        )
+
+        adapter.search(
+            query(),
+            tier=SearchTier.STANDARD,
+            max_results=8,
+            timeout_seconds=0.25,
+        )
+
+        self.assertEqual(constructor_kwargs[0]["timeout"], 0.25)
+
 
 class RegistryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -304,9 +353,7 @@ class RegistryTests(unittest.TestCase):
         tavily = mock.Mock()
         tavily.name = "tavily"
         tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
-        tavily.search.return_value = mock.Mock(
-            status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=10
-        )
+        tavily.search.return_value = _provider_result(latency_ms=10)
         registry = self._registry(tavily, None)
         result = registry.search(query(), tier=SearchTier.STANDARD, max_results=8, timeout_seconds=20.0)
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
@@ -317,16 +364,21 @@ class RegistryTests(unittest.TestCase):
         tavily = mock.Mock()
         tavily.name = "tavily"
         tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
-        tavily.search.return_value = mock.Mock(status=ProviderStatus.ERROR, hits=(), latency_ms=5)
+        tavily.search.return_value = _provider_result(status=ProviderStatus.ERROR, latency_ms=5)
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
-        ddgs.search.return_value = mock.Mock(status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=3)
+        ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
         result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
         self.assertTrue(ddgs.search.called)
         # A fallback call is a separate ProviderAttempt but one semantic query.
+        self.assertIsInstance(result.attempts, tuple)
+        self.assertEqual(
+            [(attempt.provider, attempt.query_id) for attempt in result.attempts],
+            [("tavily", "q1"), ("ddgs", "q1")],
+        )
 
     def test_unavailable_primary_is_skipped_without_invocation(self):
         tavily = mock.Mock()
@@ -336,31 +388,122 @@ class RegistryTests(unittest.TestCase):
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
-        ddgs.search.return_value = mock.Mock(status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=3)
+        ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
         result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
-        self.assertEqual(len(registry.last_attempts), 1)
+        self.assertIsInstance(result.attempts, tuple)
+        self.assertEqual(len(result.attempts), 1)
         self.assertFalse(tavily.search.called)
 
     def test_fallback_same_query_id_is_one_semantic_query(self):
         tavily = mock.Mock()
         tavily.name = "tavily"
         tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
-        tavily.search.return_value = mock.Mock(status=ProviderStatus.ERROR, hits=(), latency_ms=5)
+        tavily.search.return_value = _provider_result(status=ProviderStatus.ERROR, latency_ms=5)
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
-        ddgs.search.return_value = mock.Mock(status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=3)
+        ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
-        registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
-        self.assertEqual(len(registry.last_attempts), 2)
+        result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
+        self.assertIsInstance(result.attempts, tuple)
+        self.assertEqual(len(result.attempts), 2)
+
+    def test_concurrent_calls_return_immutable_attempts_for_their_own_query(self):
+        class PerQueryProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                time.sleep(0.03 if search_query.query_id == "qa" else 0.01)
+                return self_result(search_query.query_id)
+
+        def self_result(query_id):
+            from src.search.models import ProviderHit, ProviderResult
+
+            provider_hit = ProviderHit(
+                "tavily",
+                query_id,
+                query_id,
+                f"https://example.com/{query_id}",
+                "result",
+                None,
+                None,
+                None,
+                (),
+            )
+            return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 0)
+
+        registry = self._registry(PerQueryProvider(), None)
+        qa = SearchQuery("qa", SearchRoundKind.INITIAL, QueryPurpose.DIRECT, "A")
+        qb = SearchQuery("qb", SearchRoundKind.INITIAL, QueryPurpose.DIRECT, "B")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda item: registry.search(
+                        item,
+                        tier=SearchTier.LIGHT,
+                        max_results=1,
+                        timeout_seconds=1.0,
+                    ),
+                    (qa, qb),
+                )
+            )
+
+        self.assertTrue(hasattr(results[0], "attempts"))
+        self.assertTrue(hasattr(results[1], "attempts"))
+        self.assertEqual(results[0].attempts[0].query_id, "qa")
+        self.assertEqual(results[1].attempts[0].query_id, "qb")
+        self.assertIsInstance(results[0].attempts, tuple)
+        self.assertIsInstance(results[1].attempts, tuple)
+
+    def test_attempts_keep_each_adapter_latency_and_reduced_fallback_time(self):
+        observed_timeouts = []
+
+        def primary_search(_query, **kwargs):
+            observed_timeouts.append(("tavily", kwargs["timeout_seconds"]))
+            time.sleep(0.03)
+            from src.search.models import ProviderResult
+            return ProviderResult("tavily", ProviderStatus.ERROR, (), 0)
+
+        def fallback_search(search_query, **kwargs):
+            observed_timeouts.append(("ddgs", kwargs["timeout_seconds"]))
+            time.sleep(0.01)
+            from src.search.models import ProviderHit, ProviderResult
+            provider_hit = ProviderHit(
+                "ddgs", search_query.query_id, "ok", "https://example.com/ok",
+                "ok", None, None, None, ("availability_fallback",),
+            )
+            return ProviderResult("ddgs", ProviderStatus.SUCCESS, (provider_hit,), 0)
+
+        tavily = mock.Mock(name="tavily")
+        tavily.name = "tavily"
+        tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
+        tavily.search.side_effect = primary_search
+        ddgs = mock.Mock(name="ddgs")
+        ddgs.name = "ddgs"
+        ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
+        ddgs.search.side_effect = fallback_search
+
+        result = self._registry(tavily, ddgs).search(
+            query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=0.2
+        )
+
+        self.assertIsInstance(result.attempts, tuple)
+        self.assertEqual([attempt.provider for attempt in result.attempts], ["tavily", "ddgs"])
+        self.assertGreaterEqual(result.attempts[0].latency_ms, 20)
+        self.assertGreaterEqual(result.attempts[1].latency_ms, 5)
+        self.assertLess(observed_timeouts[1][1], observed_timeouts[0][1])
+        self.assertTrue(all(attempt.invocation_started for attempt in result.attempts))
 
     def test_no_fallback_after_usable_tavily_hits(self):
         tavily = mock.Mock()
         tavily.name = "tavily"
         tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
-        tavily.search.return_value = mock.Mock(status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=5)
+        tavily.search.return_value = _provider_result(latency_ms=5)
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         registry = self._registry(tavily, ddgs)

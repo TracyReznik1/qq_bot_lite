@@ -8,6 +8,8 @@ from .models import (
     DEFAULT_TIER_BUDGETS,
     EvidenceBundle,
     EvidenceCandidate,
+    EvidenceConflict,
+    EvidenceConflictMember,
     EvidenceGapAnalysis,
     EvidenceItem,
     EvidenceState,
@@ -55,7 +57,7 @@ from .orchestrator import (
 
 __all__ = [
     "Actionability", "AnswerBlock", "BenefitDimension", "CandidateRelevance", "Claim", "DEFAULT_TIER_BUDGETS",
-    "EvidenceBundle", "EvidenceCandidate", "EvidenceGapAnalysis", "EvidenceItem", "EvidenceState", "ExcerptOrigin", "FetchedDocument",
+    "EvidenceBundle", "EvidenceCandidate", "EvidenceConflict", "EvidenceConflictMember", "EvidenceGapAnalysis", "EvidenceItem", "EvidenceState", "ExcerptOrigin", "FetchedDocument",
     "Factuality", "Freshness", "GroundedDraft", "PlanningStatus", "PotentialHarm", "ProviderAttempt",
     "ProviderHit", "ProviderReadiness", "ProviderResult", "ProviderStatus", "PROVIDER_STATUS_FAILURE_CODES", "QueryPurpose", "RedactionCode", "RepairPlan",
     "RequestSource", "RetrievalDecision", "RetrievalRequest", "RiskLevel", "SearchFailureCode",

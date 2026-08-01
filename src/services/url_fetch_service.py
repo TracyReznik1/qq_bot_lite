@@ -193,31 +193,6 @@ def _content_length(headers: Mapping) -> int:
         return 0
 
 
-def _read_limited_text(response) -> tuple[bool, str, str]:
-    content = getattr(response, "content", None)
-    if content is None and hasattr(response, "iter_content"):
-        chunks = bytearray()
-        for chunk in response.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            if isinstance(chunk, str):
-                chunk = chunk.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
-            chunks.extend(chunk)
-            if len(chunks) > MAX_URL_BYTES:
-                return False, "too_large", ""
-        content = bytes(chunks)
-
-    if content is not None:
-        if isinstance(content, str):
-            content = content.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
-        if len(content) > MAX_URL_BYTES:
-            return False, "too_large", ""
-        encoding = getattr(response, "encoding", None) or getattr(response, "apparent_encoding", None) or "utf-8"
-        return True, "", content.decode(encoding, errors="replace")
-
-    return True, "", str(getattr(response, "text", "") or "")
-
-
 def _extract_readable_text(raw_text: str, content_type: str) -> tuple[str, str]:
     raw_text = str(raw_text or "")
     if content_type in {"text/html", "application/xhtml+xml"} or "<html" in raw_text[:1000].lower():
