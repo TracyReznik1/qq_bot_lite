@@ -295,6 +295,9 @@ _MEDICATION_ADMINISTRATION_MARKERS = (
     "吃多少",
     "该吃多少",
     "每天吃",
+    "每次",
+    "几片",
+    "几粒",
     "用量",
     "剂量",
     "服用",
@@ -307,11 +310,18 @@ _MEDICATION_ADMINISTRATION_MARKERS = (
 
 _MEDICATION_CONTEXT_MARKERS = (
     "药",
+    "药物",
+    "药品",
+    "泰诺",
     "布洛芬",
     "阿司匹林",
     "抗生素",
     "退烧",
     "发烧",
+    "片",
+    "粒",
+    "胶囊",
+    "口服液",
 )
 
 _ACUTE_SYMPTOM_MARKERS = (
@@ -327,6 +337,8 @@ _ACUTE_SYMPTOM_MARKERS = (
     "发烧40",
     "严重过敏",
     "意识不清",
+    "半边脸麻",
+    "说话含糊",
 )
 
 _URGENT_HELP_MARKERS = (
@@ -340,6 +352,7 @@ _URGENT_HELP_MARKERS = (
 
 _CHEMICAL_EXPOSURE_MARKERS = (
     "清洁剂",
+    "84消毒液",
     "漂白剂",
     "消毒液",
     "农药",
@@ -351,6 +364,8 @@ _CHEMICAL_EXPOSURE_MARKERS = (
 
 _EXPOSURE_ROUTE_MARKERS = (
     "溅进眼",
+    "溅到眼里",
+    "溅到眼睛",
     "进眼睛",
     "眼睛",
     "吸入",
@@ -362,9 +377,35 @@ _EXPOSURE_ROUTE_MARKERS = (
 )
 
 
+def _safety_normalized_text(question: str) -> str:
+    return re.sub(r"\s+", "", question).casefold()
+
+
+def _is_stable_or_nonpersonal_safety_text(question: str) -> bool:
+    """Keep definitions, mechanisms, quotations, and negated examples out of
+    the emergency/action fallback without suppressing an actual help request."""
+    compact = _safety_normalized_text(question)
+    is_definition = any(pattern in compact for pattern in _FOUNDATION_PATTERNS)
+    is_mechanism = any(marker in compact for marker in ("为什么", "为何", "原理", "机制"))
+    quoted_explanation = (
+        any(mark in question for mark in ("\"", "“", "”", "'", "‘", "’"))
+        and any(marker in compact for marker in ("这句话", "什么意思", "怎么理解", "引用"))
+    )
+    negated_example = any(marker in compact for marker in ("不是在问", "不需要用药建议", "不要给我用药建议"))
+    if quoted_explanation:
+        return True
+    if negated_example and (is_definition or is_mechanism):
+        return True
+    if is_definition:
+        return True
+    return is_mechanism and any(marker in compact for marker in _CHEMICAL_EXPOSURE_MARKERS)
+
+
 def _has_actionable_high_consequence_signal(question: str) -> bool:
     """Recognize concrete safety actions without treating domain words alone as urgent."""
-    lowered = question.casefold()
+    if _is_stable_or_nonpersonal_safety_text(question):
+        return False
+    lowered = _safety_normalized_text(question)
     medication_action = any(marker in lowered for marker in _MEDICATION_ADMINISTRATION_MARKERS)
     medication_context = any(marker in lowered for marker in _MEDICATION_CONTEXT_MARKERS)
     if medication_action and medication_context:
@@ -380,6 +421,8 @@ def _has_actionable_high_consequence_signal(question: str) -> bool:
 
 def _detect_personalized_high_consequence(question: str) -> TriggerCode | None:
     lowered = question.casefold()
+    if _is_stable_or_nonpersonal_safety_text(question):
+        return None
     if _has_actionable_high_consequence_signal(question):
         return TriggerCode.HIGH_CONSEQUENCE_ACTION
     personal = any(marker in lowered for marker in _PERSONAL_MARKERS)
@@ -433,6 +476,7 @@ _REGULATED_DOMAIN_FOUNDATION_WORDS = (
     "税法",
     "保险",
     "药品",
+    "药物",
     "抗生素",
     "疫苗",
     "抵押权",
@@ -1063,6 +1107,12 @@ def _conservative_uncertain_floor(question: str) -> SearchTier | None:
     """When the classifier fails, requests that touch high-consequence or
     current-state domains must not be silently under-routed to light."""
     lowered = question.casefold()
+    if _is_stable_or_nonpersonal_safety_text(question):
+        if any(marker in question for marker in _REGULATED_DOMAIN_FOUNDATION_WORDS):
+            return SearchTier.STANDARD
+        if _detect_external_explanation_or_comparison(question, True) is not None:
+            return SearchTier.STANDARD
+        return None
     if _has_actionable_high_consequence_signal(question):
         return SearchTier.DEEP
     if any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS):

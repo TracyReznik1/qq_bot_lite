@@ -121,6 +121,21 @@ class PlanningStatus(StrEnum):
     DEGRADED = "degraded"
 
 
+class RedactionCode(StrEnum):
+    CQ_CONTROL_CODE = "cq_control_code"
+    DATA_URL = "data_url"
+    CALLBACK_SECRET = "callback_secret"
+    ONE_TIME_CODE = "one_time_code"
+    PASSWORD = "password"
+    BANK_ACCOUNT = "bank_account"
+    CARD_CVV = "card_cvv"
+    HARD_SECRET = "hard_secret"
+    PHONE_NUMBER = "phone_number"
+    EMAIL_ADDRESS = "email_address"
+    EMPTY_AFTER_REDACTION = "empty_after_redaction"
+    INVALID_REDACTION_CODE = "invalid_redaction_code"
+
+
 class ProviderStatus(StrEnum):
     SUCCESS = "success"
     EMPTY = "empty"
@@ -225,6 +240,22 @@ def _strings(values: Any, field_name: str) -> tuple[str, ...]:
     if any(type(value) is not str for value in result):
         raise TypeError(f"{field_name} must contain strings")
     return result
+
+
+def _redaction_codes(values: Any, field_name: str) -> tuple[RedactionCode, ...]:
+    if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, (tuple, list, set, frozenset)):
+        raise TypeError(f"{field_name} must be a collection of RedactionCode values")
+    try:
+        return tuple(RedactionCode(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must contain only recognized redaction codes") from exc
+
+
+def _safe_redaction_codes(values: Any) -> tuple[RedactionCode, ...]:
+    try:
+        return _redaction_codes(values, "redaction codes")
+    except (TypeError, ValueError):
+        return (RedactionCode.INVALID_REDACTION_CODE,)
 
 
 def _records(values: Any, record_type: type[Any], field_name: str) -> tuple[Any, ...]:
@@ -395,7 +426,7 @@ class SearchPlan:
     initial_queries: tuple[SearchQuery, ...]
     required_topics: tuple[str, ...]
     required_source_relations: frozenset[SourceRelation]
-    query_redaction_codes: tuple[str, ...]
+    query_redaction_codes: tuple[RedactionCode, ...]
     budget: TierBudget
 
     def __post_init__(self) -> None:
@@ -404,7 +435,7 @@ class SearchPlan:
         time_window = None if self.time_window is None else _tuple(self.time_window)
         if time_window is not None and (len(time_window) != 2 or any(item is not None and not isinstance(item, date) for item in time_window)):
             raise ValueError("time_window must be a two-element date tuple")
-        _normalize_fields(self, entities=_strings(self.entities, "entities"), time_window=time_window, initial_queries=_records(self.initial_queries, SearchQuery, "initial_queries"), required_topics=_strings(self.required_topics, "required_topics"), required_source_relations=_enum_set(self.required_source_relations, SourceRelation, "required_source_relations"), query_redaction_codes=_strings(self.query_redaction_codes, "query_redaction_codes"))
+        _normalize_fields(self, entities=_strings(self.entities, "entities"), time_window=time_window, initial_queries=_records(self.initial_queries, SearchQuery, "initial_queries"), required_topics=_strings(self.required_topics, "required_topics"), required_source_relations=_enum_set(self.required_source_relations, SourceRelation, "required_source_relations"), query_redaction_codes=_redaction_codes(self.query_redaction_codes, "query_redaction_codes"))
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
 
@@ -414,13 +445,13 @@ class RepairPlan:
     triggered: bool
     gap_codes: tuple[str, ...]
     repair_query: SearchQuery | None
-    query_redaction_codes: tuple[str, ...] = ()
+    query_redaction_codes: tuple[RedactionCode, ...] = ()
 
     def __post_init__(self) -> None:
         _normalize_fields(
             self,
             gap_codes=_strings(self.gap_codes, "gap_codes"),
-            query_redaction_codes=_strings(self.query_redaction_codes, "query_redaction_codes"),
+            query_redaction_codes=_redaction_codes(self.query_redaction_codes, "query_redaction_codes"),
         )
         if self.triggered != (self.repair_query is not None):
             raise ValueError("repair_query must be present exactly when repair is triggered")
@@ -687,8 +718,6 @@ class SearchTrace:
     initial_round_started: bool = False
     adaptive_repair_round_started: bool = False
     adaptive_repair_query: SearchQuery | tuple[str, QueryPurpose] | None = None
-    initial_query_redaction_codes: tuple[str, ...] = ()
-    adaptive_repair_redaction_codes: tuple[str, ...] = ()
     retrieval_round_count: int = 0
     executed_queries: tuple[SearchQuery | tuple[str, QueryPurpose], ...] = ()
     provider_configured: bool = False
@@ -721,16 +750,18 @@ class SearchTrace:
     retrieval_pipeline_latency_ms: int | float = 0
     total_response_latency_ms: int | float = 0
     content_read_count: int = 0
+    initial_query_redaction_codes: tuple[RedactionCode, ...] = ()
+    adaptive_repair_redaction_codes: tuple[RedactionCode, ...] = ()
 
     def __post_init__(self) -> None:
         self.trigger_codes = _tuple(self.trigger_codes)
         self.executed_queries = _tuple(self.executed_queries)
         self.provider_attempts = _tuple(self.provider_attempts)
         self.provider_failures = _tuple(self.provider_failures)
-        self.initial_query_redaction_codes = _strings(
+        self.initial_query_redaction_codes = _redaction_codes(
             self.initial_query_redaction_codes, "initial_query_redaction_codes"
         )
-        self.adaptive_repair_redaction_codes = _strings(
+        self.adaptive_repair_redaction_codes = _redaction_codes(
             self.adaptive_repair_redaction_codes, "adaptive_repair_redaction_codes"
         )
         for attempt in self.provider_attempts:
@@ -753,8 +784,8 @@ class SearchTrace:
             "initial_round_started": self.initial_round_started,
             "adaptive_repair_round_started": self.adaptive_repair_round_started,
             "adaptive_repair_query": _query_metadata(self.adaptive_repair_query),
-            "initial_query_redaction_codes": self.initial_query_redaction_codes,
-            "adaptive_repair_redaction_codes": self.adaptive_repair_redaction_codes,
+            "initial_query_redaction_codes": _safe_redaction_codes(self.initial_query_redaction_codes),
+            "adaptive_repair_redaction_codes": _safe_redaction_codes(self.adaptive_repair_redaction_codes),
             "retrieval_round_count": self.retrieval_round_count,
             "executed_queries": [_query_metadata(query) for query in self.executed_queries],
             "provider_configured": self.provider_configured,

@@ -442,6 +442,63 @@ class PlannerDegradationTests(unittest.TestCase):
         self.assertEqual(time_bounded[0].date_from, date(2026, 7, 29))
         self.assertEqual(time_bounded[0].date_to, date(2026, 7, 29))
 
+    def test_deep_high_freshness_validates_final_slots_for_genuine_time_bounds(self):
+        def model_queries(time_query):
+            return [
+                {"purpose": "primary", "text": f"北京新闻来源 {index}"}
+                for index in range(4)
+            ] + [time_query]
+
+        cases = {
+            "fifth_slot": {
+                "purpose": "time_bounded",
+                "text": "北京 2026-07-29 新闻",
+                "date_from": "2026-07-29",
+                "date_to": "2026-07-29",
+            },
+            "unbounded": {
+                "purpose": "time_bounded",
+                "text": "北京新闻",
+            },
+            "partial": {
+                "purpose": "time_bounded",
+                "text": "北京 2026-07-29 新闻",
+                "date_from": "2026-07-29",
+            },
+            "reversed": {
+                "purpose": "time_bounded",
+                "text": "北京 2026-07-28 至 2026-07-29 新闻",
+                "date_from": "2026-07-29",
+                "date_to": "2026-07-28",
+            },
+        }
+        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
+            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
+            True, Freshness.HIGH, RiskLevel.LOW,
+            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
+            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
+            SearchTier.DEEP, None, (),
+        )
+        for name, time_query in cases.items():
+            with self.subTest(case=name):
+                model = StaticPlannerModel(
+                    {"planning_status": "normal", "entities": [], "initial_queries": model_queries(time_query)}
+                )
+                planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+                plan = planner.plan(request("北京今天有什么新闻"), d)
+                self.assertEqual(plan.initial_queries[0].text, "北京今天有什么新闻")
+                genuine = [
+                    query
+                    for query in plan.initial_queries
+                    if query.purpose is QueryPurpose.TIME_BOUNDED
+                    and query.date_from is not None
+                    and query.date_to is not None
+                    and query.date_from <= query.date_to
+                    and query.date_from.isoformat() in query.text
+                    and query.date_to.isoformat() in query.text
+                ]
+                self.assertEqual(len(genuine), 1)
+
 
 class PlannerQueryCapTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -379,6 +379,51 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertNotIn("raw query text", payload)
         json.dumps(logged)
 
+    def test_redaction_codes_are_closed_and_hostile_trace_mutation_stays_body_free(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        query = fixtures.query()
+        for build in (
+            lambda: replace(fixtures.plan(), query_redaction_codes=("sk-1234567890abcdef",)),
+            lambda: m.RepairPlan(True, (), query, ("13800138000",)),
+            lambda: m.SearchTrace(
+                "req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT,
+                initial_query_redaction_codes=("https://private.invalid",),
+            ),
+            lambda: m.SearchTrace(
+                "req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT,
+                adaptive_repair_redaction_codes=("13800138000",),
+            ),
+        ):
+            with self.subTest(build=build):
+                with self.assertRaises(ValueError):
+                    build()
+
+        trace = m.SearchTrace(
+            "req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT,
+            initial_query_redaction_codes=("cq_control_code",),
+            adaptive_repair_redaction_codes=("data_url",),
+        )
+        trace.initial_query_redaction_codes = ("sk-1234567890abcdef",)
+        trace.adaptive_repair_redaction_codes = ("13800138000", "https://private.invalid")
+        logged = trace.to_log_dict()
+        self.assertEqual(["invalid_redaction_code"], logged["initial_query_redaction_codes"])
+        self.assertEqual(["invalid_redaction_code"], logged["adaptive_repair_redaction_codes"])
+        payload = json.dumps(logged)
+        for secret in ("sk-1234567890abcdef", "13800138000", "https://private.invalid"):
+            self.assertNotIn(secret, payload)
+
+    def test_trace_legacy_positional_constructor_keeps_retrieval_round_slot(self):
+        m = models()
+        trace = m.SearchTrace(
+            "req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD,
+            None, (), None, False, None, None, False, 0, False, False,
+            ("repair-1", m.QueryPurpose.REPAIR), 1,
+        )
+        self.assertEqual(1, trace.retrieval_round_count)
+        self.assertEqual((), trace.initial_query_redaction_codes)
+        self.assertEqual((), trace.adaptive_repair_redaction_codes)
+
     def test_review_contracts_have_exact_public_fields_and_exports(self):
         m = models()
         expected_fields = {

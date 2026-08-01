@@ -439,15 +439,16 @@ class SearchPlanner:
                 )
             )
 
+        redacted_queries = redacted_queries[: budget.max_initial_queries]
         needs_time_bounded_query = (
             decision.route is SearchTier.DEEP
             and decision.freshness is Freshness.HIGH
-            and not any(q.purpose is QueryPurpose.TIME_BOUNDED for q in redacted_queries)
+            and not any(_is_genuine_time_bounded_query(query) for query in redacted_queries)
         )
         if needs_time_bounded_query:
             today = self._today()
             time_bounded = SearchQuery(
-                query_id=f"initial-{budget.max_initial_queries}",
+                query_id=f"initial-{len(redacted_queries) + 1}",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.TIME_BOUNDED,
                 text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
@@ -456,13 +457,27 @@ class SearchPlanner:
             )
             if len(redacted_queries) >= budget.max_initial_queries:
                 # Preserve the original direct question (especially CJK/no-space
-                # text) and deterministically reserve the final slot for time.
-                redacted_queries = redacted_queries[: budget.max_initial_queries]
-                redacted_queries[-1] = time_bounded
+                # text) and replace the final supplemental slot with a genuine
+                # date-bounded query after final slot selection.
+                replacement_index = next(
+                    (
+                        index
+                        for index in range(len(redacted_queries) - 1, 0, -1)
+                        if redacted_queries[index].purpose is not QueryPurpose.DIRECT
+                    ),
+                    len(redacted_queries) - 1,
+                )
+                time_bounded = SearchQuery(
+                    query_id=f"initial-{replacement_index + 1}",
+                    round_kind=time_bounded.round_kind,
+                    purpose=time_bounded.purpose,
+                    text=time_bounded.text,
+                    date_from=time_bounded.date_from,
+                    date_to=time_bounded.date_to,
+                )
+                redacted_queries[replacement_index] = time_bounded
             else:
                 redacted_queries.append(time_bounded)
-        else:
-            redacted_queries = redacted_queries[: budget.max_initial_queries]
 
         status = _planning_status(payload, direct_degraded or degraded_due_to_model)
         entities = _string_list(payload.get("entities"))
@@ -723,6 +738,17 @@ def _parse_date(value: Any) -> date | None:
         except ValueError:
             return None
     return None
+
+
+def _is_genuine_time_bounded_query(query: SearchQuery) -> bool:
+    if query.purpose is not QueryPurpose.TIME_BOUNDED:
+        return False
+    if query.date_from is None or query.date_to is None or query.date_from > query.date_to:
+        return False
+    return (
+        query.date_from.isoformat() in query.text
+        and query.date_to.isoformat() in query.text
+    )
 
 
 def _string_list(value: Any) -> list[str]:

@@ -219,6 +219,35 @@ class RouterConflictAndFloorTests(unittest.TestCase):
                 decision = decide(question, {})
                 self.assertIs(decision.route, SearchTier.STANDARD)
 
+    def test_advisor_failure_structures_actionable_safety_intent_without_promoting_concepts(self):
+        positive_cases = (
+            "泰诺每次吃几片？",
+            "泰 诺 每 次 吃 几 片？",
+            "我突然半边脸麻、说话含糊，怎么办？",
+            "84消毒液溅到眼里怎么办？",
+            "发烧 39 度怎么办？",
+        )
+        for question in positive_cases:
+            with self.subTest(kind="actionable", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+        stable_concepts = (
+            "什么是药物剂量？",
+            "清洁剂为什么会刺激眼睛？",
+            "我不是在问泰诺每次吃几片，想了解药物剂量的定义。",
+        )
+        for question in stable_concepts:
+            with self.subTest(kind="concept", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+
+        quoted_or_nonpersonal = (
+            "“泰诺每次吃几片？”这句话是什么意思？",
+            "有人引用“84消毒液溅到眼里怎么办”，这句话是什么意思？",
+        )
+        for question in quoted_or_nonpersonal:
+            with self.subTest(kind="quoted", question=question):
+                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+
     def test_stable_version_definition_is_not_deep(self):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)

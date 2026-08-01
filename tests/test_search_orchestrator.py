@@ -425,6 +425,32 @@ class OrchestratorTraceTests(unittest.TestCase):
         self.assertTrue(trace.provider_invocation_started)
         self.assertIs(trace.evidence_state, EvidenceState.SUFFICIENT)
 
+    def test_request_local_redaction_audit_flows_from_plan_and_repair_to_trace(self):
+        provider = _FakeProvider(hits=[_hit()] * 3)
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("standard")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topics=()),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+        secret = "abcdef123456"
+        result = orchestrator.run(
+            request(f"[CQ:image,file=x.png] data:image/png;base64,AAAA 回调签名 {secret} 什么是光合作用")
+        )
+        self.assertTrue(result.trace.adaptive_repair_round_started)
+        self.assertEqual(result.plan.query_redaction_codes, result.trace.initial_query_redaction_codes)
+        self.assertIn("cq_control_code", result.trace.initial_query_redaction_codes)
+        self.assertIn("data_url", result.trace.initial_query_redaction_codes)
+        self.assertIn("callback_secret", result.trace.adaptive_repair_redaction_codes)
+        self.assertNotIn(secret, result.trace.initial_query_redaction_codes)
+        self.assertNotIn(secret, result.trace.adaptive_repair_redaction_codes)
+
+        unrelated = orchestrator.run(request("什么是光合作用"))
+        self.assertNotIn("callback_secret", unrelated.trace.initial_query_redaction_codes)
+        self.assertNotIn("callback_secret", unrelated.trace.adaptive_repair_redaction_codes)
+
 
 class OrchestratorSingletonTests(unittest.TestCase):
     def test_get_search_orchestrator_returns_singleton(self):
