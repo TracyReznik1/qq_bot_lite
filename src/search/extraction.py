@@ -44,6 +44,7 @@ class SearchExtractor:
         raw_content = hit.raw_content if hit.raw_content else None
         snippet = hit.snippet if hit.snippet else None
 
+        # Provider-native raw content is a usable read with no extra network.
         if raw_content:
             excerpt = _clean_excerpt(raw_content)
             safety_flags = _detect_safety_flags(raw_content)
@@ -57,19 +58,8 @@ class SearchExtractor:
                 content_reads_consumed=1,
             )
 
-        if snippet:
-            excerpt = _clean_excerpt(snippet)
-            safety_flags = _detect_safety_flags(snippet)
-            return EvidenceCandidate(
-                hit=hit,
-                document=None,
-                excerpt=excerpt,
-                excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
-                extraction_status="search_result_snippet",
-                safety_flags=safety_flags,
-                content_reads_consumed=0,
-            )
-
+        # When a network read is allowed, fetch the page so a snippet never
+        # blocks the underlying readable content (deep-tier DDGS requires it).
         if allow_network_read and hit.url:
             document = self._fetch_document(hit.url, timeout_seconds=timeout_seconds)
             if document.fetch_status == "success" and document.excerpt:
@@ -90,6 +80,19 @@ class SearchExtractor:
                     safety_flags=_detect_safety_flags(excerpt),
                     content_reads_consumed=1,
                 )
+
+        if snippet:
+            excerpt = _clean_excerpt(snippet)
+            safety_flags = _detect_safety_flags(snippet)
+            return EvidenceCandidate(
+                hit=hit,
+                document=None,
+                excerpt=excerpt,
+                excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
+                extraction_status="search_result_snippet",
+                safety_flags=safety_flags,
+                content_reads_consumed=0,
+            )
 
         return EvidenceCandidate(
             hit=hit,

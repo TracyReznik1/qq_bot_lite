@@ -147,7 +147,16 @@ def _parse_enum(value: Any, enum_type: type[Any]) -> Any:
         return None
 
 
+def _final_url_of(candidate: EvidenceCandidate) -> str:
+    """Prefer the validated final URL from a fetch; fall back to the hit URL."""
+    if candidate.document is not None and candidate.document.final_url:
+        return candidate.document.final_url
+    return candidate.hit.url
+
+
 def _canonical_url(url: str) -> str:
+    """Normalize a URL for dedup: strip fragments, keep ports and the query
+    string (fragments and default ports are the only dropped pieces)."""
     try:
         parsed = urlparse(str(url or ""))
     except ValueError:
@@ -156,8 +165,16 @@ def _canonical_url(url: str) -> str:
     host = (parsed.hostname or "").lower()
     if not scheme or not host:
         return str(url or "").strip()
+    port = ""
+    try:
+        default_port = 443 if scheme == "https" else 80
+        if parsed.port is not None and parsed.port != default_port:
+            port = f":{parsed.port}"
+    except ValueError:
+        pass
     path = parsed.path.rstrip("/")
-    return f"{scheme}://{host}{path}"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{scheme}://{host}{port}{path}{query}"
 
 
 def _domain_of(url: str) -> str | None:
@@ -168,9 +185,10 @@ def _domain_of(url: str) -> str | None:
 
 
 def _fallback_verdict(candidate: EvidenceCandidate) -> dict[str, Any]:
-    """Conservative deterministic relevance: unknown relation, no primary claim."""
+    """Conservative deterministic fallback when judging fails: relevance cannot
+    be confirmed, so the candidate is at most CONTEXTUAL and never primary."""
     return {
-        "relevance": CandidateRelevance.DIRECT,
+        "relevance": CandidateRelevance.CONTEXTUAL,
         "relation": SourceRelation.UNKNOWN,
         "supported_topics": (),
         "publisher_match": False,
@@ -210,12 +228,15 @@ class EvidenceAssembler:
             relevance = verdict.get("relevance")
             if relevance is CandidateRelevance.IRRELEVANT:
                 continue
-            canonical = _canonical_url(candidate.hit.url)
+            # Use the validated final URL when a fetch redirected; otherwise the
+            # requested URL is the best available source URL.
+            final_url = _final_url_of(candidate)
+            canonical = _canonical_url(final_url)
             if canonical in seen_canonical:
                 continue
             seen_canonical.add(canonical)
-            domain = _domain_of(candidate.hit.url)
-            independence = _independence_key(candidate.excerpt or "", candidate.hit.url)
+            domain = _domain_of(final_url)
+            independence = _independence_key(candidate.excerpt or "", final_url)
             if independence not in grouped:
                 grouped[independence] = f"g{len(grouped) + 1}"
             group_label = grouped[independence]
@@ -231,8 +252,8 @@ class EvidenceAssembler:
                 evidence_id=f"E{len(admitted) + 1}",
                 query_id=candidate.hit.query_id,
                 provider=candidate.hit.provider,
-                title=candidate.hit.title or candidate.hit.url,
-                url=candidate.hit.url,
+                title=candidate.hit.title or final_url,
+                url=final_url,
                 canonical_url=canonical,
                 domain=domain,
                 publisher=None,
@@ -276,14 +297,15 @@ class EvidenceAssembler:
             reason_codes = ("missing_topic",)
         elif bundle.conflict_groups:
             reason_codes = ("source_conflict",)
+        eligible = repairable and bundle.decision.route in {
+            SearchTier.STANDARD,
+            SearchTier.DEEP,
+        }
         return EvidenceGapAnalysis(
             missing_claim_topics=missing,
             conflict_group_ids=bundle.conflict_groups,
-            repair_eligible=repairable and bundle.decision.route in {
-                SearchTier.STANDARD,
-                SearchTier.DEEP,
-            },
-            repair_purpose=("fill missing topic" if missing else "resolve conflict") if repairable else None,
+            repair_eligible=eligible,
+            repair_purpose=("fill missing topic" if missing else "resolve conflict") if eligible else None,
             repair_reason_codes=reason_codes,
         )
 
@@ -308,9 +330,10 @@ class EvidenceAssembler:
         items: Sequence[EvidenceItem],
     ) -> EvidenceBundle:
         required = set(plan.required_topics)
+        citable_items = [item for item in items if item.citable]
         supported: set[str] = set()
         strong_supported: set[str] = set()
-        for item in items:
+        for item in citable_items:
             supported.update(item.supported_topics)
             if _strong_support(item, plan):
                 strong_supported.update(item.supported_topics)
@@ -319,6 +342,27 @@ class EvidenceAssembler:
         # alone cannot establish sufficiency.
         if plan.decision.route is SearchTier.DEEP:
             supported = strong_supported
+
+        # Zero citable Evidence is unconditionally insufficient: a bundle with
+        # no readable content cannot support any material claim.
+        if not citable_items:
+            missing = tuple(required) or ("material_claim",)
+            return EvidenceBundle(
+                request_id=f"req-{abs(hash(plan.original_question)) % 100000}",
+                decision=plan.decision,
+                plan=plan,
+                attempts=(),
+                initial_evidence_ids=(),
+                gap_analysis=EvidenceGapAnalysis((), (), False, None, ()),
+                repair_plan=__import__("src.search.models", fromlist=["RepairPlan"]).RepairPlan(False, (), None),
+                retrieval_round_count=1,
+                evidence_items=(),
+                evidence_state=EvidenceState.INSUFFICIENT,
+                missing_claim_topics=missing,
+                weak_source_topics=(),
+                conflict_groups=(),
+                limitations=("no_citable_evidence",),
+            )
 
         missing = tuple(topic for topic in plan.required_topics if topic not in supported)
 
@@ -448,6 +492,34 @@ def _assign_evidence_ids(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
     ) for index, item in enumerate(items, 1)]
 
 
+_VERSION_PATTERN = re.compile(r"(?i)\bv?\d+(?:\.\d+){1,3}\b")
+_DATE_PATTERN = re.compile(r"\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\b")
+_NUMBER_PATTERN = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+
+def _conflicting_values(excerpts: Sequence[str]) -> bool:
+    """True when the excerpts state materially different concrete values
+    (versions, dates, or prices), rather than merely different prose."""
+    if len(excerpts) < 2:
+        return False
+    for pattern in (_VERSION_PATTERN, _DATE_PATTERN):
+        value_sets: list[set[str]] = []
+        for excerpt in excerpts:
+            value_sets.append(set(pattern.findall(excerpt or "")))
+        nonempty = [s for s in value_sets if s]
+        if len(nonempty) >= 2 and len(set().union(*nonempty)) >= 2:
+            return True
+    # Price-style numbers: ￥/元/$ signs alongside different values.
+    price_excerpts = [e for e in excerpts if any(mark in (e or "") for mark in ("￥", "元", "$"))]
+    if len(price_excerpts) >= 2:
+        numbers: set[str] = set()
+        for excerpt in price_excerpts:
+            numbers.update(_NUMBER_PATTERN.findall(excerpt or ""))
+        if len(numbers) >= 2:
+            return True
+    return False
+
+
 def _detect_conflict_groups(items: Sequence[EvidenceItem]) -> tuple[str, ...]:
     groups: set[str] = set()
     seen: dict[str, list[EvidenceItem]] = {}
@@ -457,8 +529,8 @@ def _detect_conflict_groups(items: Sequence[EvidenceItem]) -> tuple[str, ...]:
             seen.setdefault(key, []).append(item)
     for key, members in seen.items():
         if len(members) >= 2:
-            values = {m.excerpt or "" for m in members}
-            if len(values) >= 2:
+            excerpts = [m.excerpt or "" for m in members]
+            if _conflicting_values(excerpts):
                 groups.add(f"conflict:{key}")
     return tuple(sorted(groups))
 

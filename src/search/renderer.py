@@ -38,7 +38,8 @@ _FIXED_DISCLOSURES = {
     SearchFailureCode.USER_FORBID_WEB: _NO_WEB_DYNAMIC_LIMIT,
 }
 
-_SOURCE_MARKER = re.compile(r"来源[：:]\s*https?://\S+|^来源[：:].*$", re.MULTILINE)
+_SOURCE_MARKER = re.compile(r"来源[：:]\s*https?://\S+")
+_SOURCE_HEADING = re.compile(r"^来源[：:]", re.MULTILINE)
 _URGENT_DYNAMIC_CODES = {
     SearchFailureCode.PROVIDER_UNAVAILABLE,
     SearchFailureCode.PROVIDER_TIMEOUT,
@@ -57,11 +58,18 @@ def split_qq_reply(text: str, limit: int) -> list[str]:
     parts: list[str] = []
     remaining = text
     while len(remaining) > limit:
+        # An unbreakable URL longer than the limit is emitted alone, without
+        # absorbing the remaining text into the same chunk.
+        url_match = _URL_PATTERN.match(remaining)
+        if url_match is not None and url_match.end() > limit:
+            parts.append(url_match.group(0))
+            remaining = remaining[url_match.end():].strip()
+            continue
         cut = _split_boundary(remaining, limit)
         if cut <= 0:
-            # An atomic URL or unbreakable token exceeds the limit; emit it alone.
-            parts.append(remaining)
-            return parts
+            parts.append(remaining[:limit])
+            remaining = remaining[limit:].strip()
+            continue
         parts.append(remaining[:cut].strip())
         remaining = remaining[cut:].strip()
     if remaining:
@@ -201,7 +209,6 @@ def _render_validated(
         disclosures.append(_SEMANTIC_UNAVAILABLE)
 
     for block in validation.retained_blocks:
-        citations = [numbered[eid] for eid in block.claim_ids if False]
         # Collect evidence ids referenced by this block's claims.
         used_here: list[int] = []
         for claim in validation.retained_claims:
@@ -212,7 +219,7 @@ def _render_validated(
         citations = used_here
         text = _strip_markers(block.text)
         if citations:
-            text = f"{text}[{''.join(f'[{n}]' for n in citations)}]"
+            text = f"{text}[{''.join(str(n) for n in citations)}]"
         body_parts.append(text)
 
     if result.evidence is not None and result.evidence.evidence_state is EvidenceState.CONFLICTING:
@@ -221,6 +228,13 @@ def _render_validated(
     source_lines: list[str] = []
     shown_urls: list[str] = []
     seen_urls: set[str] = set()
+    # In a conflict, every recorded member must be shown even if the draft
+    # omitted it; never select a winner.
+    if result.evidence is not None and result.evidence.evidence_state is EvidenceState.CONFLICTING:
+        for evidence_id in evidence_by_id:
+            if evidence_id not in used_order:
+                used_order.append(evidence_id)
+                numbered[evidence_id] = len(used_order)
     for evidence_id in used_order:
         item = evidence_by_id[evidence_id]
         if not item.url or item.url in seen_urls:
@@ -298,6 +312,11 @@ def _bounded_title(title: str, limit: int = 80) -> str:
 
 
 def _strip_markers(text: str) -> str:
-    text = _SOURCE_MARKER.sub("", str(text or ""))
+    text = str(text or "")
+    # Discard everything from a model-written source heading onward; the
+    # deterministic renderer owns the source list.
+    text = _SOURCE_HEADING.sub("\n@@SOURCE_BOUNDARY@@", text)
+    text = text.split("@@SOURCE_BOUNDARY@@", 1)[0]
+    text = _SOURCE_MARKER.sub("", text)
     text = re.sub(r"\[(?:SRCH|MEM|CHAT):[^\]]*\]", "", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()

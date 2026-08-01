@@ -52,7 +52,7 @@ _OTP_PATTERN = re.compile(r"(?:验证码|校验码|一次性密码|OTP|code)\s*[
 _PASSWORD_PATTERN = re.compile(r"(?:密码|口令|password)\s*[:：]?\s*([A-Za-z0-9@#$%^&*_+-]{6,})", re.IGNORECASE)
 _BANK_ACCOUNT_PATTERN = re.compile(r"(?:银行卡号|卡号|账号|帐号)\s*[:：]?\s*(\d{8,19})", re.IGNORECASE)
 _CVV_PATTERN = re.compile(r"(?:CVV|CVC)\s*[:：]?\s*(\d{3,4})", re.IGNORECASE)
-_PHONE_PATTERN = re.compile(r"\b1[3-9]\d{9}\b")
+_PHONE_PATTERN = re.compile(r"(?<![\dA-Za-z])1[3-9]\d{9}(?![\dA-Za-z])")
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
 _EMPTY_REDACTION_SAFE_INTENT = "敏感凭据泄露后的安全处置"
@@ -342,8 +342,6 @@ class SearchPlanner:
     def __init__(self, model: Any, *, today_provider: Callable[[], date] | None = None) -> None:
         self._model = model
         self._today = today_provider if today_provider is not None else date.today
-        self._repair_query: SearchQuery | None = None
-        self._repair_planned: bool = False
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -351,10 +349,13 @@ class SearchPlanner:
         self,
         request: RetrievalRequest,
         decision: RetrievalDecision,
+        *,
+        deadline: float | None = None,
     ) -> SearchPlan:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         original = str(request.question or "")
         direct_text, redaction_codes, direct_degraded = self._prepare_direct(original)
+        required_topics = _derive_required_topics(original)
 
         if decision.route is SearchTier.LIGHT:
             query = SearchQuery(
@@ -371,13 +372,13 @@ class SearchPlanner:
                 entities=(),
                 time_window=None,
                 initial_queries=(query,),
-                required_topics=(),
+                required_topics=required_topics,
                 required_source_relations=frozenset(),
                 query_redaction_codes=redaction_codes,
                 budget=budget,
             )
 
-        payload = self._ask_model(request, decision)
+        payload = self._ask_model(request, decision, deadline=deadline)
         planned = _model_initial_queries(payload, budget)
         degraded_due_to_model = payload is None or planned is None
         required_relations = frozenset(
@@ -395,19 +396,35 @@ class SearchPlanner:
                 entities=_extract_entities(original),
                 time_window=_time_window_for_decision(original, decision, self._today()),
                 initial_queries=fallback,
-                required_topics=(),
+                required_topics=required_topics,
                 required_source_relations=required_relations,
                 query_redaction_codes=redaction_codes,
                 budget=budget,
             )
 
         redacted_queries: list[SearchQuery] = []
+        seen_fingerprints: set[str] = set()
+        # Always retain the redacted original natural-language question as the
+        # first direct query; the model may supplement, never replace it.
+        direct_index = 1
+        redacted_queries.append(
+            SearchQuery(
+                query_id=f"initial-{direct_index}",
+                round_kind=SearchRoundKind.INITIAL,
+                purpose=QueryPurpose.DIRECT,
+                text=direct_text,
+            )
+        )
+        seen_fingerprints.add(_query_fingerprint(direct_text))
         for index, query in enumerate(planned, 1):
             cleaned, codes, degraded = self._clean_query(query, original)
             redaction_codes = tuple(dict.fromkeys((*redaction_codes, *codes)))
+            if _query_fingerprint(cleaned) in seen_fingerprints:
+                continue
+            seen_fingerprints.add(_query_fingerprint(cleaned))
             redacted_queries.append(
                 SearchQuery(
-                    query_id=f"initial-{index}",
+                    query_id=f"initial-{direct_index + index}",
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=query.purpose,
                     text=cleaned,
@@ -417,6 +434,26 @@ class SearchPlanner:
                     exclude_domains=query.exclude_domains,
                 )
             )
+
+        # Enforce the required time-bounded freshness query for deep dynamic plans.
+        if (
+            decision.route is SearchTier.DEEP
+            and decision.freshness is Freshness.HIGH
+            and not any(q.purpose is QueryPurpose.TIME_BOUNDED for q in redacted_queries)
+        ):
+            today = self._today()
+            redacted_queries.append(
+                SearchQuery(
+                    query_id=f"initial-{len(redacted_queries) + 1}",
+                    round_kind=SearchRoundKind.INITIAL,
+                    purpose=QueryPurpose.TIME_BOUNDED,
+                    text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
+                    date_from=today,
+                    date_to=today,
+                )
+            )
+
+        redacted_queries = redacted_queries[: budget.max_initial_queries]
 
         status = _planning_status(payload, direct_degraded or degraded_due_to_model)
         entities = _string_list(payload.get("entities"))
@@ -428,7 +465,7 @@ class SearchPlanner:
             entities=tuple(entities),
             time_window=time_window,
             initial_queries=tuple(redacted_queries),
-            required_topics=(),
+            required_topics=required_topics,
             required_source_relations=required_relations,
             query_redaction_codes=redaction_codes,
             budget=budget,
@@ -438,8 +475,10 @@ class SearchPlanner:
         self,
         plan: SearchPlan,
         gap: EvidenceGapAnalysis,
+        *,
+        repair_already_planned: bool = False,
     ) -> RepairPlan:
-        if self._repair_planned:
+        if repair_already_planned:
             return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
         if plan.decision.route is SearchTier.LIGHT:
             return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
@@ -464,8 +503,6 @@ class SearchPlanner:
             date_from=plan.time_window[0] if plan.time_window is not None else None,
             date_to=plan.time_window[1] if plan.time_window is not None else None,
         )
-        self._repair_planned = True
-        self._repair_query = repair_query
         return RepairPlan(
             triggered=True,
             gap_codes=gap.repair_reason_codes,
@@ -476,7 +513,11 @@ class SearchPlanner:
 
     def _prepare_direct(self, original: str) -> tuple[str, tuple[str, ...], bool]:
         normalized = redact_query_text(original)
-        return _cap_query_text(normalized.text), normalized.redaction_codes, normalized.degraded
+        personal = _clean_personal_identifiers(normalized.text, original)
+        text = _cap_query_text(personal.text)
+        codes = tuple(dict.fromkeys((*normalized.redaction_codes, *personal.redaction_codes)))
+        degraded = normalized.degraded or personal.degraded
+        return text, codes, degraded
 
     def _clean_query(
         self,
@@ -496,12 +537,21 @@ class SearchPlanner:
         original_question: str,
         decision: RetrievalDecision,
     ) -> tuple[str, tuple[str, ...], bool]:
-        del original_question, decision
+        del decision
         redacted = redact_query_text(text)
-        cleaned = _cap_query_text(redacted.text)
-        return cleaned, redacted.redaction_codes, redacted.degraded
+        personal = _clean_personal_identifiers(redacted.text, original_question)
+        cleaned = _cap_query_text(personal.text)
+        codes = tuple(dict.fromkeys((*redacted.redaction_codes, *personal.redaction_codes)))
+        degraded = redacted.degraded or personal.degraded
+        return cleaned, codes, degraded
 
-    def _ask_model(self, request: RetrievalRequest, decision: RetrievalDecision) -> dict[str, Any] | None:
+    def _ask_model(
+        self,
+        request: RetrievalRequest,
+        decision: RetrievalDecision,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any] | None:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         payload = {
             "question": request.question,
@@ -711,6 +761,31 @@ def _deep_location_hint(original: str) -> str:
     if match is not None:
         return match.group(1)
     return str(original or "").strip()
+
+
+def _derive_required_topics(original: str) -> tuple[str, ...]:
+    """Derive the concrete topics a complete answer must support, so Evidence
+    assembly cannot declare SUFFICIENT with zero relevant coverage."""
+    text = str(original or "").strip()
+    topics: list[str] = []
+    cleaned = text
+    for prefix in ("什么是", "是什么", "啥是", "介绍一下", "请搜索并给出来源：", "搜索一下", "请搜索", "帮我查一下", "查一下"):
+        cleaned = cleaned.replace(prefix, "")
+    cleaned = re.sub(r"[？?。！!，,：:；;（）()]", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Keep a bounded set of concrete noun phrases / intent fragments.
+    for candidate in re.findall(r"[一-鿿A-Za-z0-9]{2,20}", cleaned):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        if candidate in topics:
+            continue
+        topics.append(candidate)
+        if len(topics) >= 3:
+            break
+    if not topics:
+        topics.append(text[:20])
+    return tuple(topics)
 
 
 def _short_original(original: str) -> str:

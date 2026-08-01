@@ -60,10 +60,10 @@ def plan(route=SearchTier.LIGHT):
     )
 
 
-def item(eid="E1", url="https://example.com/page"):
+def item(eid="E1", url="https://example.com/page", title="Title"):
     m = models()
     return m.EvidenceItem(
-        eid, "q1", "tavily", "Title", url, url, "example.com", "Example",
+        eid, "q1", "tavily", title, url, url, "example.com", "Example",
         SourceRelation.INDEPENDENT, None, None, None, "光合作用定义",
         ExcerptOrigin.PROVIDER_SNIPPET, "ok", 1.0, 1.0, True, Freshness.NONE,
         True, (), ("定义",), "g1",
@@ -169,6 +169,20 @@ class SearchFlowTests(unittest.TestCase):
         orch.run.assert_called_once()
         self.assertIn("版本是3.2", reply)
 
+    def test_evidence_payload_reaches_answer_model(self):
+        result = search_result(SearchTier.LIGHT, bundle((item("E1", "https://example.com/page"),)))
+        _reply, llm_chat, _orch = self._run(result)
+        # Capture the messages sent to the answer-generation call (call #1).
+        messages = llm_chat.call_args_list[0].args[0]
+        joined = "\n".join(
+            str(msg.get("content", ""))
+            for msg in messages
+            if isinstance(msg, dict)
+        )
+        self.assertIn("E1", joined)
+        self.assertIn("https://example.com/page", joined)
+        self.assertIn("光合作用定义", joined)
+
     def test_force_search_uses_command_source(self):
         result = search_result(SearchTier.LIGHT, bundle((item(),)))
         _, _, orch = self._run(result, force_search=True)
@@ -238,6 +252,72 @@ class HistoryAppendTests(unittest.TestCase):
             self.assertEqual("你好呀", append.call_args.args[2])
         finally:
             chat_service._search_orchestrator = old
+
+
+class PartialConflictFlowTests(unittest.TestCase):
+    """C5/I11: partial and conflicting Evidence stay grounded, not generic fallback."""
+
+    def _run_grounded(self, result):
+        old = getattr(chat_service, "_search_orchestrator", None)
+        chat_service._search_orchestrator = mock.Mock(run=lambda req: result)
+        draft_payload = json.dumps({
+            "answer_blocks": [{"block_id": "B1", "kind": "factual", "text": "版本是3.2", "claim_ids": ["C1"]}],
+            "claims": [{"claim_id": "C1", "block_id": "B1", "text": "版本是3.2", "material": True, "evidence_ids": ["E1"]}],
+            "limitations": [],
+            "conflict_summary": [],
+            "used_knowledge_fallback": False,
+        })
+
+        def _sequenced(*args, **kwargs):
+            if not hasattr(_sequenced, "count"):
+                _sequenced.count = 0
+            _sequenced.count += 1
+            if _sequenced.count == 1:
+                return ChatResponse(content=draft_payload)
+            return ChatResponse(content='{"C1": "supported"}')
+
+        try:
+            with (
+                _patch_memory(),
+                mock.patch.object(chat_service.llm, "chat", side_effect=_sequenced) as llm_chat,
+                mock.patch.object(chat_service, "append_history"),
+                mock.patch.object(chat_service, "finalize_search_trace"),
+            ):
+                reply = chat_service.generate_reply("private:1", "当前版本是什么")
+        finally:
+            chat_service._search_orchestrator = old
+        return reply
+
+    def test_partial_bundle_answers_supported_only(self):
+        m = models()
+        p = plan(SearchTier.STANDARD)
+        partial_bundle = m.EvidenceBundle(
+            "req-1", p.decision, p, (), ("E1",),
+            m.EvidenceGapAnalysis(("历史",), (), False, None, ()),
+            m.RepairPlan(False, (), None), 1, (item("E1", "https://a.example.com"),),
+            m.EvidenceState.PARTIAL, ("历史",), (), (), (),
+        )
+        result = search_result(SearchTier.STANDARD, partial_bundle, failure=m.SearchFailureCode.PARTIAL_EVIDENCE)
+        reply = self._run_grounded(result)
+        self.assertIn("版本是3.2", reply)
+        self.assertIn("以下只回答已获得证据支持的部分", reply)
+        self.assertIn("https://a.example.com", reply)
+
+    def test_conflict_bundle_shows_sources(self):
+        m = models()
+        p = plan(SearchTier.STANDARD)
+        conflict_bundle = m.EvidenceBundle(
+            "req-1", p.decision, p, (), ("E1", "E2"),
+            m.EvidenceGapAnalysis((), (), False, None, ()),
+            m.RepairPlan(False, (), None), 1,
+            (item("E1", "https://a.example.com", title="Source A"), item("E2", "https://b.example.com", title="Source B")),
+            m.EvidenceState.CONFLICTING, (), (), ("conflict:版本",), (),
+        )
+        result = search_result(SearchTier.STANDARD, conflict_bundle, failure=m.SearchFailureCode.SOURCE_CONFLICT)
+        reply = self._run_grounded(result)
+        self.assertIn("来源之间存在未解决差异", reply)
+        self.assertIn("https://a.example.com", reply)
+        self.assertIn("https://b.example.com", reply)
 
 
 if __name__ == "__main__":

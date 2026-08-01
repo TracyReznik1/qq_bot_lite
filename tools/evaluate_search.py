@@ -184,28 +184,51 @@ def offline() -> int:
     confusion: dict[tuple[str, str], int] = {}
     correct = 0
     total = 0
+    explicit_total = 0
+    explicit_routed = 0
+    meaningless_total = 0
+    meaningless_searched = 0
     for case in cases:
         pred = route_preds.get(case["case_id"])
+        expected = str(case.get("minimum_tier") or "skip")
+        predicted = str(pred.get("predicted_tier") or "skip") if pred is not None else None
         if pred is None:
             continue
-        expected = str(case.get("minimum_tier") or "skip")
-        predicted = str(pred.get("predicted_tier") or "skip")
         confusion[(predicted, expected)] = confusion.get((predicted, expected), 0) + 1
         total += 1
         if predicted == expected:
             correct += 1
+        if case.get("category") == "explicit_search":
+            explicit_total += 1
+            if predicted != "skip":
+                explicit_routed += 1
+        if case.get("category") == "no_benefit":
+            meaningless_total += 1
+            if predicted != "skip":
+                meaningless_searched += 1
 
     tier = tier_metrics(confusion)
+    explicit_rate = explicit_routed / explicit_total if explicit_total else 0.0
+    meaningless_rate = meaningless_searched / meaningless_total if meaningless_total else 0.0
     print(f"offline: cases_with_router_prediction={total}")
     print(f"offline: tier_macro_f1={tier['macro_f1']:.4f}")
     for label in TIERS:
         print(f"offline: tier_{label}_f1={tier[f'{label}_f1']:.4f}")
+    print(f"offline: explicit_search_route_rate={explicit_rate:.4f} ({explicit_routed}/{explicit_total})")
+    print(f"offline: legal_non_factual_meaningless_search_rate={meaningless_rate:.4f} ({meaningless_searched}/{meaningless_total})")
+    print(f"offline: route_accuracy={correct / total:.4f} ({correct}/{total})" if total else "offline: route_accuracy=n/a")
 
     failures = 0
     if total > 0:
         if tier["macro_f1"] < 0.90:
             failures += 1
             print("offline: FAIL tier_macro_f1 < 0.90")
+        if explicit_total and explicit_rate < 1.00:
+            failures += 1
+            print("offline: FAIL explicit_search_route_rate < 1.00")
+        if meaningless_total and meaningless_rate > 0.10:
+            failures += 1
+            print("offline: FAIL meaningless_search_rate > 0.10")
     print(f"offline: failures={failures}")
     return 1 if failures else 0
 

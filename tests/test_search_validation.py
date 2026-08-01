@@ -226,6 +226,52 @@ class _Discoverer:
         return self.spans
 
 
+class ClaimDiscoveryTests(unittest.TestCase):
+    def test_hidden_fact_in_non_factual_block_is_removed(self):
+        module = validation_module()
+        d = GroundedDraft(
+            (models().AnswerBlock("B1", "non_factual", "今天天气很好，顺带说一下版本是9.9", ()),),
+            (), (), (), False,
+        )
+        b = bundle((item(),), state=EvidenceState.SUFFICIENT)
+        report = module.validate_and_filter(
+            d, b, decision(),
+            claim_discoverer=_Discoverer(["版本是9.9"]),
+            semantic_verifier=StaticSemanticVerifier({"supported"}),
+        )
+        self.assertIn("B1", report.removed_block_ids)
+
+    def test_factual_block_without_claims_is_rejected(self):
+        module = validation_module()
+        d = GroundedDraft(
+            (models().AnswerBlock("B1", "factual", "版本是9.9", ()),),
+            (), (), (), False,
+        )
+        b = bundle((item(),), state=EvidenceState.SUFFICIENT)
+        report = module.validate_and_filter(
+            d, b, decision(),
+            claim_discoverer=_Discoverer([]),
+            semantic_verifier=StaticSemanticVerifier({"supported"}),
+        )
+        self.assertIn("B1", report.removed_block_ids)
+
+    def test_material_claim_requires_evidence(self):
+        module = validation_module()
+        d = GroundedDraft(
+            (models().AnswerBlock("B1", "factual", "版本是9.9", ("C1",)),),
+            (models().Claim("C1", "B1", "版本是9.9", True, ()),),
+            (), (), False,
+        )
+        b = bundle((item(),), state=EvidenceState.SUFFICIENT)
+        report = module.validate_and_filter(
+            d, b, decision(),
+            claim_discoverer=_Discoverer([]),
+            semantic_verifier=StaticSemanticVerifier({"supported"}),
+        )
+        self.assertIn("B1", report.removed_block_ids)
+
+
+
 class ModelMemoryTests(unittest.TestCase):
     def test_model_memory_disagreement_is_unsupported_not_conflict(self):
         module = validation_module()

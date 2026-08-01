@@ -419,10 +419,11 @@ def _safe_close(response) -> None:
 
 
 def _read_limited_document(response) -> tuple[bool, str, str, bytes]:
-    content = getattr(response, "content", None)
-    raw_bytes: bytes = b""
+    """Read a bounded body. For streamed responses, consume ``iter_content``
+    into a bounded buffer and never touch ``response.content`` (which would
+    drain the full body into memory first)."""
     iter_content = getattr(response, "iter_content", None)
-    if content is None and callable(iter_content):
+    if callable(iter_content):
         chunks = bytearray()
         for chunk in iter_content(chunk_size=8192):
             if not chunk:
@@ -433,13 +434,13 @@ def _read_limited_document(response) -> tuple[bool, str, str, bytes]:
             if len(chunks) > MAX_URL_BYTES:
                 return False, "too_large", "", b""
         raw_bytes = bytes(chunks)
-
-    if content is not None:
+    else:
+        content = getattr(response, "content", None)
         if isinstance(content, str):
             content = content.encode(getattr(response, "encoding", None) or "utf-8", errors="replace")
-        if len(content) > MAX_URL_BYTES:
+        if content is not None and len(content) > MAX_URL_BYTES:
             return False, "too_large", "", b""
-        raw_bytes = content
+        raw_bytes = content if content is not None else b""
 
     if not raw_bytes:
         response_text = getattr(response, "text", None)

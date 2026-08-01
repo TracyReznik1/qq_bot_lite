@@ -280,6 +280,37 @@ class QQSplitTests(unittest.TestCase):
         chunks = self.module.split_qq_reply(url, 100)
         self.assertIn(url, chunks)
 
+    def test_oversize_url_does_not_absorb_trailing_text(self):
+        url = "https://example.com/" + "y" * 300
+        chunks = self.module.split_qq_reply(url + " TAIL", 50)
+        self.assertTrue(any(url in chunk for chunk in chunks))
+        self.assertFalse(any("TAIL" in chunk for chunk in chunks if url in chunk))
+
+    def test_citation_numbers_single_bracket(self):
+        b = bundle((item("E1", "https://a.example.com"), item("E2", "https://b.example.com")), state=EvidenceState.SUFFICIENT)
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1", "E2")),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=1700)
+        self.assertIn("[12]", rendered.text)
+        self.assertNotIn("[[", rendered.text)
+
+    def test_model_source_section_discarded_from_heading_onward(self):
+        b = bundle((item("E1", "https://a.example.com"),), state=EvidenceState.SUFFICIENT)
+        block_text = "版本是3.2\n来源：\n[1] 假来源\nhttps://fake.example.com"
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", block_text, ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=1700)
+        self.assertNotIn("假来源", rendered.text)
+        self.assertNotIn("fake.example.com", rendered.text)
+
     def test_cjk_punctuation_boundaries(self):
         text = "第一句。第二句。第三句。"
         chunks = self.module.split_qq_reply(text, 8)

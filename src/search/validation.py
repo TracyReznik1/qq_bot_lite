@@ -197,6 +197,13 @@ def _apply_structural_checks(
         block_ok = True
         block_failures: list[str] = []
 
+        # A factual block must have at least one mapped claim; otherwise the
+        # block carries an unguarded factual assertion.
+        if block.kind == "factual" and not block.claim_ids:
+            report.removed_block_ids.append(block.block_id)
+            report.limitations.append(f"removed:{block.block_id}:uncited_fact")
+            continue
+
         for claim_id in block.claim_ids:
             claim = claims_by_id.get(claim_id)
             if claim is None:
@@ -208,10 +215,15 @@ def _apply_structural_checks(
                 block_ok = False
                 block_failures.append("missing_topic")
                 continue
-            if block.kind == "factual":
-                if not claim.material and not claim.evidence_ids:
+            if block.kind in {"factual", "inference"}:
+                # Material factual claims and inference premises require Evidence.
+                if block.kind == "factual" and not claim.evidence_ids:
                     block_ok = False
                     block_failures.append("uncited_fact")
+                    continue
+                if block.kind == "inference" and not _has_inferential_wording(claim.text):
+                    block_ok = False
+                    block_failures.append("inference_mapping")
                     continue
                 for evidence_id in claim.evidence_ids:
                     if not _evidence_exists(evidence_id, bundle):
@@ -222,15 +234,6 @@ def _apply_structural_checks(
                         block_ok = False
                         block_failures.append("invalid_url")
                         break
-            elif block.kind == "inference":
-                if not claim.evidence_ids or not _has_inferential_wording(claim.text):
-                    block_ok = False
-                    block_failures.append("inference_mapping")
-                    for evidence_id in claim.evidence_ids:
-                        if not _evidence_exists(evidence_id, bundle):
-                            block_ok = False
-                            block_failures.append("missing_evidence")
-                            break
 
         # strip numeric citations deterministically
         if block_ok:
@@ -272,23 +275,9 @@ def _semantic_verify(
     claims = list(report.kept_claims)
     if not claims:
         return
-    try:
-        verdict = verifier.verify(
-            {"draft": _draft_to_dict(draft), "evidence": _evidence_to_dict(bundle)},
-        )
-    except Exception:
-        report.limitations.append("semantic_verification_unavailable")
-        for claim in claims:
-            report.labels[claim.claim_id] = SupportLabel.UNSUPPORTED
-        report.removed_block_ids.extend(
-            block.block_id for block in report.kept_blocks if block.claim_ids
-        )
-        report.kept_blocks = [
-            block for block in report.kept_blocks
-            if block.kind == "non_factual" and not block.claim_ids
-        ]
-        report.kept_claims = []
-        return
+    verdict = verifier.verify(
+        {"draft": _draft_to_dict(draft), "evidence": _evidence_to_dict(bundle)},
+    )
 
     if not isinstance(verdict, dict):
         verdict = {}
@@ -362,6 +351,10 @@ def _evidence_to_dict(bundle: EvidenceBundle) -> dict[str, Any]:
     }
 
 
+class SemanticVerificationUnavailable(RuntimeError):
+    """Raised when the semantic verifier cannot run (e.g. provider failure)."""
+
+
 def validate_and_filter(
     draft: GroundedDraft,
     bundle: EvidenceBundle,
@@ -370,10 +363,23 @@ def validate_and_filter(
     claim_discoverer: Any,
     semantic_verifier: Any,
 ) -> ValidationReport:
-    del claim_discoverer, decision
     report = _StructuralReport()
     _apply_structural_checks(draft, bundle, report)
-    _semantic_verify(draft, bundle, semantic_verifier, report)
+
+    # Run claim discovery over the entire draft. Any material external-fact
+    # span that was not already mapped to a Claim marks its block uncovered.
+    discovered = _discover_factual_spans(claim_discoverer, draft, bundle)
+    _apply_discovered_spans(draft, bundle, report, discovered)
+
+    verifier_unavailable = False
+    try:
+        _semantic_verify(draft, bundle, semantic_verifier, report)
+    except SemanticVerificationUnavailable:
+        verifier_unavailable = True
+        _apply_verifier_unavailable(draft, bundle, decision, report)
+    except Exception:
+        verifier_unavailable = True
+        _apply_verifier_unavailable(draft, bundle, decision, report)
 
     # non_factual blocks may omit claims only when discovery finds no factual span
     for block in draft.answer_blocks:
@@ -381,14 +387,84 @@ def validate_and_filter(
             if not block.claim_ids and block.text.strip():
                 report.kept_blocks.append(block)
 
+    limitations = list(report.limitations)
+    if verifier_unavailable:
+        limitations.append("semantic_verification_unavailable")
+
     return ValidationReport(
         draft=draft,
         retained_blocks=tuple(_dedupe_blocks(report.kept_blocks)),
         retained_claims=tuple(_dedupe_claims(report.kept_claims)),
         removed_block_ids=tuple(_dedupe(report.removed_block_ids)),
         claim_labels=dict(report.labels),
-        limitations=tuple(report.limitations),
+        limitations=tuple(limitations),
     )
+
+
+def _discover_factual_spans(claim_discoverer: Any, draft: GroundedDraft, bundle: EvidenceBundle) -> tuple[str, ...]:
+    """Return the block_ids that contain material external-fact spans the draft
+    failed to map to a Claim. The discoverer's output is advisory: it only flags
+    uncovered spans; it never invents claims or Evidence IDs."""
+    try:
+        spans = claim_discoverer.discover(draft, bundle)
+    except Exception:
+        return ()
+    if not isinstance(spans, (list, tuple)):
+        return ()
+    covered: set[str] = set()
+    for claim in draft.claims:
+        covered.add(claim.block_id)
+    flagged: list[str] = []
+    for span in spans:
+        if not isinstance(span, str) or not span.strip():
+            continue
+        # A discovered factual span must live in a block that has no mapped claim.
+        for block in draft.answer_blocks:
+            if block.block_id in covered:
+                continue
+            if block.kind == "non_factual" and span in (block.text or ""):
+                flagged.append(block.block_id)
+    return tuple(dict.fromkeys(flagged))
+
+
+def _apply_discovered_spans(
+    draft: GroundedDraft,
+    bundle: EvidenceBundle,
+    report: _StructuralReport,
+    discovered: Sequence[str],
+) -> None:
+    del bundle
+    if not discovered:
+        return
+    for block in draft.answer_blocks:
+        if block.block_id in discovered and block.block_id not in report.removed_block_ids:
+            report.removed_block_ids.append(block.block_id)
+            report.limitations.append(f"removed:{block.block_id}:hidden_fact")
+
+
+def _apply_verifier_unavailable(
+    draft: GroundedDraft,
+    bundle: EvidenceBundle,
+    decision: Any,
+    report: _StructuralReport,
+) -> None:
+    del draft, bundle
+    route = getattr(decision, "route", None)
+    # Deep dynamic/high-consequence output becomes non-definitive: remove every
+    # factual/inference block. Lower tiers keep structurally mapped blocks but the
+    # report carries a fixed "semantic verification unavailable" disclosure.
+    if route is SearchTier.DEEP:
+        for block in list(report.kept_blocks):
+            if block.kind in {"factual", "inference"}:
+                report.removed_block_ids.append(block.block_id)
+                report.kept_blocks.remove(block)
+        report.kept_claims = [
+            claim for claim in report.kept_claims if claim.block_id not in report.removed_block_ids
+        ]
+    else:
+        for block in report.kept_blocks:
+            for claim_id in block.claim_ids:
+                report.labels[claim_id] = SupportLabel.UNMAPPED
 
 
 def _dedupe(items: Sequence[str]) -> list[str]:

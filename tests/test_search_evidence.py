@@ -304,6 +304,32 @@ class EvidenceGapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = evidence_module()
 
+    def test_zero_citable_evidence_is_unconditionally_insufficient(self):
+        judge = StaticEvidenceJudge(
+            {"C1": {
+                "candidate_id": "C1",
+                "relevance": "direct",
+                "source_relation": "independent",
+                "publisher_entity_match": False,
+                "ownership_basis": None,
+                "supported_topics": ["定义"],
+                "conflict_key": None,
+            }}
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        p = plan(required_topics=("定义",), route=SearchTier.DEEP)
+        # A candidate whose excerpt is empty cannot be citable.
+        from src.search.models import EvidenceCandidate, ExcerptOrigin
+        empty = EvidenceCandidate(
+            candidate(hit=None) if False else __import__("src.search.models", fromlist=["ProviderHit"]).ProviderHit(
+                "tavily", "q1", "t", "https://example.com/x", None, None, None, None, (),
+            ),
+            None, None, None, "no_content", (), 0,
+        )
+        bundle = assembler.assemble(p, (empty,))
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertTrue(bundle.limitations)
+
     def test_gap_analysis_reports_missing_topics_and_repair_eligibility(self):
         judge = StaticEvidenceJudge({"C1": judge_ok("C1", supported=("定义",))})
         assembler = self.module.EvidenceAssembler(judge)

@@ -214,16 +214,16 @@ def _build_messages(
 ) -> list[dict[str, Any]]:
     _ensure_history_loaded(mem_ctx.session_key)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_untrusted_context(
-            mem_ctx,
-            query=text,
-            evidence_payload=evidence_payload,
-            include_memories=include_memories,
-        )},
-    ]
-    # Rebuild the untrusted context as a user message for the model.
-    messages = [
         {"role": "system", "content": _system_prompt_for(mem_ctx, evidence_payload)},
+        {
+            "role": "user",
+            "content": build_untrusted_context(
+                mem_ctx,
+                query=text,
+                evidence_payload=evidence_payload,
+                include_memories=include_memories,
+            ),
+        },
     ]
     with chat_history_lock:
         messages.extend(chat_history.get(mem_ctx.session_key, []).copy())
@@ -245,21 +245,39 @@ def _grounded_generation(mem_ctx, text, images, result) -> str:
     evidence_payload = _build_evidence_payload(result)
     messages = _build_messages(mem_ctx, text, images, evidence_payload=evidence_payload, include_memories=True)
     response = llm.chat(messages, temperature=0.2)
-    from src.search.validation import parse_grounded_draft, validate_and_filter
-    from tests.search_fakes import StaticSemanticVerifier
-    draft = parse_grounded_draft(response.content)
-    from src.search.evidence import EvidenceAssembler
-    verifier = _Verifier()
-    report = validate_and_filter(
-        draft,
-        result.evidence,
-        result.decision,
-        claim_discoverer=_Discoverer(),
-        semantic_verifier=verifier,
-    )
-    from src.search.renderer import render_search_reply
+    try:
+        draft = _parse_draft(response.content)
+    except ValueError:
+        return _handle_draft_failure(mem_ctx, text, images, result, response.content)
+    report = _validate_draft(draft, result)
     rendered = render_search_reply(result, report, qq_limit=config.max_reply_chars)
+    finalize_search_trace(result, None)
+    reply = rendered.text
+    append_history(mem_ctx.session_key, history_user_text(text, len(images)), reply)
+    return reply
+
+
+def _handle_draft_failure(mem_ctx, text, images, result, raw_content: str) -> str:
+    """A malformed draft cannot produce a definite grounded answer."""
+    del raw_content
+    decision = result.decision
+    if decision.route is SearchTier.DEEP:
+        rendered = render_search_reply(result, None, qq_limit=config.max_reply_chars)
+        finalize_search_trace(result, None)
+        append_history(mem_ctx.session_key, history_user_text(text, len(images)), rendered.text)
+        return rendered.text
+    rendered = render_search_reply(
+        result, None,
+        knowledge_fallback_text="回答未能通过证据核验，已移除无法确认的内容。",
+        qq_limit=config.max_reply_chars,
+    )
+    finalize_search_trace(result, None)
+    append_history(mem_ctx.session_key, history_user_text(text, len(images)), rendered.text)
     return rendered.text
+
+
+class SemanticVerificationUnavailable(RuntimeError):
+    """Raised when the semantic verifier cannot run (e.g. provider failure)."""
 
 
 class _Verifier:
@@ -278,10 +296,12 @@ class _Verifier:
             response = llm.chat(messages, temperature=0.0)
             parsed = json.loads(response.content)
             if not isinstance(parsed, dict):
-                return {}
+                raise SemanticVerificationUnavailable("verifier returned non-object")
             return parsed
-        except Exception:
-            return {}
+        except SemanticVerificationUnavailable:
+            raise
+        except Exception as exc:
+            raise SemanticVerificationUnavailable(str(exc)) from exc
 
 
 class _Discoverer:
@@ -314,19 +334,19 @@ def generate_reply(
     if result.decision.route is SearchTier.SKIP:
         return _handle_skip(mem_ctx, text, images, result)
 
+    # Partial/conflicting bundles are still grounded: use the Evidence we have.
+    if result.evidence is not None and result.evidence.evidence_items:
+        if result.failure_code in {
+            SearchFailureCode.PARTIAL_EVIDENCE,
+            SearchFailureCode.SOURCE_CONFLICT,
+            None,
+        }:
+            return _grounded_generation(mem_ctx, text, images, result)
+
     if result.evidence is None or result.failure_code is not None:
         return _handle_failure(mem_ctx, text, images, result)
 
-    evidence_payload = _build_evidence_payload(result)
-    messages = _build_messages(mem_ctx, text, images, evidence_payload=evidence_payload, include_memories=True)
-    response = llm.chat(messages, temperature=0.2)
-    draft = _parse_draft(response.content)
-    report = _validate_draft(draft, result)
-    rendered = render_search_reply(result, report, qq_limit=config.max_reply_chars)
-    finalize_search_trace(result, history_text)
-    reply = rendered.text
-    append_history(session_key, history_user_text(text, len(images)), reply)
-    return reply
+    return _grounded_generation(mem_ctx, text, images, result)
 
 
 def _handle_skip(mem_ctx, text, images, result) -> str:
@@ -388,7 +408,6 @@ def _parse_draft(content: str):
 
 def _validate_draft(draft, result):
     from src.search.validation import validate_and_filter
-    from src.search.evidence import EvidenceAssembler
     verifier = _Verifier()
     return validate_and_filter(
         draft,

@@ -173,6 +173,40 @@ class RouterTableTests(unittest.TestCase):
         self.assertIs(decision.route, SearchTier.LIGHT)
 
 
+class RouterConflictAndFloorTests(unittest.TestCase):
+    """C2 regression: forced search + no-web conflict, mixed floors, advisor failure."""
+
+    def setUp(self) -> None:
+        self.module = router_module()
+
+    def test_force_search_plus_no_web_is_clarification_not_error(self):
+        decision = decide("不要联网", force_search=True)
+        self.assertIs(decision.route, SearchTier.SKIP)
+        self.assertIs(decision.skip_reason, SkipReason.USER_FORBID_WEB)
+        self.assertTrue(decision.requires_clarification)
+
+    def test_mixed_social_plus_news_cannot_skip(self):
+        decision = decide("今天心情不错，但北京今天有什么新闻")
+        self.assertNotEqual(decision.route, SearchTier.SKIP)
+        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.DEEP))
+
+    def test_proof_plus_current_version_cannot_skip(self):
+        decision = decide("证明一下，顺便看看最新版本是多少")
+        self.assertNotEqual(decision.route, SearchTier.SKIP)
+
+    def test_advisor_failure_with_high_consequence_domain_is_not_light(self):
+        decision = decide("这种药每天吃多少剂量", NEUTRAL)
+        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+
+    def test_stable_version_definition_is_not_deep(self):
+        decision = decide("什么是版本控制")
+        self.assertNotEqual(decision.route, SearchTier.DEEP)
+
+    def test_current_version_question_is_deep(self):
+        decision = decide("最新版本是多少")
+        self.assertIs(decision.route, SearchTier.DEEP)
+
+
 def _tier_index(tier: SearchTier) -> int:
     return {SearchTier.SKIP: 0, SearchTier.LIGHT: 1, SearchTier.STANDARD: 2, SearchTier.DEEP: 3}[tier]
 

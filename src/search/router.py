@@ -184,14 +184,31 @@ _DATED_EXTERNAL_CONTEXT = (
     "汇率",
 )
 
+# Dynamic-attribute words only force a DEEP/current-state floor when the
+# request asks about the current value/state, not for a stable definition.
+_DYNAMIC_ATTRIBUTE_WORDS = ("版本", "价格", "行情", "利率", "汇率")
+_FRESHNESS_MODIFIERS = ("最新", "当前", "现在", "目前", "最近", "今天", "实时", "今日", "当下")
+_CURRENT_RULE_WORDS = ("规则", "政策", "法规")
+
 
 def _detect_current_state(question: str) -> tuple[TriggerCode, ...]:
     lowered = question.casefold()
     codes: list[TriggerCode] = []
     for marker, code in _CURRENT_STATE_TRIGGERS:
         if marker in lowered:
+            if marker in _DYNAMIC_ATTRIBUTE_WORDS:
+                # Only current-version/price questions trigger DEEP; a stable
+                # definition such as "什么是版本控制" must not.
+                if any(mod in lowered for mod in _FRESHNESS_MODIFIERS):
+                    codes.append(code)
+                continue
+            if marker in _CURRENT_RULE_WORDS:
+                # Rules/policies need a current-state or personalized context.
+                if any(mod in lowered for mod in _FRESHNESS_MODIFIERS) or "我" in question:
+                    codes.append(code)
+                continue
             codes.append(code)
-    for dated_marker in ("今天", "昨日", "今天", "今明"):
+    for dated_marker in ("今天", "昨日", "今日", "今明"):
         if dated_marker in lowered:
             if any(context in lowered for context in _DATED_EXTERNAL_CONTEXT):
                 codes.append(TriggerCode.FRESHNESS_MARKER)
@@ -254,6 +271,26 @@ _HIGH_CONSEQUENCE_DOMAINS = (
     "遗产",
 )
 
+# Dose/usage/action directives that imply personalized high-consequence action
+# even without an explicit first-person pronoun.
+_HIGH_CONSEQUENCE_ACTION_PHRASES = (
+    "吃多少",
+    "每天吃",
+    "该吃多少",
+    "用量",
+    "服药",
+    "剂量",
+    "能不能吃",
+    "该不该",
+    "要不要",
+    "买不买",
+    "卖不卖",
+    "涨到多少",
+    "跌到多少",
+    "现在买",
+    "现在卖",
+)
+
 
 def _detect_personalized_high_consequence(question: str) -> TriggerCode | None:
     lowered = question.casefold()
@@ -290,7 +327,9 @@ def _detect_personalized_high_consequence(question: str) -> TriggerCode | None:
     )
     if first_person_consequence and consequence_intent:
         return TriggerCode.HIGH_CONSEQUENCE_ACTION
-    if domain and any(marker in lowered for marker in ("是否应该", "该不该", "要不要", "能不能")):
+    # Dose/usage action phrases are personalized high-consequence even without
+    # an explicit pronoun.
+    if domain and any(phrase in lowered for phrase in _HIGH_CONSEQUENCE_ACTION_PHRASES):
         return TriggerCode.HIGH_CONSEQUENCE_ACTION
     return None
 
@@ -359,11 +398,32 @@ def _detect_external_explanation_or_comparison(
     external_fact_required: bool,
 ) -> TriggerCode | None:
     lowered = question.casefold()
+    # Explaining/rewriting the user's own text or current-conversation content
+    # does not depend on external facts.
+    closed_context = any(
+        marker in question
+        for marker in (
+            "我刚才",
+            "刚才贴",
+            "刚才说",
+            "这段话",
+            "这段文字",
+            "这段内容",
+            "我贴的",
+            "我发的",
+            "我上面",
+            "刚才那句话",
+            "刚才那句",
+        )
+    )
+    has_transform = any(marker in lowered for marker in _TRANSFORM_MARKERS)
     is_comparison = any(marker in lowered for marker in _COMPARISON_MARKERS)
     is_explanation = any(marker in lowered for marker in _EXPLANATION_MARKERS)
     if not (is_comparison or is_explanation):
         return None
     if not external_fact_required:
+        return None
+    if closed_context or has_transform:
         return None
     return TriggerCode.EXTERNAL_FACT_EXPLANATION_OR_COMPARISON
 
@@ -783,9 +843,11 @@ class RetrievalBenefitRouter:
         explicit_codes = _explicit_trigger_codes(explicit_search, explicit_verification, explicit_source)
         has_force_search = explicit_any or bool(request.force_search)
 
-        # Explicit no-web is the user's hard constraint.
+        # Explicit no-web is the user's hard constraint. Any explicit search
+        # signal — including force_search from the /search command — turns this
+        # into the deterministic clarification conflict, never a forced SKIP.
         if explicit_no_web:
-            conflict = explicit_any
+            conflict = explicit_any or has_force_search
             trigger_codes = (TriggerCode.EXPLICIT_NO_WEB,)
             if conflict:
                 trigger_codes = (TriggerCode.EXPLICIT_NO_WEB, TriggerCode.EXPLICIT_SEARCH)
@@ -800,9 +862,28 @@ class RetrievalBenefitRouter:
         classification = _validated_classification(raw)
         valid_advisor = bool(raw)
 
-        # Closed-task skip is the only program authority for skipping.
+        # Compute forced / dynamic / high-consequence / mixed floors BEFORE any
+        # closed-task skip, so a mixed request can never skip retrieval.
+        floors, floor_codes = _compute_floors(
+            question,
+            classification,
+            explicit_verification=explicit_verification,
+            explicit_source=explicit_source,
+        )
+        if not valid_advisor:
+            # Classifier uncertainty must not silently under-route a request
+            # that carries high-consequence or current-state domain signals.
+            conservative = _conservative_uncertain_floor(question)
+            floors = _max_tier(floors, conservative) if conservative is not None else floors
+            floor_codes = (TriggerCode.CLASSIFIER_UNCERTAIN,)
+        floor = floors if floors is not None else SearchTier.LIGHT
+        if not floor_codes:
+            floor_codes = (TriggerCode.FACTUAL_DEFAULT,)
+
+        # A closed-task skip is only accepted when the whole request carries no
+        # search trigger and no forced floor.
         program_skip = _classify_closed_task(question)
-        if program_skip is not None and not has_force_search:
+        if program_skip is not None and not has_force_search and not floors:
             trigger_codes = _dedupe_codes((*explicit_codes, *classification.trigger_codes))
             return _skip_decision(
                 request,
@@ -810,18 +891,6 @@ class RetrievalBenefitRouter:
                 trigger_codes,
                 forced_search=False,
             )
-
-        # Program floor: default to light, raise on confirmed triggers.
-        floor, floor_codes = _compute_floor(
-            question,
-            classification,
-            explicit_verification=explicit_verification,
-            explicit_source=explicit_source,
-        )
-        if not valid_advisor:
-            floor_codes = (TriggerCode.CLASSIFIER_UNCERTAIN,)
-        if not floor_codes:
-            floor_codes = (TriggerCode.FACTUAL_DEFAULT,)
 
         recommended = classification.recommended_tier
         final_route = max_tier(floor, recommended) if recommended is not None else floor
@@ -850,47 +919,71 @@ class RetrievalBenefitRouter:
         )
 
 
-def _compute_floor(
+def _compute_floors(
     question: str,
     classification: _Classification,
     *,
     explicit_verification: bool,
     explicit_source: bool,
-) -> tuple[SearchTier, tuple[TriggerCode, ...]]:
-    floor = SearchTier.LIGHT
+) -> tuple[SearchTier | None, tuple[TriggerCode, ...]]:
+    """Return (forced_floor, reason_codes). None means no forced floor was found."""
+    floor: SearchTier | None = None
     codes: list[TriggerCode] = []
 
     current_state_codes = _detect_current_state(question)
     if current_state_codes:
-        floor = SearchTier.DEEP
+        floor = _max_tier(floor, SearchTier.DEEP)
         codes.extend(current_state_codes)
 
     high_consequence = _detect_personalized_high_consequence(question)
     if high_consequence is not None:
-        floor = SearchTier.DEEP
+        floor = _max_tier(floor, SearchTier.DEEP)
         codes.append(high_consequence)
 
     regulated = _detect_regulated_foundation(question)
-    if regulated is not None and _rank(floor) < _rank(SearchTier.STANDARD):
-        floor = SearchTier.STANDARD
+    if regulated is not None:
+        floor = _max_tier(floor, SearchTier.STANDARD)
         codes.append(regulated)
 
     external_compare = _detect_external_explanation_or_comparison(
         question,
         classification.external_fact_required,
     )
-    if external_compare is not None and _rank(floor) < _rank(SearchTier.STANDARD):
-        floor = SearchTier.STANDARD
+    if external_compare is not None:
+        floor = _max_tier(floor, SearchTier.STANDARD)
         codes.append(external_compare)
 
-    if (explicit_verification or explicit_source) and _rank(floor) < _rank(SearchTier.STANDARD):
-        floor = SearchTier.STANDARD
+    if explicit_verification or explicit_source:
+        floor = _max_tier(floor, SearchTier.STANDARD)
         if explicit_verification:
             codes.append(TriggerCode.EXPLICIT_VERIFICATION)
         if explicit_source:
             codes.append(TriggerCode.EXPLICIT_SOURCE_REQUEST)
 
+    if floor is None:
+        return None, tuple(codes)
     return floor, tuple(codes)
+
+
+def _max_tier(current: SearchTier | None, candidate: SearchTier) -> SearchTier:
+    if current is None:
+        return candidate
+    return current if _rank(current) >= _rank(candidate) else candidate
+
+
+def _conservative_uncertain_floor(question: str) -> SearchTier | None:
+    """When the classifier fails, requests that touch high-consequence or
+    current-state domains must not be silently under-routed to light."""
+    lowered = question.casefold()
+    if any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS):
+        if any(phrase in lowered for phrase in _HIGH_CONSEQUENCE_ACTION_PHRASES):
+            return SearchTier.DEEP
+        return SearchTier.STANDARD
+    if _detect_current_state(question):
+        return SearchTier.DEEP
+    if any(marker in question for marker in _REGULATED_DOMAIN_FOUNDATION_WORDS):
+        return SearchTier.STANDARD
+    return None
 
 
 def _rank(tier: SearchTier) -> int:

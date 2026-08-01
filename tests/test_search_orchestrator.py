@@ -96,8 +96,9 @@ def _make_planner():
 
 
 class _FakeJudge:
-    def __init__(self, verdicts=None):
+    def __init__(self, verdicts=None, supported_topics=("光合作用", "Rust", "Go")):
         self.verdicts = verdicts or {}
+        self.supported_topics = tuple(supported_topics)
 
     def judge(self, question, candidates):
         del question
@@ -111,7 +112,7 @@ class _FakeJudge:
                     "source_relation": "independent",
                     "publisher_entity_match": False,
                     "ownership_basis": None,
-                    "supported_topics": ["定义"],
+                    "supported_topics": list(self.supported_topics),
                     "conflict_key": None,
                 }
         return result
@@ -252,12 +253,14 @@ class OrchestratorStandardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = orchestrator_module()
 
-    def _orchestrator(self, provider_hits, judge_verdicts=None):
+    def _orchestrator(self, provider_hits, judge_verdicts=None, question="Rust 和 Go 的并发模型有什么区别"):
         provider = _FakeProvider(hits=provider_hits)
+        from src.search.planner import _derive_required_topics
+        topics = _derive_required_topics(question)
         orchestrator = self.module.SearchOrchestrator(
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(judge_verdicts or {}),
+            judge=_FakeJudge(judge_verdicts or {}, supported_topics=topics),
             providers=(provider,),
             extractor=_FakeExtractor(),
             clock=FakeClock(),

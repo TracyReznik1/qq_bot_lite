@@ -145,7 +145,9 @@ class PlannerStandardTests(unittest.TestCase):
         plan = planner.plan(request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
         first = planner.plan_repair(plan, gap(missing=("x",)))
         self.assertTrue(first.triggered)
-        second = planner.plan_repair(plan, gap(missing=("x",)))
+        # A second repair for the same request is refused via the
+        # repair_already_planned flag (no cross-request instance state).
+        second = planner.plan_repair(plan, gap(missing=("x",)), repair_already_planned=True)
         self.assertFalse(second.triggered)
         self.assertIsNone(second.repair_query)
 
@@ -154,6 +156,16 @@ class PlannerStandardTests(unittest.TestCase):
         plan = planner.plan(request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
         repair = planner.plan_repair(plan, gap(missing=(), conflict=(), eligible=False))
         self.assertFalse(repair.triggered)
+
+    def test_repair_state_does_not_leak_across_requests(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan_a = planner.plan(request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
+        first = planner.plan_repair(plan_a, gap(missing=("内存",)))
+        self.assertTrue(first.triggered)
+        # An unrelated request must be able to plan its own repair.
+        plan_b = planner.plan(request("什么是光合作用"), standard_decision())
+        second = planner.plan_repair(plan_b, gap(missing=("机制",)))
+        self.assertTrue(second.triggered)
 
 
 class PlannerDeepTests(unittest.TestCase):
@@ -250,6 +262,28 @@ class PlannerRedactionTests(unittest.TestCase):
         self.assertNotIn("安静", joined)
         self.assertIn("什么是光合作用", joined)
 
+    def test_light_direct_phone_removed_without_explicit_search(self):
+        plan = self._plan("这个号码13800138000是谁", tier=SearchTier.LIGHT)
+        joined = " ".join(q.text for q in plan.initial_queries)
+        self.assertNotIn("13800138000", joined)
+        self.assertIn("phone_number", plan.query_redaction_codes)
+
+    def test_deterministic_fallback_phone_removed(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan = planner.plan(
+            request("这个号码 13800138000 是谁"),
+            decision(SearchTier.STANDARD),
+        )
+        joined = " ".join(q.text for q in plan.initial_queries)
+        self.assertNotIn("13800138000", joined)
+
+    def test_repair_query_phone_removed(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan = planner.plan(request("什么是光合作用"), standard_decision())
+        repair = planner.plan_repair(plan, gap(missing=("13800138000 是什么号码",)))
+        if repair.triggered:
+            self.assertNotIn("13800138000", repair.repair_query.text)
+
 
 class PlannerDomainValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -262,8 +296,8 @@ class PlannerDomainValidationTests(unittest.TestCase):
                 "entities": [],
                 "initial_queries": [
                     {
-                        "purpose": "direct",
-                        "text": "什么是光合作用",
+                        "purpose": "primary",
+                        "text": "光合作用 官方 介绍",
                         "include_domains": include,
                         "exclude_domains": exclude,
                     }
@@ -275,20 +309,20 @@ class PlannerDomainValidationTests(unittest.TestCase):
 
     def test_rejects_urls_in_domain_lists(self):
         plan = self._plan_with_domains(["https://example.com"], [])
-        self.assertEqual(plan.initial_queries[0].include_domains, ())
+        self.assertEqual(plan.initial_queries[1].include_domains, ())
 
     def test_rejects_private_and_local_names(self):
         plan = self._plan_with_domains(["127.0.0.1", "localhost", "example.com"], [])
-        self.assertNotIn("127.0.0.1", plan.initial_queries[0].include_domains)
-        self.assertNotIn("localhost", plan.initial_queries[0].include_domains)
-        self.assertIn("example.com", plan.initial_queries[0].include_domains)
+        self.assertNotIn("127.0.0.1", plan.initial_queries[1].include_domains)
+        self.assertNotIn("localhost", plan.initial_queries[1].include_domains)
+        self.assertIn("example.com", plan.initial_queries[1].include_domains)
 
     def test_deduplicates_and_caps_domain_list(self):
         plan = self._plan_with_domains(
             ["a.com", "a.com", "b.com", "c.com", "d.com", "e.com", "f.com"],
             [],
         )
-        self.assertEqual(len(plan.initial_queries[0].include_domains), 5)
+        self.assertEqual(len(plan.initial_queries[1].include_domains), 5)
 
 
 class PlannerDegradationTests(unittest.TestCase):
@@ -326,6 +360,40 @@ class PlannerDegradationTests(unittest.TestCase):
         planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
         plan = planner.plan(request("什么是光合作用"), standard_decision())
         self.assertEqual(plan.planning_status, PlanningStatus.DEGRADED)
+
+    def test_model_cannot_remove_cjk_direct_query(self):
+        model = StaticPlannerModel(
+            {
+                "planning_status": "normal",
+                "entities": [],
+                "initial_queries": [{"purpose": "primary", "text": "机械关键词"}],
+            }
+        )
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+        plan = planner.plan(request("北京今天有什么新闻"), deep_decision())
+        texts = [q.text for q in plan.initial_queries]
+        self.assertIn("北京今天有什么新闻", texts)
+        self.assertIn(QueryPurpose.DIRECT, {q.purpose for q in plan.initial_queries})
+
+    def test_deep_dynamic_plan_always_has_time_bounded_query(self):
+        from src.search.models import Freshness as F
+        model = StaticPlannerModel(
+            {
+                "planning_status": "normal",
+                "entities": [],
+                "initial_queries": [{"purpose": "direct", "text": "北京今天有什么新闻"}],
+            }
+        )
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+        d = decision(SearchTier.DEEP)
+        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
+            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
+            True, F.HIGH, RiskLevel.LOW, __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
+            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
+            SearchTier.DEEP, None, (),
+        )
+        plan = planner.plan(request("北京今天有什么新闻"), d)
+        self.assertIn(QueryPurpose.TIME_BOUNDED, {q.purpose for q in plan.initial_queries})
 
 
 class PlannerQueryCapTests(unittest.TestCase):

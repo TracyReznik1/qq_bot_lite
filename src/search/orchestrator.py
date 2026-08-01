@@ -90,20 +90,22 @@ class SearchOrchestrator:
                     else None
                 ),
             )
-            self._finalize_trace(result.trace)
             return result
+
+        # One monotonic hard deadline per tier starts before planning, so
+        # planner and Evidence-judge latency count toward the retrieval budget.
+        budget = DEFAULT_TIER_BUDGETS[decision.route]
+        deadline = self._monotonic() + budget.hard_timeout_seconds
 
         trace.orchestrator_started = True
         plan_started = self._monotonic()
-        plan = self._planner.plan(request, decision)
+        plan = self._planner.plan(request, decision, deadline=deadline)
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
         trace.initial_query_count = len(plan.initial_queries)
         trace.executed_queries = _query_metadata(plan.initial_queries)
 
-        budget = DEFAULT_TIER_BUDGETS[decision.route]
-        deadline = self._monotonic() + budget.hard_timeout_seconds
         trace.provider_configured = any(
-            provider.readiness().available for provider in self._providers
+            provider.readiness().configured for provider in self._providers
         )
 
         initial_round_started = self._monotonic()
@@ -131,21 +133,21 @@ class SearchOrchestrator:
             failure = _failure_for_status(status)
             trace.degradation_reason = failure
             evidence = None if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED else _empty_bundle(plan)
-            result = SearchPipelineResult(
+            return SearchPipelineResult(
                 decision=decision,
                 plan=plan,
                 evidence=evidence,
                 trace=trace,
                 failure_code=failure,
             )
-            self._finalize_trace(trace)
-            return result
 
         content_started = self._monotonic()
-        candidates = self._extract_candidates(plan, provider_results, budget, deadline, trace)
+        candidates, candidate_url_count, reads = self._extract_candidates(
+            plan, provider_results, budget, deadline, trace,
+        )
         trace.initial_content_read_latency_ms = self._elapsed_ms(content_started)
         trace.content_read_total_latency_ms = trace.initial_content_read_latency_ms
-        trace.candidate_url_count = _candidate_url_count(provider_results)
+        trace.candidate_url_count = candidate_url_count
 
         evidence_started = self._monotonic()
         bundle = self._assembler().assemble(plan, candidates)
@@ -159,24 +161,24 @@ class SearchOrchestrator:
             for result in provider_results
         ):
             trace.degradation_reason = SearchFailureCode.CONTENT_UNREADABLE
-            result = SearchPipelineResult(
+            return SearchPipelineResult(
                 decision=decision,
                 plan=plan,
                 evidence=_empty_bundle(plan),
                 trace=trace,
                 failure_code=SearchFailureCode.CONTENT_UNREADABLE,
             )
-            self._finalize_trace(trace)
-            return result
 
         gap_started = self._monotonic()
         gap = self._assembler().analyze_gap(plan, bundle)
         trace.gap_analysis_latency_ms = self._elapsed_ms(gap_started)
 
+        repair_already_planned = False
         if _repair_allowed(plan, decision) and gap.repair_eligible:
             repair_started = self._monotonic()
-            repair = self._planner.plan_repair(plan, gap)
+            repair = self._planner.plan_repair(plan, gap, repair_already_planned=repair_already_planned)
             if repair.triggered and repair.repair_query is not None:
+                repair_already_planned = True
                 trace.adaptive_repair_round_started = True
                 trace.adaptive_repair_query = (repair.repair_query.query_id, repair.repair_query.purpose)
                 trace.retrieval_round_count = 2
@@ -187,14 +189,20 @@ class SearchOrchestrator:
                     deadline,
                     trace,
                 )
-                repair_candidates = self._extract_candidates(
+                repair_candidates, more_urls, more_reads = self._extract_candidates(
                     plan,
                     repair_result,
                     budget,
                     deadline,
                     trace,
                     round_kind=SearchRoundKind.REPAIR,
+                    existing_candidate_count=len(candidates),
+                    existing_read_count=reads,
                 )
+                candidate_url_count = min(candidate_url_count + more_urls, budget.max_candidate_urls)
+                reads = min(reads + more_reads, budget.max_content_reads)
+                trace.candidate_url_count = candidate_url_count
+                trace.content_read_count = reads
                 bundle = self._assembler().assemble(plan, (*candidates, *repair_candidates))
                 trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_started)
                 trace.evidence_state = bundle.evidence_state
@@ -206,15 +214,13 @@ class SearchOrchestrator:
         trace.retrieval_pipeline_latency_ms = self._elapsed_ms(plan_started)
 
         failure_code = _failure_for_state(bundle.evidence_state)
-        result = SearchPipelineResult(
+        return SearchPipelineResult(
             decision=decision,
             plan=plan,
             evidence=bundle,
             trace=trace,
             failure_code=failure_code,
         )
-        self._finalize_trace(trace)
-        return result
 
     # ── internal stages ─────────────────────────────────────────────
 
@@ -255,15 +261,38 @@ class SearchOrchestrator:
         mark_repair: bool = False,
     ) -> list[ProviderResult]:
         results: list[ProviderResult] = []
-        for query in queries:
-            if self._monotonic() >= deadline:
-                trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
-                break
-            remaining = max(deadline - self._monotonic(), 0.0)
-            result = self._search_one(query, decision, min(config.request_timeout, remaining), trace)
-            if mark_repair:
-                trace.executed_queries = (*trace.executed_queries, _query_metadata((query,)))
-            results.append(result)
+        with ThreadPoolExecutor(max_workers=min(len(queries), 4)) as executor:
+            futures = {}
+            for query in queries:
+                if self._monotonic() >= deadline:
+                    trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
+                    break
+                remaining = max(deadline - self._monotonic(), 0.0)
+                future = executor.submit(
+                    self._search_one,
+                    query,
+                    decision,
+                    min(config.request_timeout, remaining),
+                    trace,
+                )
+                futures[future] = query
+            for future in as_completed(futures, timeout=max(deadline - self._monotonic(), 0.01)):
+                query = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.debug("query dispatch failed for %s", query.query_id, exc_info=True)
+                    result = ProviderResult(
+                        provider="tavily",
+                        status=ProviderStatus.ERROR,
+                        hits=(),
+                        latency_ms=0,
+                    )
+                if mark_repair:
+                    trace.executed_queries = (*trace.executed_queries, _query_metadata((query,)))
+                results.append(result)
+            # Cancel any pending futures without waiting past the deadline.
+            executor.shutdown(wait=False, cancel_futures=True)
         return results
 
     def _search_one(
@@ -300,16 +329,18 @@ class SearchOrchestrator:
         trace: SearchTrace,
         *,
         round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
-    ) -> list[Any]:
-        del round_kind
+        existing_candidate_count: int = 0,
+        existing_read_count: int = 0,
+    ) -> tuple[list[Any], int, int]:
         hits: list[Any] = []
         for result in results:
             if result.status is ProviderStatus.SUCCESS:
                 hits.extend(result.hits)
-        hits = hits[: budget.max_candidate_urls]
+        candidate_url_total = min(existing_candidate_count + len(hits), budget.max_candidate_urls)
+        hits = hits[: max(budget.max_candidate_urls - existing_candidate_count, 0)]
 
         candidates: list[Any] = []
-        reads = 0
+        reads = existing_read_count
         for hit in hits:
             if self._monotonic() >= deadline:
                 break
@@ -319,7 +350,7 @@ class SearchOrchestrator:
             try:
                 candidate = self._extractor.extract(
                     hit,
-                    _query_for_hit(plan, hit),
+                    _query_for_hit(plan, hit, round_kind=round_kind),
                     allow_network_read=True,
                     timeout_seconds=min(config.request_timeout, remaining),
                 )
@@ -330,7 +361,7 @@ class SearchOrchestrator:
                 candidates.append(candidate)
                 reads += candidate.content_reads_consumed
         trace.content_read_count = reads
-        return candidates
+        return candidates, candidate_url_total, reads
 
     def _assembler(self) -> EvidenceAssembler:
         return EvidenceAssembler(self._judge)
@@ -342,21 +373,6 @@ class SearchOrchestrator:
 
     def _elapsed_ms(self, started: float) -> int:
         return int((self._monotonic() - started) * 1000)
-
-    def _finalize_trace(self, trace: SearchTrace) -> None:
-        trace.total_response_latency_ms = (
-            trace.route_latency_ms
-            + trace.query_planning_latency_ms
-            + trace.initial_provider_search_latency_ms
-            + trace.initial_content_read_latency_ms
-            + trace.initial_evidence_assembly_latency_ms
-            + trace.gap_analysis_latency_ms
-            + trace.adaptive_repair_latency_ms
-        )
-        try:
-            logger.info("search trace: %s", trace.to_log_dict())
-        except Exception:
-            logger.debug("failed to serialize search trace", exc_info=True)
 
 
 def _query_metadata(queries: Sequence[SearchQuery]) -> tuple[tuple[str, object], ...]:
@@ -372,7 +388,16 @@ def _repair_allowed(plan: SearchPlan, decision: Any) -> bool:
     return decision.route in {SearchTier.STANDARD, SearchTier.DEEP}
 
 
-def _query_for_hit(plan: SearchPlan, hit: Any) -> SearchQuery:
+def _query_for_hit(
+    plan: SearchPlan,
+    hit: Any,
+    *,
+    round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
+) -> SearchQuery:
+    if round_kind is SearchRoundKind.REPAIR:
+        if hit.query_id and hit.query_id.startswith("repair"):
+            return plan.initial_queries[0]
+        return plan.initial_queries[0]
     for query in plan.initial_queries:
         if query.query_id == hit.query_id:
             return query
@@ -413,10 +438,17 @@ def _empty_bundle(plan: SearchPlan) -> EvidenceBundle:
 
 
 def finalize_search_trace(trace: SearchTrace, *, response_finished_at: float) -> None:
-    """Idempotently fill total latency and log the body-free Trace once."""
+    """Fill the end-to-end total latency and log the body-free Trace exactly
+    once. The caller invokes it only after validation/rendering complete."""
+    if getattr(trace, "_logged", False):
+        return
     if trace.total_response_latency_ms == 0 and response_finished_at >= 0:
         trace.total_response_latency_ms = int(response_finished_at * 1000)
-    logger.info("search trace final: %s", trace.to_log_dict())
+    try:
+        logger.info("search trace final: %s", trace.to_log_dict())
+    except Exception:
+        logger.debug("failed to serialize search trace", exc_info=True)
+    trace._logged = True
 
 
 # ── lazy singleton graph ────────────────────────────────────────────────

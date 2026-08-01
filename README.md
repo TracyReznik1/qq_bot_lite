@@ -162,7 +162,7 @@ Gemini 使用原生无状态 `generateContent` REST API，DeepSeek 继续使用 
 
 | 参数 | 必需性 | 源码默认值 | 作用与配置方法 |
 |---|---|---|---|
-| `TAVILY_API_KEY` | 可选 | 空 | 配置后 Tavily 作为主搜索提供者；未配置、不可用、出错或无结果时才回退到 DDGS。未配置时事实型请求返回 `provider_not_configured`，不会静默按普通聊天处理。 |
+| `TAVILY_API_KEY` | 可选 | 空 | 配置后 Tavily 作为主搜索提供者；未配置、不可用、出错或无结果时才回退到 DDGS。若 Tavily 未配置且 DDGS 也不可用，事实型请求返回 `provider_not_configured`；已配置但依赖缺失时返回 `provider_unavailable`。两者都不会静默按普通聊天处理。 |
 | `PROXY_URL` | 可选 | 空 | HTTP(S) 代理地址，例如 `http://127.0.0.1:7890`；模型、搜索和图片下载会按实现使用它。 |
 | `SEARCH_MAX_RESULTS` | 可选 | `4` | 每个搜索查询的 provider 结果上限（至少按 1 处理）。它不能提高 tier 的候选 URL / 正文读取上限，那些上限由不可变的 tier 预算决定。 |
 | `REQUEST_TIMEOUT` | 可选 | `18.0` | 模型、OneBot、搜索、图片等 HTTP 请求的超时秒数。 |

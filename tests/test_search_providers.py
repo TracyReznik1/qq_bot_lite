@@ -313,10 +313,11 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(tavily.search.called)
 
     def test_no_usable_tavily_falls_back_to_ddgs(self):
+        # An available-but-erroring primary triggers the DDGS availability fallback.
         tavily = mock.Mock()
         tavily.name = "tavily"
-        tavily.readiness.return_value = ProviderReadiness("tavily", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE)
-        tavily.search.return_value = mock.Mock(status=ProviderStatus.UNAVAILABLE, hits=(), latency_ms=5)
+        tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
+        tavily.search.return_value = mock.Mock(status=ProviderStatus.ERROR, hits=(), latency_ms=5)
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
@@ -327,11 +328,26 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(ddgs.search.called)
         # A fallback call is a separate ProviderAttempt but one semantic query.
 
-    def test_fallback_same_query_id_is_one_semantic_query(self):
+    def test_unavailable_primary_is_skipped_without_invocation(self):
         tavily = mock.Mock()
         tavily.name = "tavily"
         tavily.readiness.return_value = ProviderReadiness("tavily", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE)
-        tavily.search.return_value = mock.Mock(status=ProviderStatus.UNAVAILABLE, hits=(), latency_ms=5)
+        tavily.search = mock.Mock(side_effect=AssertionError("must not be invoked"))
+        ddgs = mock.Mock()
+        ddgs.name = "ddgs"
+        ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
+        ddgs.search.return_value = mock.Mock(status=ProviderStatus.SUCCESS, hits=(mock.Mock(),), latency_ms=3)
+        registry = self._registry(tavily, ddgs)
+        result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
+        self.assertEqual(result.status, ProviderStatus.SUCCESS)
+        self.assertEqual(len(registry.last_attempts), 1)
+        self.assertFalse(tavily.search.called)
+
+    def test_fallback_same_query_id_is_one_semantic_query(self):
+        tavily = mock.Mock()
+        tavily.name = "tavily"
+        tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
+        tavily.search.return_value = mock.Mock(status=ProviderStatus.ERROR, hits=(), latency_ms=5)
         ddgs = mock.Mock()
         ddgs.name = "ddgs"
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)

@@ -56,11 +56,10 @@ class ProviderRegistry:
         timeout_seconds: float,
     ) -> ProviderResult:
         attempts: list[Any] = []
-        usable_hits: list[Any] = []
         primary_error: ProviderStatus | None = None
 
         primary = self._primary_provider()
-        if primary is not None:
+        if primary is not None and primary.readiness().available:
             result = self._call(primary, query, tier=tier, max_results=max_results, timeout_seconds=timeout_seconds)
             attempts.append(result)
             if result.status is ProviderStatus.SUCCESS and result.hits:
@@ -69,7 +68,7 @@ class ProviderRegistry:
             primary_error = result.status
 
         fallback = self._fallback_provider()
-        if fallback is not None:
+        if fallback is not None and fallback.readiness().available:
             result = self._call(fallback, query, tier=tier, max_results=max_results, timeout_seconds=timeout_seconds)
             attempts.append(result)
             if result.status is ProviderStatus.SUCCESS and result.hits:
@@ -77,19 +76,19 @@ class ProviderRegistry:
                 return result
 
         self.last_attempts = tuple(attempts)
-        if primary is None and fallback is None:
+        if not attempts:
+            # No adapter was actually invoked: this is a readiness failure, not
+            # an attempted invocation.
             return ProviderResult(
                 provider="tavily",
-                status=ProviderStatus.NOT_CONFIGURED,
+                status=ProviderStatus.NOT_CONFIGURED if not self.configured() else ProviderStatus.UNAVAILABLE,
                 hits=(),
                 latency_ms=0,
             )
-        if primary_error is not None and primary_error is not ProviderStatus.SUCCESS:
-            last_status = attempts[-1].status if attempts else ProviderStatus.UNAVAILABLE
-            return ProviderResult(provider="tavily", status=last_status, hits=(), latency_ms=sum(a.latency_ms for a in attempts))
+        last_status = attempts[-1].status
         return ProviderResult(
             provider="tavily",
-            status=ProviderStatus.UNAVAILABLE,
+            status=last_status,
             hits=(),
             latency_ms=sum(a.latency_ms for a in attempts),
         )
@@ -117,6 +116,16 @@ class ProviderRegistry:
                 provider=provider.name,
                 status=ProviderStatus.ERROR,
                 hits=(),
+                latency_ms=elapsed_ms,
+            )
+        # Fill real latency on successful adapter returns (adapters may leave
+        # latency at zero).
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if result.latency_ms == 0 and elapsed_ms > 0:
+            return ProviderResult(
+                provider=result.provider,
+                status=result.status,
+                hits=result.hits,
                 latency_ms=elapsed_ms,
             )
         return result
