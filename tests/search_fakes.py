@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.search.models import ProviderReadiness, ProviderStatus
+from src.services.llm_types import ChatResponse
 
 
 @dataclass
@@ -59,3 +61,25 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+@dataclass
+class StaticPlannerModel:
+    """LLM stand-in that returns a fixed planning JSON payload."""
+
+    payload: Any = None
+    calls: list[Any] = field(default_factory=list)
+    raise_error: Exception | None = None
+
+    def chat(self, messages: list[Any], **kwargs: Any) -> ChatResponse:
+        self.calls.append((messages, kwargs))
+        if self.raise_error is not None:
+            raise self.raise_error
+        if self.payload is None:
+            return ChatResponse(content="{}", tool_calls=[])
+        if isinstance(self.payload, dict):
+            return ChatResponse(
+                content=json.dumps(self.payload, ensure_ascii=False),
+                tool_calls=[],
+            )
+        return ChatResponse(content=self.payload, tool_calls=[])
