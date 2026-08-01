@@ -135,23 +135,8 @@ def strip_bot_mention(raw_msg: str, self_id: str) -> tuple[bool, str]:
 
 
 def split_reply(text: str) -> list[str]:
-    text = (text or "").strip()
-    if not text:
-        return []
-
-    limit = max(config.max_reply_chars, 200)
-    parts = []
-    while len(text) > limit:
-        cut = max(text.rfind("\n", 0, limit), text.rfind("。", 0, limit), text.rfind("，", 0, limit))
-        if cut < limit // 2:
-            parts.append(text[:limit].strip())
-            text = text[limit:].strip()
-        else:
-            parts.append(text[: cut + 1].strip())
-            text = text[cut + 1 :].strip()
-    if text:
-        parts.append(text)
-    return parts
+    from src.search.renderer import split_qq_reply
+    return split_qq_reply(text, max(config.max_reply_chars, 200))
 
 
 def send_reply(target_id: Any, text: str, is_group: bool) -> None:
