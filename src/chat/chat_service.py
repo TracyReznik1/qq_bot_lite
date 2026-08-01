@@ -45,11 +45,11 @@ def normalize_chat_response(response: ChatResponse | str) -> ChatResponse:
     return ChatResponse(content=str(response or ""))
 
 
-def run_tool(name: str, query: str) -> str:
-    """Legacy tool dispatch used only by generic provider protocol tests."""
+def _tool_result(name: str, query: str) -> str:
+    """Generic provider-protocol tool result. Ordinary chat never supplies tools."""
+    del query
     if name == "search_web":
-        from src.services.search_service import web_search
-        return web_search(query)
+        return "搜索已完成（兼容工具占位）。"
     return ""
 
 
@@ -82,7 +82,7 @@ def build_tool_messages(
                 "role": "tool",
                 "tool_call_id": str(tool_call.get("id") or f"tool_{index}"),
                 "name": str(function.get("name") or ""),
-                "content": run_tool(str(function.get("name") or ""), query),
+                "content": _tool_result(str(function.get("name") or ""), query),
             }
         )
     return messages

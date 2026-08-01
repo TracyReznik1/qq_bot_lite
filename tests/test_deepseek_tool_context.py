@@ -153,7 +153,7 @@ class DeepSeekToolContextTests(unittest.TestCase):
         response = FakeResponse({"content": "整理结果"})
         with mock.patch.object(
             chat_service,
-            "run_tool",
+            "_tool_result",
             return_value="搜索结果",
         ):
             messages = chat_service.build_tool_messages(

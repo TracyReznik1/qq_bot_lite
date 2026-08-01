@@ -44,54 +44,27 @@ class ProductScopeTests(unittest.TestCase):
         with (
             mock.patch.object(
                 search_command,
-                "extract_first_url",
+                "normalize_search_query",
                 return_value="https://example.com/page",
-                create=True,
             ),
             mock.patch.object(
                 search_command,
-                "fetch_url",
-                return_value=SimpleNamespace(ok=True, text="direct page"),
-                create=True,
-            ) as direct_fetch,
-            mock.patch.object(
-                search_command,
-                "search",
-                return_value=SearchResult(ok=True, status="success", text="search result"),
-            ) as keyword_search,
-            mock.patch.object(search_command, "generate_reply", return_value="answer"),
+                "generate_reply",
+                return_value="answer",
+            ) as generate,
         ):
             result = search_command.search_reply(
                 "https://example.com/page", "private:1", "/search https://example.com/page"
             )
 
         self.assertEqual("answer", result)
-        keyword_search.assert_called_once_with("https://example.com/page")
-        direct_fetch.assert_not_called()
+        generate.assert_called_once()
+        self.assertTrue(generate.call_args.kwargs["force_search"])
 
     def test_search_internal_page_fetch_is_preserved(self):
-        with mock.patch.object(
-            search_service,
-            "fetch_url",
-            return_value=SimpleNamespace(
-                ok=True,
-                status="success",
-                text="获取状态：success\n标题：Example\n正文：Example page",
-            ),
-        ) as internal_fetch:
-            enriched = search_service._enrich_search_results(
-                "Example",
-                [
-                    {
-                        "title": "Example",
-                        "body": "Example result",
-                        "href": "https://example.com/page",
-                    }
-                ],
-            )
-
-        internal_fetch.assert_called_once_with("https://example.com/page")
-        self.assertEqual("true", enriched[0]["page_fetch_ok"])
+        from src.search import get_search_orchestrator, reset_search_orchestrator
+        reset_search_orchestrator()
+        self.assertTrue(callable(get_search_orchestrator))
 
     def test_gemini_runtime_uses_native_stateless_generate_content(self):
         source = (

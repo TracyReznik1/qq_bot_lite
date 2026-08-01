@@ -26,12 +26,10 @@ def _ensure_context(context: MemoryContext | str) -> MemoryContext:
 def build_untrusted_context(
     context: MemoryContext | str,
     query: str = "",
-    tool_context: str = "",
     *,
     evidence_payload: str = "",
     include_memories: bool = True,
 ) -> str:
-    del tool_context
     ctx = _ensure_context(context)
     retrieved = MemoryRetriever().retrieve(ctx, query=query) if include_memories else []
     formatted_memories = format_memory_context(retrieved) if include_memories else "（本回答不使用已检索记忆）"
@@ -48,8 +46,8 @@ def build_untrusted_context(
     )
 
 
-def build_system_prompt(context: MemoryContext | str, tool_context: str = "", *, evidence_payload: str = "") -> str:
-    del tool_context, evidence_payload
+def build_system_prompt(context: MemoryContext | str, *, evidence_payload: str = "") -> str:
+    del evidence_payload
     persona = get_persona()
 
     return (
