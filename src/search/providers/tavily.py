@@ -99,7 +99,9 @@ class TavilySearchProvider(SearchProvider):
 
 def _tavily_hit(item: dict[str, Any], query_id: str) -> ProviderHit:
     published = _parse_datetime(item.get("published_date"))
-    raw_content = item.get("raw_content") or item.get("content") or None
+    raw_content = item.get("raw_content")
+    if raw_content is None or not str(raw_content).strip():
+        raw_content = None
     return ProviderHit(
         provider="tavily",
         query_id=query_id,
@@ -108,7 +110,7 @@ def _tavily_hit(item: dict[str, Any], query_id: str) -> ProviderHit:
         snippet=_optional_text(item.get("content")),
         score=_optional_float(item.get("score")),
         published_at=published,
-        raw_content=_optional_text(raw_content),
+        raw_content=raw_content,
         quality_flags=(),
     )
 

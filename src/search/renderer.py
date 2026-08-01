@@ -107,6 +107,8 @@ def render_search_reply(
         if decision.skip_reason and decision.skip_reason.value == "user_forbid_web":
             disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
         text = _strip_markers(knowledge_fallback_text)
+        if disclosures:
+            text = f"{'\n'.join(disclosures)}\n{text}".strip()
         chunks = split_qq_reply(text, qq_limit)
         return RenderedReply(
             text=text,
@@ -132,7 +134,7 @@ def render_search_reply(
         if knowledge_fallback_text:
             base = _STABLE_FALLBACK_PREFIX
             disclosures.append(_STABLE_FALLBACK_PREFIX)
-            text = _strip_markers(knowledge_fallback_text)
+            text = f"{_STABLE_FALLBACK_PREFIX}\n{_strip_markers(knowledge_fallback_text)}"
         else:
             text = base
         if explicit_add:
