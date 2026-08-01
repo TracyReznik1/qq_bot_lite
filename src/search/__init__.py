@@ -47,6 +47,10 @@ from .models import (
     AnswerBlock,
     max_tier,
 )
+from .orchestrator import (
+    get_search_orchestrator,
+    reset_search_orchestrator,
+)
 
 __all__ = [
     "Actionability", "AnswerBlock", "BenefitDimension", "CandidateRelevance", "Claim", "DEFAULT_TIER_BUDGETS",
@@ -56,5 +60,5 @@ __all__ = [
     "RequestSource", "RetrievalDecision", "RetrievalRequest", "RiskLevel", "SearchFailureCode",
     "SearchPipelineResult", "SearchPlan", "SearchQuery", "SearchRoundKind", "SearchTier",
     "SearchTrace", "SkipReason", "SourceRelation", "SupportLabel", "TierBudget", "TriggerCode", "ValidationReport", "RenderedReply",
-    "max_tier",
+    "get_search_orchestrator", "reset_search_orchestrator", "max_tier",
 ]
