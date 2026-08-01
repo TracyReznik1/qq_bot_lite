@@ -283,6 +283,76 @@ class RouterConflictAndFloorTests(unittest.TestCase):
             with self.subTest(kind="excluded", question=question):
                 self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
 
+    def test_advisor_failure_covers_round_two_actionable_safety_families(self):
+        actionable_cases = (
+            "对乙酰氨基酚一次吃500mg可以吗？",
+            "美林每隔六小时能再吃吗？",
+            "这个药多久吃一回？",
+            "布洛芬能服用吗？",
+            "这个药可以突然停吗？",
+            "一侧手脚无力、口齿不清怎么办？",
+            "突然胸痛该做什么？",
+            "心口疼得厉害，要叫救护车吗？",
+            "胸痛没缓解怎么办？",
+            "我没法呼吸怎么办？",
+            "清洁剂误吞怎么办？",
+            "喝下漂白剂怎么办？",
+            "漂白剂溅进眼睛，需要马上冲洗吗？",
+            "洗衣液不小心进眼了，应该怎么办？",
+            "吃完饼干呼吸困难怎么办？",
+            "清洁剂误吞后为什么恶心，该怎么处理？",
+        )
+        for question in actionable_cases:
+            with self.subTest(question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+    def test_advisor_failure_handles_family_level_units_paraphrases_and_scoped_negation(self):
+        actionable_cases = (
+            "头孢一天三回，每回两粒行不行？",
+            "这种口服液一次用十毫升可以吗？",
+            "阿莫西林隔8小时能服一次吗？",
+            "突然右臂抬不起来，讲话不清楚，要打120吗？",
+            "胸口有压迫感并冒冷汗，需要去急诊吗？",
+            "气喘不上来，该怎么处理？",
+            "那瓶除垢液喷到眼里，要立即用水冲吗？",
+            "吸入除虫喷雾后头晕，要不要就医？",
+            "不小心咽下除垢剂，需要马上处理吗？",
+            "不是没有胸痛，是疼痛一直没缓解，该怎么办？",
+            "现在没有胸痛，但右手突然无力、说话不清，要去急诊吗？",
+            "“胸痛怎么办只是示例。现在我胸痛还没完全缓解，要打120吗？",
+            "我现在喘不上气，该怎么办”",
+            "I don't know，我胸痛还没缓解，该怎么办？",
+            "吃完面包突然胸口压迫、喘不上气，该怎么办？",
+        )
+        for question in actionable_cases:
+            with self.subTest(question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+    def test_advisor_failure_keeps_stable_explanations_and_benign_scopes_below_deep(self):
+        stable_explanations = (
+            "布洛芬有哪些常见副作用？",
+            "误吞清洁剂会有什么后果？",
+            "漂白剂刺激眼睛的机制是什么？",
+            "目前没有胸痛，也没有呼吸困难，只想了解这些症状的常见原因。",
+        )
+        for question in stable_explanations:
+            with self.subTest(kind="stable", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+
+        quoted_or_harmless = (
+            "胸痛怎么办”这只是示例。",
+            "胸痛怎么办\" this is a test.",
+            "“‘胸口压迫感要打120吗’只是测试文本”请改写。",
+            "'胸痛怎么办' 只是示例文本。",
+            "洗澡水弄进眼睛怎么办？",
+            "矿泉水进眼睛，需要马上冲洗吗？",
+            "蛋糕每隔六小时能再吃吗？",
+            "我没有误吞清洁剂，也没有眼部接触，只是在校对急救说明。",
+        )
+        for question in quoted_or_harmless:
+            with self.subTest(kind="excluded", question=question):
+                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+
     def test_stable_version_definition_is_not_deep(self):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)

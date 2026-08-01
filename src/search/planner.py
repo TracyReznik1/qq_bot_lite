@@ -438,7 +438,13 @@ class SearchPlanner:
                 )
             )
 
-        redacted_queries = redacted_queries[: budget.max_initial_queries]
+        # Model-owned date metadata is executable provider input. Remove every
+        # malformed candidate before slot selection so partial/reversed bounds
+        # cannot consume budget or reach an adapter. The direct query has no
+        # model-owned date metadata and remains first.
+        redacted_queries = [
+            query for query in redacted_queries if _has_valid_query_time_shape(query)
+        ][: budget.max_initial_queries]
         needs_time_bounded_query = (
             decision.route is SearchTier.DEEP
             and decision.freshness is Freshness.HIGH
@@ -748,6 +754,19 @@ def _is_genuine_time_bounded_query(query: SearchQuery) -> bool:
         query.date_from.isoformat() in query.text
         and query.date_to.isoformat() in query.text
     )
+
+
+def _has_valid_query_time_shape(query: SearchQuery) -> bool:
+    """Reject provider-bound partial/reversed dates and false time purposes."""
+    has_start = query.date_from is not None
+    has_end = query.date_to is not None
+    if has_start != has_end:
+        return False
+    if has_start and query.date_from > query.date_to:
+        return False
+    if query.purpose is QueryPurpose.TIME_BOUNDED:
+        return _is_genuine_time_bounded_query(query)
+    return True
 
 
 def _assign_initial_query_ids(queries: Sequence[SearchQuery]) -> tuple[SearchQuery, ...]:
