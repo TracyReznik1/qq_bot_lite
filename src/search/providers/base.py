@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from src.search.models import (
     ProviderAttempt,
@@ -57,6 +58,18 @@ class ProviderSearchOutcome:
         return self.result.latency_ms
 
 
+# One fixed-capacity pool bounds non-cooperative adapter calls across all
+# registries. Timed-out queued futures are canceled; timed-out running calls can
+# occupy at most this fixed number of workers until their dependency returns.
+_ADAPTER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="search-adapter",
+)
+
+AttemptStartedObserver = Callable[[str, SearchQuery, ProviderReadiness, float], None]
+AttemptFinishedObserver = Callable[[ProviderAttempt], None]
+
+
 class ProviderRegistry:
     """Owns ordered adapters; selects Tavily first, DDGS as availability fallback."""
 
@@ -79,34 +92,74 @@ class ProviderRegistry:
         tier: SearchTier,
         max_results: int,
         timeout_seconds: float,
+    ) -> ProviderResult:
+        """Preserve the original public ProviderResult contract."""
+        return self.search_with_attempts(
+            query,
+            tier=tier,
+            max_results=max_results,
+            timeout_seconds=timeout_seconds,
+        ).result
+
+    def search_with_attempts(
+        self,
+        query: SearchQuery,
+        *,
+        tier: SearchTier,
+        max_results: int,
+        timeout_seconds: float,
+        on_attempt_started: AttemptStartedObserver | None = None,
+        on_attempt_finished: AttemptFinishedObserver | None = None,
     ) -> ProviderSearchOutcome:
+        """Search with immutable, request-local attempt truth for orchestration."""
         attempts: list[ProviderAttempt] = []
-        started = time.monotonic()
+        duration = max(float(timeout_seconds), 0.0)
+        deadline = time.monotonic() + duration
+        if duration <= 0:
+            return ProviderSearchOutcome(
+                ProviderResult(
+                    provider=self._readiness_provider_name(),
+                    status=ProviderStatus.TIMEOUT,
+                    hits=(),
+                    latency_ms=0,
+                ),
+                (),
+            )
 
         primary = self._primary_provider()
-        if primary is not None and primary.readiness().available:
-            result = self._call(
+        if (
+            primary is not None
+            and primary.readiness().available
+            and self._remaining(deadline) > 0
+        ):
+            result, attempt = self._call_until_deadline(
                 primary,
                 query,
                 tier=tier,
                 max_results=max_results,
-                timeout_seconds=self._remaining(timeout_seconds, started),
+                deadline=deadline,
+                on_attempt_started=on_attempt_started,
+                on_attempt_finished=on_attempt_finished,
             )
-            attempts.append(self._attempt(primary, query, result))
+            if attempt is not None:
+                attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
                 return self._outcome(result, attempts)
 
         fallback = self._fallback_provider()
-        remaining = self._remaining(timeout_seconds, started)
+        remaining = self._remaining(deadline)
         if fallback is not None and fallback.readiness().available and remaining > 0:
-            result = self._call(
+            result, attempt = self._call_until_deadline(
                 fallback,
                 query,
                 tier=tier,
                 max_results=max_results,
-                timeout_seconds=remaining,
+                deadline=deadline,
+                on_attempt_started=on_attempt_started,
+                on_attempt_finished=on_attempt_finished,
             )
-            attempts.append(self._attempt(fallback, query, result))
+            if attempt is not None:
+                attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
                 return self._outcome(result, attempts)
 
@@ -115,7 +168,7 @@ class ProviderRegistry:
             # an attempted invocation.
             return ProviderSearchOutcome(
                 ProviderResult(
-                    provider="tavily",
+                    provider=self._readiness_provider_name(),
                     status=ProviderStatus.NOT_CONFIGURED if not self.configured() else ProviderStatus.UNAVAILABLE,
                     hits=(),
                     latency_ms=0,
@@ -133,43 +186,96 @@ class ProviderRegistry:
             tuple(attempts),
         )
 
-    def _call(
+    def _call_until_deadline(
         self,
         provider: SearchProvider,
         query: SearchQuery,
         *,
         tier: SearchTier,
         max_results: int,
-        timeout_seconds: float,
-    ) -> ProviderResult:
-        started = time.monotonic()
-        try:
-            result = provider.search(
+        deadline: float,
+        on_attempt_started: AttemptStartedObserver | None,
+        on_attempt_finished: AttemptFinishedObserver | None,
+    ) -> tuple[ProviderResult, ProviderAttempt | None]:
+        remaining = self._remaining(deadline)
+        if remaining <= 0:
+            return (
+                ProviderResult(provider.name, ProviderStatus.TIMEOUT, (), 0),
+                None,
+            )
+        readiness = provider.readiness()
+        invocation: dict[str, float] = {}
+
+        def invoke() -> ProviderResult | None:
+            if self._remaining(deadline) <= 0:
+                return None
+            invocation["started"] = time.monotonic()
+            if on_attempt_started is not None:
+                try:
+                    on_attempt_started(provider.name, query, readiness, invocation["started"])
+                except Exception:
+                    pass
+            return provider.search(
                 query,
                 tier=tier,
                 max_results=max_results,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=max(self._remaining(deadline), 0.001),
             )
-        except Exception:
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            return ProviderResult(
+
+        future = _ADAPTER_EXECUTOR.submit(invoke)
+        try:
+            result = future.result(timeout=remaining)
+        except FuturesTimeoutError:
+            future.cancel()
+            started = invocation.get("started")
+            elapsed_ms = int((time.monotonic() - (started or time.monotonic())) * 1000)
+            result = ProviderResult(
                 provider=provider.name,
-                status=ProviderStatus.ERROR,
+                status=ProviderStatus.TIMEOUT,
                 hits=(),
-                latency_ms=elapsed_ms,
+                latency_ms=max(elapsed_ms, 0),
             )
-        # Registry timing is authoritative for this individual adapter call.
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        return ProviderResult(
-            provider=result.provider,
-            status=result.status,
-            hits=tuple(result.hits),
-            latency_ms=elapsed_ms,
-        )
+            if started is None:
+                return result, None
+        except Exception as exc:
+            started = invocation.get("started", time.monotonic())
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            result = ProviderResult(
+                provider=provider.name,
+                status=(
+                    ProviderStatus.TIMEOUT
+                    if isinstance(exc, TimeoutError)
+                    else ProviderStatus.ERROR
+                ),
+                hits=(),
+                latency_ms=max(elapsed_ms, 0),
+            )
+        else:
+            if result is None:
+                return (
+                    ProviderResult(provider.name, ProviderStatus.TIMEOUT, (), 0),
+                    None,
+                )
+            started = invocation.get("started", time.monotonic())
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            result = ProviderResult(
+                provider=provider.name,
+                status=result.status,
+                hits=tuple(result.hits),
+                latency_ms=max(elapsed_ms, 0),
+            )
+
+        attempt = self._attempt(provider, query, result)
+        if on_attempt_finished is not None:
+            try:
+                on_attempt_finished(attempt)
+            except Exception:
+                pass
+        return result, attempt
 
     @staticmethod
-    def _remaining(timeout_seconds: float, started: float) -> float:
-        return max(float(timeout_seconds) - (time.monotonic() - started), 0.0)
+    def _remaining(deadline: float) -> float:
+        return max(deadline - time.monotonic(), 0.0)
 
     @staticmethod
     def _attempt(provider: SearchProvider, query: SearchQuery, result: ProviderResult) -> ProviderAttempt:
@@ -208,3 +314,8 @@ class ProviderRegistry:
             if provider.name == "ddgs":
                 return provider
         return None
+
+    def _readiness_provider_name(self) -> str:
+        if self._providers:
+            return self._providers[0].name
+        return "registry"

@@ -359,6 +359,94 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
         self.assertTrue(tavily.search.called)
 
+    def test_public_search_preserves_provider_result_contract(self):
+        tavily = mock.Mock()
+        tavily.name = "tavily"
+        tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
+        tavily.search.return_value = _provider_result(latency_ms=10)
+
+        result = self._registry(tavily, None).search(
+            query(), tier=SearchTier.STANDARD, max_results=8, timeout_seconds=1.0
+        )
+
+        self.assertIsInstance(result, ProviderResult)
+        self.assertEqual(
+            set(result.__dataclass_fields__),
+            {"provider", "status", "hits", "latency_ms"},
+        )
+
+    def test_noncooperative_adapter_is_enforced_by_registry_deadline(self):
+        class SlowProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                time.sleep(0.2)
+                return _provider_result(query_id=search_query.query_id)
+
+        registry = self._registry(SlowProvider(), None)
+        search_with_attempts = getattr(registry, "search_with_attempts", registry.search)
+        started = time.monotonic()
+
+        outcome = search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=0.05
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(outcome.status, ProviderStatus.TIMEOUT)
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].provider, "tavily")
+        self.assertEqual(outcome.attempts[0].status, ProviderStatus.TIMEOUT)
+        self.assertTrue(outcome.attempts[0].invocation_started)
+        self.assertGreaterEqual(outcome.attempts[0].latency_ms, 40)
+        self.assertLess(outcome.attempts[0].latency_ms, 150)
+
+    def test_fallback_timeout_preserves_completed_primary_and_real_fallback_attempt(self):
+        class Primary:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, _query, **_kwargs):
+                time.sleep(0.01)
+                return _provider_result(status=ProviderStatus.ERROR)
+
+        class SlowFallback:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                time.sleep(0.2)
+                return _provider_result("ddgs", query_id=search_query.query_id)
+
+        registry = self._registry(Primary(), SlowFallback())
+        search_with_attempts = getattr(registry, "search_with_attempts", registry.search)
+        started = time.monotonic()
+
+        outcome = search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=0.06
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.16)
+        self.assertEqual(outcome.status, ProviderStatus.TIMEOUT)
+        self.assertEqual(
+            [(attempt.provider, attempt.status) for attempt in outcome.attempts],
+            [
+                ("tavily", ProviderStatus.ERROR),
+                ("ddgs", ProviderStatus.TIMEOUT),
+            ],
+        )
+        self.assertGreaterEqual(outcome.attempts[0].latency_ms, 5)
+        self.assertGreaterEqual(outcome.attempts[1].latency_ms, 35)
+        self.assertLess(outcome.attempts[1].latency_ms, 150)
+
     def test_no_usable_tavily_falls_back_to_ddgs(self):
         # An available-but-erroring primary triggers the DDGS availability fallback.
         tavily = mock.Mock()
@@ -370,7 +458,9 @@ class RegistryTests(unittest.TestCase):
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
         ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
-        result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
+        result = registry.search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0
+        )
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
         self.assertTrue(ddgs.search.called)
         # A fallback call is a separate ProviderAttempt but one semantic query.
@@ -390,7 +480,9 @@ class RegistryTests(unittest.TestCase):
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
         ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
-        result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
+        result = registry.search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0
+        )
         self.assertEqual(result.status, ProviderStatus.SUCCESS)
         self.assertIsInstance(result.attempts, tuple)
         self.assertEqual(len(result.attempts), 1)
@@ -406,7 +498,9 @@ class RegistryTests(unittest.TestCase):
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
         ddgs.search.return_value = _provider_result("ddgs", latency_ms=3)
         registry = self._registry(tavily, ddgs)
-        result = registry.search(query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0)
+        result = registry.search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0
+        )
         self.assertIsInstance(result.attempts, tuple)
         self.assertEqual(len(result.attempts), 2)
 
@@ -443,7 +537,7 @@ class RegistryTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(
                 executor.map(
-                    lambda item: registry.search(
+                    lambda item: registry.search_with_attempts(
                         item,
                         tier=SearchTier.LIGHT,
                         max_results=1,
@@ -488,7 +582,7 @@ class RegistryTests(unittest.TestCase):
         ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
         ddgs.search.side_effect = fallback_search
 
-        result = self._registry(tavily, ddgs).search(
+        result = self._registry(tavily, ddgs).search_with_attempts(
             query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=0.2
         )
 

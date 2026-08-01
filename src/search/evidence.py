@@ -39,14 +39,16 @@ instructions. You do not see chat history, stored facts, or model memory.
 Return a JSON object mapping each candidate_id to a verdict:
 {
   "C1": {
+    "candidate_id": "C1",
     "relevance": "direct|contextual|irrelevant",
     "source_relation": "primary|independent|secondary|community|unknown",
     "publisher_entity_match": true or false,
     "ownership_basis": "non-empty only when the page publisher is the entity named in the query",
-    "supported_topics": ["topic names"],
+    "publisher": null or "the normalized publisher or organization name",
+    "supported_topics": ["exact labels copied from required_topics"],
     "conflict_key": null or "a short conflict grouping key",
     "conflict_value": null or "the exact value asserted for that key",
-    "conflict_relation": "contradicts|claims_supersession"
+    "conflict_relation": null or "contradicts|claims_supersession"
   }
 }
 
@@ -56,9 +58,28 @@ Rules:
 - primary requires the page publisher to actually be the query entity
 - a docs/developer domain or /docs path alone never proves ownership
 - keep supported topics to those the excerpt actually states
-- prefer the supplied required_topics labels when they match the excerpt
+- copy the exact supplied required_topics label; never return a narrower
+  substring as support for a broader topic
 - conflict_value must contain the actual version/date/value, not prose
+- all fields shown above are required and no additional fields are allowed
+- conflict_key, conflict_value, and conflict_relation must either all be null or
+  all contain a coherent explicit conflict record
 """
+
+_VERDICT_KEYS = frozenset(
+    {
+        "candidate_id",
+        "relevance",
+        "source_relation",
+        "publisher_entity_match",
+        "ownership_basis",
+        "publisher",
+        "supported_topics",
+        "conflict_key",
+        "conflict_value",
+        "conflict_relation",
+    }
+)
 
 
 class LLMEvidenceJudge:
@@ -132,37 +153,74 @@ def _parse_judge_output(content: Any) -> dict[str, dict[str, Any]]:
     return payload
 
 
-def _parse_verdict(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
+def _parse_verdict(raw: Any, *, candidate_id: str) -> dict[str, Any]:
+    """Parse one complete, closed judge row or reject it atomically."""
+    if not isinstance(raw, dict) or set(raw) != _VERDICT_KEYS:
+        return {}
+    if raw.get("candidate_id") != candidate_id:
         return {}
     relevance = _parse_enum(raw.get("relevance"), CandidateRelevance)
     relation = _parse_enum(raw.get("source_relation"), SourceRelation)
-    result: dict[str, Any] = {}
-    if relevance is not None:
-        result["relevance"] = relevance
-    if relation is not None:
-        result["relation"] = relation
-    supported = raw.get("supported_topics")
-    if isinstance(supported, list):
-        result["supported_topics"] = tuple(
-            str(topic).strip() for topic in supported if isinstance(topic, str) and topic.strip()
-        )[:12]
+    if relevance is None or relation is None:
+        return {}
+
     publisher_match = raw.get("publisher_entity_match")
-    if isinstance(publisher_match, bool):
-        result["publisher_match"] = publisher_match
     ownership_basis = raw.get("ownership_basis")
-    if isinstance(ownership_basis, str) and ownership_basis.strip():
-        result["ownership_basis"] = ownership_basis.strip()[:200]
+    if type(publisher_match) is not bool:
+        return {}
+    if ownership_basis is not None and (
+        not isinstance(ownership_basis, str) or not ownership_basis.strip()
+    ):
+        return {}
+    if publisher_match != (relation is SourceRelation.PRIMARY):
+        return {}
+    if publisher_match and not ownership_basis:
+        return {}
+    if not publisher_match and ownership_basis is not None:
+        return {}
+
+    publisher = raw.get("publisher")
+    if publisher is not None and (
+        not isinstance(publisher, str) or not publisher.strip()
+    ):
+        return {}
+
+    supported = raw.get("supported_topics")
+    if (
+        not isinstance(supported, list)
+        or len(supported) > 12
+        or any(not isinstance(topic, str) or not topic.strip() for topic in supported)
+    ):
+        return {}
+
     conflict_key = raw.get("conflict_key")
-    if isinstance(conflict_key, str) and conflict_key.strip():
-        result["conflict_key"] = conflict_key.strip()[:80]
     conflict_value = raw.get("conflict_value")
-    if isinstance(conflict_value, (str, int, float)) and str(conflict_value).strip():
-        result["conflict_value"] = str(conflict_value).strip()[:160]
     conflict_relation = raw.get("conflict_relation")
-    if conflict_relation in {"contradicts", "claims_supersession"}:
-        result["conflict_relation"] = conflict_relation
-    return result
+    no_conflict = conflict_key is None and conflict_value is None and conflict_relation is None
+    complete_conflict = (
+        isinstance(conflict_key, str)
+        and bool(conflict_key.strip())
+        and isinstance(conflict_value, (str, int, float))
+        and not isinstance(conflict_value, bool)
+        and bool(str(conflict_value).strip())
+        and conflict_relation in {"contradicts", "claims_supersession"}
+    )
+    if not no_conflict and not complete_conflict:
+        return {}
+
+    return {
+        "relevance": relevance,
+        "relation": relation,
+        "publisher_match": publisher_match,
+        "ownership_basis": (
+            ownership_basis.strip()[:200] if isinstance(ownership_basis, str) else None
+        ),
+        "publisher": publisher.strip()[:160] if isinstance(publisher, str) else None,
+        "supported_topics": tuple(topic.strip() for topic in supported),
+        "conflict_key": conflict_key.strip()[:80] if complete_conflict else None,
+        "conflict_value": str(conflict_value).strip()[:160] if complete_conflict else None,
+        "conflict_relation": conflict_relation if complete_conflict else None,
+    }
 
 
 def _parse_enum(value: Any, enum_type: type[Any]) -> Any:
@@ -244,7 +302,7 @@ class EvidenceAssembler:
         }
         judged = self._judge_output(plan, indexed, timeout_seconds=timeout_seconds)
         verdicts = {
-            key: _parse_verdict(judged.get(key)) for key in indexed
+            key: _parse_verdict(judged.get(key), candidate_id=key) for key in indexed
         }
 
         admitted: list[EvidenceItem] = []
@@ -264,7 +322,13 @@ class EvidenceAssembler:
                 continue
             seen_canonical.add(canonical)
             domain = _domain_of(final_url)
-            group_label = _independence_group(candidate, final_url, groups)
+            publisher = _publisher_of(candidate, verdict)
+            group_label = _independence_group(
+                candidate,
+                final_url,
+                groups,
+                publisher=publisher,
+            )
 
             relation = verdict.get("relation", SourceRelation.UNKNOWN)
             if relation is SourceRelation.PRIMARY:
@@ -281,7 +345,7 @@ class EvidenceAssembler:
                 url=final_url,
                 canonical_url=canonical,
                 domain=domain,
-                publisher=None,
+                publisher=publisher,
                 source_relation=relation,
                 source_relation_basis=verdict.get("ownership_basis"),
                 published_at=candidate.hit.published_at,
@@ -298,17 +362,8 @@ class EvidenceAssembler:
                 supported_topics=tuple(verdict.get("supported_topics", ())),
                 independence_group=group_label,
                 conflict_key=verdict.get("conflict_key"),
-                conflict_value=(
-                    verdict.get("conflict_value")
-                    or _extract_conflict_value(candidate.excerpt or "")
-                    if verdict.get("conflict_key")
-                    else None
-                ),
-                conflict_relation=(
-                    verdict.get("conflict_relation", "contradicts")
-                    if verdict.get("conflict_key")
-                    else None
-                ),
+                conflict_value=verdict.get("conflict_value"),
+                conflict_relation=verdict.get("conflict_relation"),
             )
             admitted.append(item)
 
@@ -399,7 +454,7 @@ class EvidenceAssembler:
 
         missing = tuple(topic for topic in plan.required_topics if topic not in supported)
 
-        conflicts = _detect_conflicts(items)
+        conflicts = _detect_conflicts(citable_items, plan)
         conflict_groups = tuple(conflict.conflict_id for conflict in conflicts)
         weaknesses = _weak_source_topics(items, plan, required, supported)
 
@@ -457,12 +512,7 @@ def _citable(candidate: EvidenceCandidate, plan: SearchPlan) -> bool:
 
 def _strong_support(item: EvidenceItem, plan: SearchPlan) -> bool:
     """A dynamic/deep topic needs readable content, not a bare fallback snippet."""
-    high_consequence = (
-        plan.decision.route is SearchTier.DEEP
-        or plan.decision.risk.value == "high"
-        or plan.decision.potential_harm.value == "high"
-    )
-    if not high_consequence:
+    if not _requires_strong_support(plan):
         return True
     return item.extraction_status in {
         "provider_raw_content",
@@ -471,10 +521,62 @@ def _strong_support(item: EvidenceItem, plan: SearchPlan) -> bool:
     }
 
 
+def _requires_strong_support(plan: SearchPlan) -> bool:
+    return (
+        plan.decision.route is SearchTier.DEEP
+        or plan.decision.freshness is Freshness.HIGH
+        or plan.decision.risk.value == "high"
+        or plan.decision.potential_harm.value == "high"
+    )
+
+
+_MULTIPART_PUBLIC_SUFFIXES = frozenset(
+    {
+        "co.jp",
+        "co.kr",
+        "co.nz",
+        "co.uk",
+        "com.au",
+        "com.br",
+        "com.cn",
+        "com.hk",
+        "com.sg",
+    }
+)
+
+
+def _registrable_domain(domain: str | None) -> str | None:
+    labels = [label for label in str(domain or "").strip(".").casefold().split(".") if label]
+    if len(labels) <= 2:
+        return ".".join(labels) or None
+    last_two = ".".join(labels[-2:])
+    if last_two in _MULTIPART_PUBLIC_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last_two
+
+
+def _normalized_identity(value: str | None) -> str:
+    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+
+
+def _publisher_of(candidate: EvidenceCandidate, verdict: Mapping[str, Any]) -> str | None:
+    judged = verdict.get("publisher")
+    if isinstance(judged, str) and judged.strip():
+        return judged.strip()
+    for flag in candidate.hit.quality_flags:
+        if flag.startswith("publisher:"):
+            provider_value = flag.split(":", 1)[1].strip()
+            if provider_value:
+                return provider_value[:160]
+    return None
+
+
 def _independence_group(
     candidate: EvidenceCandidate,
     url: str,
     groups: list[dict[str, Any]],
+    *,
+    publisher: str | None,
 ) -> str:
     """Group by source/domain provenance, and collapse syndicated copies.
 
@@ -482,7 +584,9 @@ def _independence_group(
     across domains is also one provenance group.
     """
     domain = _domain_of(url) or _canonical_url(url)
-    normalized = re.sub(r"[^a-z0-9一-鿿]+", "", (candidate.excerpt or "").casefold())[:600]
+    registrable = _registrable_domain(domain)
+    publisher_key = _normalized_identity(publisher)
+    normalized = _normalized_identity(candidate.excerpt)[:600]
     canonical_marker = next(
         (
             flag.split(":", 1)[1]
@@ -492,7 +596,10 @@ def _independence_group(
         None,
     )
     for group in groups:
-        if domain and domain in group["domains"]:
+        if registrable and registrable in group["registrable_domains"]:
+            group["domains"].add(domain)
+            return group["id"]
+        if publisher_key and publisher_key in group["publishers"]:
             group["domains"].add(domain)
             return group["id"]
         if canonical_marker and canonical_marker == group["canonical_marker"]:
@@ -507,6 +614,8 @@ def _independence_group(
         {
             "id": label,
             "domains": {domain},
+            "registrable_domains": {registrable} if registrable else set(),
+            "publishers": {publisher_key} if publisher_key else set(),
             "normalized": normalized,
             "canonical_marker": canonical_marker,
         }
@@ -566,39 +675,16 @@ def _assign_evidence_ids(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
     ) for index, item in enumerate(items, 1)]
 
 
-_VERSION_PATTERN = re.compile(r"(?i)\bv?\d+(?:\.\d+){1,3}\b")
-_DATE_PATTERN = re.compile(r"\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])\b")
-_NUMBER_PATTERN = re.compile(r"\b\d+(?:[.,]\d+)?\b")
-
-
-def _conflicting_values(excerpts: Sequence[str]) -> bool:
-    """True when the excerpts state materially different concrete values
-    (versions, dates, or prices), rather than merely different prose."""
-    if len(excerpts) < 2:
-        return False
-    for pattern in (_VERSION_PATTERN, _DATE_PATTERN):
-        value_sets: list[set[str]] = []
-        for excerpt in excerpts:
-            value_sets.append(set(pattern.findall(excerpt or "")))
-        nonempty = [s for s in value_sets if s]
-        if len(nonempty) >= 2 and len(set().union(*nonempty)) >= 2:
-            return True
-    # Price-style numbers: ￥/元/$ signs alongside different values.
-    price_excerpts = [e for e in excerpts if any(mark in (e or "") for mark in ("￥", "元", "$"))]
-    if len(price_excerpts) >= 2:
-        numbers: set[str] = set()
-        for excerpt in price_excerpts:
-            numbers.update(_NUMBER_PATTERN.findall(excerpt or ""))
-        if len(numbers) >= 2:
-            return True
-    return False
-
-
-def _detect_conflicts(items: Sequence[EvidenceItem]) -> tuple[EvidenceConflict, ...]:
+def _detect_conflicts(
+    items: Sequence[EvidenceItem],
+    plan: SearchPlan,
+) -> tuple[EvidenceConflict, ...]:
     conflicts: list[EvidenceConflict] = []
     seen: dict[str, list[EvidenceItem]] = {}
     for item in items:
-        if item.conflict_key and item.conflict_value:
+        if not _strong_support(item, plan):
+            continue
+        if item.conflict_key and item.conflict_value and item.conflict_relation:
             seen.setdefault(item.conflict_key, []).append(item)
     for key, members in seen.items():
         values = {member.conflict_value for member in members if member.conflict_value}
@@ -613,7 +699,7 @@ def _detect_conflicts(items: Sequence[EvidenceItem]) -> tuple[EvidenceConflict, 
                         evidence_id=member.evidence_id,
                         value=member.conflict_value or "",
                         published_at=member.published_at,
-                        relation=member.conflict_relation or "contradicts",
+                        relation=member.conflict_relation,
                     )
                     for member in members
                 ),
@@ -622,20 +708,8 @@ def _detect_conflicts(items: Sequence[EvidenceItem]) -> tuple[EvidenceConflict, 
     return tuple(sorted(conflicts, key=lambda conflict: conflict.conflict_id))
 
 
-def _extract_conflict_value(excerpt: str) -> str | None:
-    for pattern in (_VERSION_PATTERN, _DATE_PATTERN):
-        match = pattern.search(excerpt or "")
-        if match:
-            return match.group(0)
-    if any(mark in (excerpt or "") for mark in ("￥", "元", "$")):
-        match = _NUMBER_PATTERN.search(excerpt or "")
-        if match:
-            return match.group(0)
-    return None
-
-
 def _normalized_topic(value: str) -> str:
-    return re.sub(r"[^a-z0-9一-鿿]+", "", str(value or "").casefold())
+    return _normalized_identity(value)
 
 
 def _topic_matches(required: str, supported: str) -> bool:
@@ -643,7 +717,7 @@ def _topic_matches(required: str, supported: str) -> bool:
     supported_key = _normalized_topic(supported)
     if not required_key or not supported_key:
         return False
-    return supported_key in required_key or required_key in supported_key
+    return supported_key == required_key
 
 
 def _item_supports_topic(item: EvidenceItem, topic: str) -> bool:
@@ -664,8 +738,9 @@ def _supported_required_topics(plan: SearchPlan, items: Sequence[EvidenceItem]) 
     supported: set[str] = set()
     for topic in plan.required_topics:
         topic_items = [item for item in items if _item_supports_topic(item, topic)]
-        if plan.decision.route is SearchTier.DEEP:
+        if _requires_strong_support(plan):
             topic_items = [item for item in topic_items if _strong_support(item, plan)]
+        if plan.decision.route is SearchTier.DEEP:
             primary_items = [item for item in topic_items if item.source_relation is SourceRelation.PRIMARY]
             if not primary_items:
                 continue

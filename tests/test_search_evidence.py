@@ -105,14 +105,18 @@ def judge_ok(
     supported=("定义",),
     conflict_key=None,
     conflict_value=None,
-    conflict_relation="contradicts",
+    conflict_relation=None,
+    publisher=None,
 ):
+    if conflict_key is not None and conflict_relation is None:
+        conflict_relation = "contradicts"
     return {
         "candidate_id": candidate_id,
         "relevance": relevance,
         "source_relation": relation,
         "publisher_entity_match": relation == "primary",
         "ownership_basis": "publisher matches query entity" if relation == "primary" else None,
+        "publisher": publisher,
         "supported_topics": list(supported),
         "conflict_key": conflict_key,
         "conflict_value": conflict_value,
@@ -153,7 +157,7 @@ class EvidenceAdmissionTests(unittest.TestCase):
         self.assertEqual(bundle.evidence_items, ())
         self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
-    def test_primary_requires_publisher_match_and_basis(self):
+    def test_contradictory_primary_row_is_rejected(self):
         judge = StaticEvidenceJudge(
             {
                 "C1": {
@@ -162,15 +166,17 @@ class EvidenceAdmissionTests(unittest.TestCase):
                     "source_relation": "primary",
                     "publisher_entity_match": False,
                     "ownership_basis": None,
+                    "publisher": None,
                     "supported_topics": ["定义"],
                     "conflict_key": None,
+                    "conflict_value": None,
+                    "conflict_relation": None,
                 }
             }
         )
         assembler = self.module.EvidenceAssembler(judge)
         bundle = assembler.assemble(plan(), (candidate(url="https://docs.example.com"),))
-        self.assertEqual(len(bundle.evidence_items), 1)
-        self.assertIs(bundle.evidence_items[0].source_relation, SourceRelation.SECONDARY)
+        self.assertEqual(bundle.evidence_items, ())
 
     def test_docs_path_never_primary_by_shape(self):
         judge = StaticEvidenceJudge({"C1": judge_ok("C1", relation="primary")})
@@ -206,6 +212,53 @@ class EvidenceAdmissionTests(unittest.TestCase):
         assembler.assemble(plan(required_topics=("定义", "历史")), (candidate(),), timeout_seconds=0.4)
 
         self.assertEqual(calls, [("什么是光合作用", ("定义", "历史"), 0.4, 1)])
+
+    def test_partial_direct_judge_row_is_rejected_as_a_whole(self):
+        class PartialJudge:
+            def judge(self, *_args, **_kwargs):
+                return {"C1": {"relevance": "direct", "supported_topics": ["定义"]}}
+
+        bundle = self.module.EvidenceAssembler(PartialJudge()).assemble(
+            plan(required_topics=("定义",)), (candidate(),)
+        )
+
+        self.assertEqual(bundle.evidence_items, ())
+        self.assertEqual(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+
+    def test_missing_or_unknown_judge_field_rejects_the_complete_row(self):
+        missing = judge_ok("C1")
+        missing.pop("source_relation")
+        extra = judge_ok("C2")
+        extra["unreviewed_field"] = "must not be ignored"
+
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": missing, "C2": extra})
+        ).assemble(
+            plan(required_topics=("定义",)),
+            (
+                candidate(url="https://one.example/item"),
+                candidate(url="https://two.example/item"),
+            ),
+        )
+
+        self.assertEqual(bundle.evidence_items, ())
+
+    def test_malformed_or_contradictory_conflict_contract_rejects_row(self):
+        missing_value = judge_ok("C1", conflict_key="version", conflict_value=None)
+        value_without_key = judge_ok("C2", conflict_key=None, conflict_value="2.0")
+
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": missing_value, "C2": value_without_key})
+        ).assemble(
+            plan(required_topics=("版本",)),
+            (
+                candidate(url="https://one.example/version", content="版本 1.0"),
+                candidate(url="https://two.example/version", content="版本 2.0"),
+            ),
+        )
+
+        self.assertEqual(bundle.evidence_items, ())
+        self.assertEqual(bundle.conflicts, ())
 
 
 class EvidenceDedupTests(unittest.TestCase):
@@ -269,6 +322,74 @@ class EvidenceDedupTests(unittest.TestCase):
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("定义",), route=SearchTier.DEEP),
             deep_candidates,
+        )
+        self.assertEqual(
+            bundle.evidence_items[0].independence_group,
+            bundle.evidence_items[1].independence_group,
+        )
+        self.assertIn("single_source_authority", bundle.limitations)
+
+    def test_same_registrable_parent_subdomains_cannot_corroborate(self):
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok("C1", relation="primary", supported=("动态",)),
+                "C2": judge_ok("C2", relation="independent", supported=("动态",)),
+            }
+        )
+        candidates = tuple(
+            replace(
+                candidate(url=url, content=text),
+                excerpt_origin=ExcerptOrigin.PAGE_EXTRACT,
+                extraction_status="page_extract",
+                content_reads_consumed=1,
+            )
+            for url, text in (
+                ("https://www.vendor.example/status", "厂商主站确认当前状态。"),
+                ("https://news.vendor.example/report", "新闻子站使用完全不同的措辞报道。"),
+            )
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+        )
+
+        self.assertEqual(
+            bundle.evidence_items[0].independence_group,
+            bundle.evidence_items[1].independence_group,
+        )
+        self.assertIn("single_source_authority", bundle.limitations)
+
+    def test_same_publisher_across_domains_cannot_corroborate(self):
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok(
+                    "C1", relation="primary", supported=("动态",), publisher="Example Wire"
+                ),
+                "C2": judge_ok(
+                    "C2", relation="independent", supported=("动态",), publisher="Example Wire"
+                ),
+            }
+        )
+        candidates = tuple(
+            replace(
+                candidate(url=url, content=text),
+                excerpt_origin=ExcerptOrigin.PAGE_EXTRACT,
+                extraction_status="page_extract",
+                content_reads_consumed=1,
+            )
+            for url, text in (
+                ("https://authority.example/status", "权威页面陈述动态状态。"),
+                ("https://affiliate.invalid/report", "关联出版方采用不同措辞。"),
+            )
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+        )
+
+        self.assertEqual(
+            bundle.evidence_items[0].publisher,
+            bundle.evidence_items[1].publisher,
         )
         self.assertEqual(
             bundle.evidence_items[0].independence_group,
@@ -468,9 +589,85 @@ class EvidenceStateTests(unittest.TestCase):
         )
         self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
 
-    def test_required_topic_support_is_not_accidental_exact_string_equality(self):
+    def test_standard_high_risk_failed_fetch_snippet_cannot_satisfy_topic(self):
+        risky_plan = plan(required_topics=("剂量",), route=SearchTier.STANDARD)
+        risky_plan = replace(
+            risky_plan,
+            decision=replace(risky_plan.decision, risk=RiskLevel.HIGH),
+        )
+        weak = replace(
+            candidate(content="药物剂量搜索片段"),
+            extraction_status="search_result_snippet_after_fetch_failure",
+            content_reads_consumed=1,
+        )
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("并发模型",), relation="primary")}
+            {"C1": judge_ok("C1", supported=("剂量",), relation="primary")}
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(risky_plan, (weak,))
+
+        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("剂量", bundle.missing_claim_topics)
+
+    def test_standard_high_freshness_failed_fetch_snippet_cannot_satisfy_topic(self):
+        dynamic_plan = plan(required_topics=("当前版本",), route=SearchTier.STANDARD)
+        dynamic_plan = replace(
+            dynamic_plan,
+            decision=replace(dynamic_plan.decision, freshness=Freshness.HIGH),
+        )
+        weak = replace(
+            candidate(content="当前版本是 2.0 的搜索片段"),
+            extraction_status="search_result_snippet_after_fetch_failure",
+            content_reads_consumed=1,
+        )
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("当前版本",), relation="primary")}
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(dynamic_plan, (weak,))
+
+        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("当前版本", bundle.missing_claim_topics)
+
+    def test_two_weak_dynamic_snippets_cannot_form_material_conflict(self):
+        weak_candidates = tuple(
+            replace(
+                candidate(url=url, content=text),
+                extraction_status="search_result_snippet_after_fetch_failure",
+                content_reads_consumed=1,
+            )
+            for url, text in (
+                ("https://a.example/version", "当前版本 1.0"),
+                ("https://b.example/version", "当前版本 2.0"),
+            )
+        )
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok(
+                    "C1", supported=("当前版本",), conflict_key="version", conflict_value="1.0"
+                ),
+                "C2": judge_ok(
+                    "C2", supported=("当前版本",), conflict_key="version", conflict_value="2.0"
+                ),
+            }
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("当前版本",), route=SearchTier.DEEP), weak_candidates
+        )
+
+        self.assertNotEqual(bundle.evidence_state, EvidenceState.CONFLICTING)
+        self.assertEqual(bundle.conflict_groups, ())
+        self.assertEqual(bundle.conflicts, ())
+        self.assertIn("当前版本", bundle.missing_claim_topics)
+
+    def test_exact_required_topic_label_is_supported(self):
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok(
+                    "C1", supported=("Rust 和 Go 的并发模型差异",), relation="primary"
+                )
+            }
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("Rust 和 Go 的并发模型差异",)),
@@ -478,6 +675,54 @@ class EvidenceStateTests(unittest.TestCase):
         )
         self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertEqual(bundle.missing_claim_topics, ())
+
+    def test_broad_subtopic_cannot_satisfy_composite_required_topic(self):
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("Go",), relation="primary")}
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("Rust 和 Go 的并发模型差异",)),
+            (candidate(content="这里只介绍 Go，不比较 Rust，也未讨论并发模型。"),),
+        )
+
+        self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("Rust 和 Go 的并发模型差异", bundle.missing_claim_topics)
+
+    def test_overlapping_product_name_is_not_a_topic_alias(self):
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("JavaScript",), relation="primary")}
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("Java",)),
+            (candidate(content="本文只讨论 JavaScript。"),),
+        )
+
+        self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("Java", bundle.missing_claim_topics)
+
+    def test_cjk_narrow_label_cannot_satisfy_full_required_topic(self):
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("苹果",), relation="primary")}
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("苹果公司的季度营收",)),
+            (candidate(content="这里只介绍苹果这一名称。"),),
+        )
+
+        self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("苹果公司的季度营收", bundle.missing_claim_topics)
+
+    def test_japanese_narrow_label_cannot_satisfy_full_required_topic(self):
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("東京大学",), relation="primary")}
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("東京大学の入学要件",)),
+            (candidate(content="東京大学という名称だけを紹介する。"),),
+        )
+
+        self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIn("東京大学の入学要件", bundle.missing_claim_topics)
 
 
 class EvidenceGapTests(unittest.TestCase):
@@ -492,8 +737,11 @@ class EvidenceGapTests(unittest.TestCase):
                 "source_relation": "independent",
                 "publisher_entity_match": False,
                 "ownership_basis": None,
+                "publisher": None,
                 "supported_topics": ["定义"],
                 "conflict_key": None,
+                "conflict_value": None,
+                "conflict_relation": None,
             }}
         )
         assembler = self.module.EvidenceAssembler(judge)

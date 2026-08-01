@@ -906,6 +906,8 @@ class SearchPipelineResult:
             EvidenceState.INSUFFICIENT: SearchFailureCode.INSUFFICIENT_EVIDENCE,
         }
         allowed = {state_failures[self.evidence.evidence_state]}
+        if "hard_deadline_exceeded" in getattr(self.evidence, "limitations", ()):
+            allowed.add(SearchFailureCode.PROVIDER_TIMEOUT)
         if self.evidence.evidence_state is EvidenceState.INSUFFICIENT:
             allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}
         if self.failure_code not in allowed:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -111,12 +112,16 @@ class _FakeJudge:
                 result[f"C{index}"] = self.verdicts[f"C{index}"]
             else:
                 result[f"C{index}"] = {
+                    "candidate_id": f"C{index}",
                     "relevance": "direct",
                     "source_relation": "independent",
                     "publisher_entity_match": False,
                     "ownership_basis": None,
+                    "publisher": None,
                     "supported_topics": list(self.supported_topics),
                     "conflict_key": None,
+                    "conflict_value": None,
+                    "conflict_relation": None,
                 }
         return result
 
@@ -332,6 +337,62 @@ class OrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_NOT_CONFIGURED)
         self.assertIsNone(result.evidence)
         self.assertFalse(result.trace.provider_invocation_started)
+        self.assertEqual(result.trace.executed_queries, ())
+        self.assertEqual(result.trace.to_log_dict()["semantic_query_count"], 0)
+
+    def _assert_bundle_trace_mirror(self, result):
+        bundle = result.evidence
+        self.assertIsNotNone(bundle)
+        self.assertIs(result.trace.evidence_state, bundle.evidence_state)
+        self.assertEqual(
+            result.trace.citable_evidence_count,
+            sum(1 for item in bundle.evidence_items if item.citable),
+        )
+        self.assertEqual(result.trace.provider_attempts, bundle.attempts)
+        self.assertEqual(result.trace.retrieval_round_count, bundle.retrieval_round_count)
+        self.assertEqual(
+            len(result.trace.provider_failures),
+            len(set(result.trace.provider_failures)),
+        )
+
+    def test_no_results_failure_seals_bundle_and_trace_from_same_state(self):
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(_FakeProvider(hits=()),),
+            extractor=_FakeExtractor(),
+        )
+
+        result = orchestrator.run(request())
+
+        self.assertEqual(result.failure_code, SearchFailureCode.NO_RESULTS)
+        self._assert_bundle_trace_mirror(result)
+
+    def test_unavailable_failure_seals_bundle_and_trace_from_same_state(self):
+        class UnavailableProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness(
+                    "tavily", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE
+                )
+
+            def search(self, *_args, **_kwargs):
+                raise AssertionError("unavailable adapter must not execute")
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(UnavailableProvider(),),
+            extractor=_FakeExtractor(),
+        )
+
+        result = orchestrator.run(request())
+
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_UNAVAILABLE)
+        self._assert_bundle_trace_mirror(result)
 
     def test_provider_failure_never_changes_route_to_skip(self):
         class FailingProvider:
@@ -389,6 +450,8 @@ class OrchestratorFailureTests(unittest.TestCase):
         )
         result = orchestrator.run(request())
         self.assertEqual(result.failure_code, SearchFailureCode.CONTENT_UNREADABLE)
+        self.assertIn("content_unreadable", result.evidence.limitations)
+        self._assert_bundle_trace_mirror(result)
 
 
 class OrchestratorDeadlineTests(unittest.TestCase):
@@ -416,6 +479,21 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 self.fail(f"deadline leaked TimeoutError: {exc}")
         return result, time.monotonic() - started
 
+    def _assert_bundle_trace_mirror(self, result):
+        bundle = result.evidence
+        self.assertIsNotNone(bundle)
+        self.assertIs(result.trace.evidence_state, bundle.evidence_state)
+        self.assertEqual(
+            result.trace.citable_evidence_count,
+            sum(1 for item in bundle.evidence_items if item.citable),
+        )
+        self.assertEqual(result.trace.provider_attempts, bundle.attempts)
+        self.assertEqual(result.trace.retrieval_round_count, bundle.retrieval_round_count)
+        self.assertEqual(
+            len(result.trace.provider_failures),
+            len(set(result.trace.provider_failures)),
+        )
+
     def test_provider_deadline_returns_without_waiting_for_running_future(self):
         class SlowProvider(_FakeProvider):
             def search(self, query, *, tier, max_results, timeout_seconds):
@@ -438,6 +516,55 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
         self.assertTrue(result.trace.provider_invocation_started)
+        self._assert_bundle_trace_mirror(result)
+
+    def test_fallback_timeout_keeps_completed_primary_and_real_fallback_truth(self):
+        class ErrorPrimary:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, _query, **_kwargs):
+                time.sleep(0.01)
+                from src.search.models import ProviderResult
+                return ProviderResult("tavily", ProviderStatus.ERROR, (), 1)
+
+        class SlowFallback:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                time.sleep(0.25)
+                from src.search.models import ProviderHit, ProviderResult
+                provider_hit = ProviderHit(
+                    "ddgs", search_query.query_id, "late", "https://late.example/item",
+                    "late", None, None, None, (),
+                )
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (provider_hit,), 1)
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(ErrorPrimary(), SlowFallback()),
+            extractor=_FakeExtractor(),
+        )
+
+        result, elapsed = self._run_with_short_budget(orchestrator)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(
+            [(attempt.provider, attempt.status) for attempt in result.trace.provider_attempts],
+            [
+                ("tavily", ProviderStatus.ERROR),
+                ("ddgs", ProviderStatus.TIMEOUT),
+            ],
+        )
+        self._assert_bundle_trace_mirror(result)
 
     def test_planner_is_bounded_by_same_deadline_and_degrades(self):
         class SlowPlanner:
@@ -498,6 +625,130 @@ class OrchestratorDeadlineTests(unittest.TestCase):
 
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+
+    def test_queued_fifth_query_is_never_recorded_as_executed_or_invoked(self):
+        started_queries = []
+        lock = threading.Lock()
+
+        class BlockingProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                with lock:
+                    started_queries.append(search_query.query_id)
+                time.sleep(0.25)
+                from src.search.models import ProviderResult
+                return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
+
+        original = DEFAULT_TIER_BUDGETS[SearchTier.DEEP]
+        short_deep = SimpleNamespace(
+            max_initial_queries=original.max_initial_queries,
+            max_candidate_urls=original.max_candidate_urls,
+            max_content_reads=original.max_content_reads,
+            max_repair_queries=original.max_repair_queries,
+            max_total_queries=original.max_total_queries,
+            max_retrieval_rounds=original.max_retrieval_rounds,
+            hard_timeout_seconds=0.05,
+        )
+        budgets = dict(DEFAULT_TIER_BUDGETS)
+        budgets[SearchTier.DEEP] = short_deep
+
+        class FiveQueryPlanner:
+            def plan(self, *args, **kwargs):
+                from src.search.models import QueryPurpose, SearchQuery, SearchRoundKind
+
+                base = _make_planner().plan(*args, **kwargs)
+                queries = tuple(
+                    SearchQuery(
+                        f"initial-{index}",
+                        SearchRoundKind.INITIAL,
+                        QueryPurpose.DIRECT,
+                        f"query {index}",
+                    )
+                    for index in range(1, 6)
+                )
+                return replace(base, initial_queries=queries)
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("deep")),
+            planner=FiveQueryPlanner(),
+            judge=_FakeJudge(),
+            providers=(BlockingProvider(),),
+            extractor=_FakeExtractor(),
+        )
+
+        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", budgets):
+            result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+        time.sleep(0.27)
+
+        self.assertEqual(len(started_queries), 4)
+        executed_ids = [query_id for query_id, _purpose in result.trace.executed_queries]
+        attempted_ids = [attempt.query_id for attempt in result.trace.provider_attempts]
+        self.assertCountEqual(executed_ids, started_queries)
+        self.assertCountEqual(attempted_ids, started_queries)
+        self.assertNotIn("initial-5", executed_ids)
+
+    def test_repair_timeout_preserves_citable_truth_and_deduplicates_failure(self):
+        class RepairBlockingProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                from src.search.models import ProviderHit, ProviderResult
+                if search_query.query_id == "repair-1":
+                    time.sleep(0.25)
+                    return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
+                provider_hit = ProviderHit(
+                    "tavily",
+                    search_query.query_id,
+                    search_query.query_id,
+                    f"https://example.com/{search_query.query_id}",
+                    "正文",
+                    None,
+                    None,
+                    "正文",
+                    (),
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
+
+        original = DEFAULT_TIER_BUDGETS[SearchTier.STANDARD]
+        short_standard = SimpleNamespace(
+            max_initial_queries=original.max_initial_queries,
+            max_candidate_urls=original.max_candidate_urls,
+            max_content_reads=original.max_content_reads,
+            max_repair_queries=original.max_repair_queries,
+            max_total_queries=original.max_total_queries,
+            max_retrieval_rounds=original.max_retrieval_rounds,
+            hard_timeout_seconds=0.12,
+        )
+        budgets = dict(DEFAULT_TIER_BUDGETS)
+        budgets[SearchTier.STANDARD] = short_standard
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("standard")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topics=()),
+            providers=(RepairBlockingProvider(),),
+            extractor=_FakeExtractor(),
+        )
+        started = time.monotonic()
+
+        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", budgets):
+            result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.22)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertGreater(len(result.evidence.evidence_items), 0)
+        self.assertGreater(
+            sum(1 for item in result.evidence.evidence_items if item.citable), 0
+        )
+        self.assertIn("hard_deadline_exceeded", result.evidence.limitations)
+        self._assert_bundle_trace_mirror(result)
 
 
 class OrchestratorAccountingTests(unittest.TestCase):

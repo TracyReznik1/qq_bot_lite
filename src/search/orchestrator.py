@@ -7,6 +7,7 @@ import inspect
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import replace
+from threading import Lock
 from typing import Any, Callable, Sequence
 
 from src.config import config
@@ -33,10 +34,68 @@ from src.search.models import (
     TriggerCode,
 )
 from src.search.planner import SearchPlanner
-from src.search.providers import DDGSSearchProvider, ProviderRegistry, TavilySearchProvider
+from src.search.providers import (
+    DDGSSearchProvider,
+    ProviderRegistry,
+    TavilySearchProvider,
+)
+from src.search.providers.base import ProviderSearchOutcome
 from src.search.router import LLMRoutingAdvisor, RetrievalBenefitRouter
 
 logger = logging.getLogger("qq-bot")
+
+
+class _QueryAttemptTracker:
+    """Thread-safe, request-local adapter truth for one semantic query."""
+
+    def __init__(self, query: SearchQuery) -> None:
+        self.query = query
+        self._lock = Lock()
+        self._order: list[str] = []
+        self._started: dict[str, tuple[Any, float]] = {}
+        self._finished: dict[str, ProviderAttempt] = {}
+
+    def on_started(
+        self,
+        provider: str,
+        query: SearchQuery,
+        readiness: Any,
+        started_at: float,
+    ) -> None:
+        if query.query_id != self.query.query_id:
+            return
+        with self._lock:
+            if provider not in self._started:
+                self._order.append(provider)
+                self._started[provider] = (readiness, started_at)
+
+    def on_finished(self, attempt: ProviderAttempt) -> None:
+        with self._lock:
+            if attempt.provider in self._started:
+                self._finished[attempt.provider] = attempt
+
+    def snapshot(self, now: float) -> tuple[ProviderAttempt, ...]:
+        with self._lock:
+            attempts: list[ProviderAttempt] = []
+            for provider in self._order:
+                completed = self._finished.get(provider)
+                if completed is not None:
+                    attempts.append(completed)
+                    continue
+                readiness, started_at = self._started[provider]
+                attempts.append(
+                    ProviderAttempt(
+                        provider=provider,
+                        status=ProviderStatus.TIMEOUT,
+                        count=1,
+                        latency_ms=max(int((now - started_at) * 1000), 0),
+                        query_id=self.query.query_id,
+                        configured=readiness.configured,
+                        available=readiness.available,
+                        invocation_started=True,
+                    )
+                )
+            return tuple(attempts)
 
 
 class SearchOrchestrator:
@@ -146,19 +205,14 @@ class SearchOrchestrator:
                 ProviderStatus.NOT_CONFIGURED,
             )
             failure = _failure_for_status(status)
-            trace.degradation_reason = failure
-            evidence = None if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED else _empty_bundle(
+            return self._failure_result(
+                decision,
                 plan,
-                attempts=trace.provider_attempts,
-                retrieval_round_count=trace.retrieval_round_count,
-            )
-            trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
-            return SearchPipelineResult(
-                decision=decision,
-                plan=plan,
-                evidence=evidence,
-                trace=trace,
-                failure_code=failure,
+                trace,
+                started,
+                failure=failure,
+                bundle=None,
+                limitation=_limitation_for_failure(failure),
             )
 
         content_started = self._monotonic()
@@ -194,17 +248,14 @@ class SearchOrchestrator:
             result.status is ProviderStatus.SUCCESS and result.hits
             for result in provider_results
         ):
-            trace.degradation_reason = SearchFailureCode.CONTENT_UNREADABLE
-            return SearchPipelineResult(
-                decision=decision,
-                plan=plan,
-                evidence=_empty_bundle(
-                    plan,
-                    attempts=trace.provider_attempts,
-                    retrieval_round_count=trace.retrieval_round_count,
-                ),
-                trace=trace,
-                failure_code=SearchFailureCode.CONTENT_UNREADABLE,
+            return self._failure_result(
+                decision,
+                plan,
+                trace,
+                started,
+                failure=SearchFailureCode.CONTENT_UNREADABLE,
+                bundle=None,
+                limitation="content_unreadable",
             )
 
         gap_started = self._monotonic()
@@ -287,17 +338,14 @@ class SearchOrchestrator:
             )
 
         final_gap = self._assembler().analyze_gap(plan, bundle)
-        bundle = self._seal_bundle(
+        bundle = self._finalize_bundle(
             bundle,
             trace,
-            final_gap,
-            repair,
-            initial_canonical_urls,
+            started,
+            gap=final_gap,
+            repair=repair,
+            initial_canonical_urls=initial_canonical_urls,
         )
-
-        trace.evidence_state = bundle.evidence_state
-        trace.citable_evidence_count = sum(1 for item in bundle.evidence_items if item.citable)
-        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
 
         failure_code = _failure_for_state(bundle.evidence_state)
         return SearchPipelineResult(
@@ -350,69 +398,87 @@ class SearchOrchestrator:
         results: list[ProviderResult] = []
         if not queries:
             return results
-        dispatch_started = self._monotonic()
         executor = ThreadPoolExecutor(max_workers=min(len(queries), 4), thread_name_prefix="search-provider")
-        futures: dict[Any, SearchQuery] = {}
-        has_available_provider = any(
-            provider.readiness().available for provider in self._providers
-        )
+        futures: dict[Any, _QueryAttemptTracker] = {}
+        outcomes: dict[_QueryAttemptTracker, ProviderSearchOutcome] = {}
         try:
             for query in queries:
                 remaining = self._remaining(deadline)
                 if remaining <= 0:
                     break
-                trace.executed_queries = (*trace.executed_queries, (query.query_id, query.purpose))
-                if has_available_provider:
-                    trace.provider_invocation_started = True
+                tracker = _QueryAttemptTracker(query)
                 future = executor.submit(
                     self._search_one,
                     query,
                     decision,
-                    min(config.request_timeout, remaining),
+                    deadline,
+                    tracker,
                 )
-                futures[future] = query
+                futures[future] = tracker
             try:
                 for future in as_completed(futures, timeout=self._remaining(deadline)):
-                    query = futures[future]
+                    tracker = futures[future]
                     try:
-                        result = future.result()
+                        outcome = future.result()
                     except Exception:
-                        logger.debug("query dispatch failed for %s", query.query_id, exc_info=True)
-                        result = ProviderResult("tavily", ProviderStatus.ERROR, (), 0)
-                    self._record_provider_result(trace, result)
-                    results.append(result)
+                        logger.debug(
+                            "query dispatch failed for %s",
+                            tracker.query.query_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if isinstance(outcome, ProviderSearchOutcome):
+                        outcomes[tracker] = outcome
             except FuturesTimeoutError:
-                trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
-                for future, query in futures.items():
+                for future in futures:
                     if future.done():
                         continue
                     future.cancel()
-                    provider = self._first_available_provider_name()
-                    timeout_attempt = ProviderAttempt(
-                        provider,
-                        ProviderStatus.TIMEOUT,
-                        1,
-                        self._elapsed_ms(dispatch_started),
-                        query_id=query.query_id,
-                    )
-                    trace.provider_attempts = (*trace.provider_attempts, timeout_attempt)
-                results.append(ProviderResult("tavily", ProviderStatus.TIMEOUT, (), 0))
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        observed_at = self._monotonic()
+        for future, tracker in futures.items():
+            outcome = outcomes.get(tracker)
+            if outcome is None and future.done() and not future.cancelled():
+                try:
+                    completed = future.result(timeout=0)
+                except Exception:
+                    completed = None
+                if isinstance(completed, ProviderSearchOutcome):
+                    outcome = completed
+            attempts = outcome.attempts if outcome is not None else tracker.snapshot(observed_at)
+            if attempts:
+                self._record_query_attempts(trace, tracker.query, attempts)
+            if outcome is not None:
+                results.append(outcome.result)
+            elif attempts:
+                last = attempts[-1]
+                results.append(
+                    ProviderResult(
+                        provider=last.provider,
+                        status=ProviderStatus.TIMEOUT,
+                        hits=(),
+                        latency_ms=sum(attempt.latency_ms for attempt in attempts),
+                    )
+                )
         return results
 
     def _search_one(
         self,
         query: SearchQuery,
         decision: Any,
-        timeout: float,
-    ) -> ProviderResult:
+        deadline: float,
+        tracker: _QueryAttemptTracker,
+    ) -> ProviderSearchOutcome:
         max_results = max(int(config.search_max_results or 1), 1)
-        return self._registry.search(
+        return self._registry.search_with_attempts(
             query,
             tier=decision.route,
             max_results=max_results,
-            timeout_seconds=timeout,
+            timeout_seconds=min(config.request_timeout, self._remaining(deadline)),
+            on_attempt_started=tracker.on_started,
+            on_attempt_finished=tracker.on_finished,
         )
 
     def _extract_candidates(
@@ -550,8 +616,18 @@ class SearchOrchestrator:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    def _record_provider_result(self, trace: SearchTrace, result: Any) -> None:
-        for attempt in getattr(result, "attempts", ()):
+    def _record_query_attempts(
+        self,
+        trace: SearchTrace,
+        query: SearchQuery,
+        attempts: Sequence[ProviderAttempt],
+    ) -> None:
+        if not attempts:
+            return
+        executed = (query.query_id, query.purpose)
+        if executed not in trace.executed_queries:
+            trace.executed_queries = (*trace.executed_queries, executed)
+        for attempt in attempts:
             trace.provider_attempts = (*trace.provider_attempts, attempt)
             if attempt.invocation_started:
                 trace.provider_invocation_started = True
@@ -560,12 +636,6 @@ class SearchOrchestrator:
                     *trace.provider_failures,
                     _failure_for_status(attempt.status),
                 )
-
-    def _first_available_provider_name(self) -> str:
-        for provider in self._providers:
-            if provider.readiness().available:
-                return provider.name
-        return "tavily"
 
     def _assembler_with_rejecting_judge(self) -> EvidenceAssembler:
         class _RejectingJudge:
@@ -589,11 +659,103 @@ class SearchOrchestrator:
         )
         return replace(
             bundle,
+            request_id=trace.request_id,
             attempts=trace.provider_attempts,
             initial_evidence_ids=initial_ids,
             gap_analysis=gap,
             repair_plan=repair,
             retrieval_round_count=trace.retrieval_round_count,
+        )
+
+    def _finalize_bundle(
+        self,
+        bundle: EvidenceBundle,
+        trace: SearchTrace,
+        started: float,
+        *,
+        gap: Any = None,
+        repair: RepairPlan | None = None,
+        initial_canonical_urls: set[str] | None = None,
+    ) -> EvidenceBundle:
+        bundle = self._seal_bundle(
+            bundle,
+            trace,
+            gap if gap is not None else bundle.gap_analysis,
+            repair if repair is not None else bundle.repair_plan,
+            initial_canonical_urls
+            if initial_canonical_urls is not None
+            else {item.canonical_url for item in bundle.evidence_items if item.canonical_url},
+        )
+        trace.provider_failures = tuple(dict.fromkeys(trace.provider_failures))
+        trace.evidence_state = bundle.evidence_state
+        trace.citable_evidence_count = sum(
+            1 for item in bundle.evidence_items if item.citable
+        )
+        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
+        return bundle
+
+    def _failure_result(
+        self,
+        decision: Any,
+        plan: SearchPlan,
+        trace: SearchTrace,
+        started: float,
+        *,
+        failure: SearchFailureCode,
+        bundle: EvidenceBundle | None,
+        limitation: str,
+        gap: Any = None,
+        repair: RepairPlan | None = None,
+        initial_canonical_urls: set[str] | None = None,
+    ) -> SearchPipelineResult:
+        if failure in {
+            SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            SearchFailureCode.PROVIDER_UNAVAILABLE,
+            SearchFailureCode.PROVIDER_TIMEOUT,
+            SearchFailureCode.NO_RESULTS,
+        }:
+            trace.provider_failures = (*trace.provider_failures, failure)
+        trace.provider_failures = tuple(dict.fromkeys(trace.provider_failures))
+        trace.degradation_reason = failure
+
+        if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED and bundle is None:
+            trace.evidence_state = None
+            trace.citable_evidence_count = 0
+            trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
+            return SearchPipelineResult(
+                decision=decision,
+                plan=plan,
+                evidence=None,
+                trace=trace,
+                failure_code=failure,
+            )
+
+        if bundle is None:
+            bundle = _empty_bundle(
+                plan,
+                attempts=trace.provider_attempts,
+                retrieval_round_count=trace.retrieval_round_count,
+                limitation=limitation,
+            )
+        else:
+            bundle = replace(
+                bundle,
+                limitations=tuple(dict.fromkeys((*bundle.limitations, limitation))),
+            )
+        bundle = self._finalize_bundle(
+            bundle,
+            trace,
+            started,
+            gap=gap,
+            repair=repair,
+            initial_canonical_urls=initial_canonical_urls,
+        )
+        return SearchPipelineResult(
+            decision=decision,
+            plan=plan,
+            evidence=bundle,
+            trace=trace,
+            failure_code=failure,
         )
 
     def _timeout_result(
@@ -608,40 +770,17 @@ class SearchOrchestrator:
         repair: RepairPlan | None = None,
         initial_canonical_urls: set[str] | None = None,
     ) -> SearchPipelineResult:
-        trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
-        trace.degradation_reason = SearchFailureCode.PROVIDER_TIMEOUT
-        trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
-        if bundle is None:
-            bundle = _empty_bundle(
-                plan,
-                attempts=trace.provider_attempts,
-                retrieval_round_count=trace.retrieval_round_count,
-                limitation="hard_deadline_exceeded",
-            )
-        else:
-            bundle = replace(
-                bundle,
-                evidence_state=EvidenceState.INSUFFICIENT,
-                missing_claim_topics=tuple(plan.required_topics) or ("material_claim",),
-                limitations=tuple(dict.fromkeys((*bundle.limitations, "hard_deadline_exceeded"))),
-            )
-            bundle = self._seal_bundle(
-                bundle,
-                trace,
-                gap if gap is not None else bundle.gap_analysis,
-                repair if repair is not None else bundle.repair_plan,
-                initial_canonical_urls
-                if initial_canonical_urls is not None
-                else {item.canonical_url for item in bundle.evidence_items if item.canonical_url},
-            )
-        trace.evidence_state = EvidenceState.INSUFFICIENT
-        trace.citable_evidence_count = 0
-        return SearchPipelineResult(
-            decision=decision,
-            plan=plan,
-            evidence=bundle,
-            trace=trace,
-            failure_code=SearchFailureCode.PROVIDER_TIMEOUT,
+        return self._failure_result(
+            decision,
+            plan,
+            trace,
+            started,
+            failure=SearchFailureCode.PROVIDER_TIMEOUT,
+            bundle=bundle,
+            limitation="hard_deadline_exceeded",
+            gap=gap,
+            repair=repair,
+            initial_canonical_urls=initial_canonical_urls,
         )
 
     def _remaining(self, deadline: float) -> float:
@@ -702,6 +841,16 @@ def _failure_for_state(state: EvidenceState) -> SearchFailureCode | None:
     }.get(state)
 
 
+def _limitation_for_failure(failure: SearchFailureCode) -> str:
+    return {
+        SearchFailureCode.PROVIDER_NOT_CONFIGURED: "provider_not_configured",
+        SearchFailureCode.PROVIDER_UNAVAILABLE: "provider_unavailable",
+        SearchFailureCode.PROVIDER_TIMEOUT: "hard_deadline_exceeded",
+        SearchFailureCode.NO_RESULTS: "no_results",
+        SearchFailureCode.CONTENT_UNREADABLE: "content_unreadable",
+    }.get(failure, "retrieval_failure")
+
+
 def _empty_bundle(
     plan: SearchPlan,
     *,
@@ -710,18 +859,19 @@ def _empty_bundle(
     limitation: str = "provider_failure",
 ) -> EvidenceBundle:
     from src.search.models import EvidenceGapAnalysis, RepairPlan
+    missing = tuple(plan.required_topics) or ("material_claim",)
     return EvidenceBundle(
         request_id="req-empty",
         decision=plan.decision,
         plan=plan,
         attempts=tuple(attempts),
         initial_evidence_ids=(),
-        gap_analysis=EvidenceGapAnalysis((), (), False, None, ()),
+        gap_analysis=EvidenceGapAnalysis(missing, (), False, None, ()),
         repair_plan=RepairPlan(False, (), None),
         retrieval_round_count=retrieval_round_count,
         evidence_items=(),
         evidence_state=EvidenceState.INSUFFICIENT,
-        missing_claim_topics=tuple(plan.required_topics),
+        missing_claim_topics=missing,
         weak_source_topics=(),
         conflict_groups=(),
         limitations=(limitation,),
