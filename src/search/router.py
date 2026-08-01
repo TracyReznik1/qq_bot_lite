@@ -291,9 +291,97 @@ _HIGH_CONSEQUENCE_ACTION_PHRASES = (
     "现在卖",
 )
 
+_MEDICATION_ADMINISTRATION_MARKERS = (
+    "吃多少",
+    "该吃多少",
+    "每天吃",
+    "用量",
+    "剂量",
+    "服用",
+    "怎么吃",
+    "能不能吃",
+    "停药",
+    "加量",
+    "减量",
+)
+
+_MEDICATION_CONTEXT_MARKERS = (
+    "药",
+    "布洛芬",
+    "阿司匹林",
+    "抗生素",
+    "退烧",
+    "发烧",
+)
+
+_ACUTE_SYMPTOM_MARKERS = (
+    "胸口疼",
+    "胸痛",
+    "呼吸困难",
+    "喘不过气",
+    "昏迷",
+    "抽搐",
+    "大出血",
+    "高烧",
+    "发烧39",
+    "发烧40",
+    "严重过敏",
+    "意识不清",
+)
+
+_URGENT_HELP_MARKERS = (
+    "怎么办",
+    "要不要去医院",
+    "需要急诊",
+    "立刻",
+    "马上",
+    "紧急",
+)
+
+_CHEMICAL_EXPOSURE_MARKERS = (
+    "清洁剂",
+    "漂白剂",
+    "消毒液",
+    "农药",
+    "强酸",
+    "强碱",
+    "化学品",
+    "洗涤剂",
+)
+
+_EXPOSURE_ROUTE_MARKERS = (
+    "溅进眼",
+    "进眼睛",
+    "眼睛",
+    "吸入",
+    "吸进去",
+    "误吞",
+    "吞下",
+    "喝了",
+    "入口",
+)
+
+
+def _has_actionable_high_consequence_signal(question: str) -> bool:
+    """Recognize concrete safety actions without treating domain words alone as urgent."""
+    lowered = question.casefold()
+    medication_action = any(marker in lowered for marker in _MEDICATION_ADMINISTRATION_MARKERS)
+    medication_context = any(marker in lowered for marker in _MEDICATION_CONTEXT_MARKERS)
+    if medication_action and medication_context:
+        return True
+    if any(marker in lowered for marker in _ACUTE_SYMPTOM_MARKERS) and any(
+        marker in lowered for marker in _URGENT_HELP_MARKERS
+    ):
+        return True
+    return any(marker in lowered for marker in _CHEMICAL_EXPOSURE_MARKERS) and any(
+        marker in lowered for marker in _EXPOSURE_ROUTE_MARKERS
+    )
+
 
 def _detect_personalized_high_consequence(question: str) -> TriggerCode | None:
     lowered = question.casefold()
+    if _has_actionable_high_consequence_signal(question):
+        return TriggerCode.HIGH_CONSEQUENCE_ACTION
     personal = any(marker in lowered for marker in _PERSONAL_MARKERS)
     domain = any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS)
     if personal and domain:
@@ -975,6 +1063,8 @@ def _conservative_uncertain_floor(question: str) -> SearchTier | None:
     """When the classifier fails, requests that touch high-consequence or
     current-state domains must not be silently under-routed to light."""
     lowered = question.casefold()
+    if _has_actionable_high_consequence_signal(question):
+        return SearchTier.DEEP
     if any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS):
         if any(phrase in lowered for phrase in _HIGH_CONSEQUENCE_ACTION_PHRASES):
             return SearchTier.DEEP

@@ -226,6 +226,14 @@ class PlannerRedactionTests(unittest.TestCase):
         self.assertNotIn("data:image", joined)
         self.assertNotIn("base64", joined)
 
+    def test_cq_and_data_url_redactions_have_explicit_audit_codes(self):
+        plan = self._plan("[CQ:image,file=x.png] data:image/png;base64,AAAA 什么是光合作用")
+        joined = " ".join(query.text for query in plan.initial_queries)
+        self.assertNotIn("CQ:", joined)
+        self.assertNotIn("data:image", joined)
+        self.assertIn("cq_control_code", plan.query_redaction_codes)
+        self.assertIn("data_url", plan.query_redaction_codes)
+
     def test_removes_api_keys(self):
         plan = self._plan("API密钥 AIzaSyExampleKey123 是什么")
         joined = " ".join(q.text for q in plan.initial_queries)
@@ -283,6 +291,18 @@ class PlannerRedactionTests(unittest.TestCase):
         repair = planner.plan_repair(plan, gap(missing=("13800138000 是什么号码",)))
         if repair.triggered:
             self.assertNotIn("13800138000", repair.repair_query.text)
+
+    def test_repair_redaction_codes_are_request_scoped_and_auditable(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan = planner.plan(request("什么是光合作用"), standard_decision())
+        repair = planner.plan_repair(plan, gap(missing=("回调签名 abcdef123456 如何处理",)))
+        self.assertTrue(repair.triggered)
+        self.assertNotIn("abcdef123456", repair.repair_query.text)
+        self.assertIn("callback_secret", repair.query_redaction_codes)
+
+        unrelated_plan = planner.plan(request("什么是光合作用"), standard_decision())
+        unrelated_repair = planner.plan_repair(unrelated_plan, gap(missing=("证据缺口",)))
+        self.assertNotIn("callback_secret", unrelated_repair.query_redaction_codes)
 
 
 class PlannerDomainValidationTests(unittest.TestCase):
@@ -394,6 +414,33 @@ class PlannerDegradationTests(unittest.TestCase):
         )
         plan = planner.plan(request("北京今天有什么新闻"), d)
         self.assertIn(QueryPurpose.TIME_BOUNDED, {q.purpose for q in plan.initial_queries})
+
+    def test_deep_high_freshness_replaces_a_full_model_slot_with_time_bounded_query(self):
+        model = StaticPlannerModel(
+            {
+                "planning_status": "normal",
+                "entities": [],
+                "initial_queries": [
+                    {"purpose": "primary", "text": f"北京新闻来源 {index}"}
+                    for index in range(5)
+                ],
+            }
+        )
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
+            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
+            True, Freshness.HIGH, RiskLevel.LOW,
+            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
+            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
+            SearchTier.DEEP, None, (),
+        )
+        plan = planner.plan(request("北京今天有什么新闻"), d)
+        self.assertEqual(len(plan.initial_queries), plan.budget.max_initial_queries)
+        self.assertEqual(plan.initial_queries[0].text, "北京今天有什么新闻")
+        time_bounded = [query for query in plan.initial_queries if query.purpose is QueryPurpose.TIME_BOUNDED]
+        self.assertEqual(len(time_bounded), 1)
+        self.assertEqual(time_bounded[0].date_from, date(2026, 7, 29))
+        self.assertEqual(time_bounded[0].date_to, date(2026, 7, 29))
 
 
 class PlannerQueryCapTests(unittest.TestCase):

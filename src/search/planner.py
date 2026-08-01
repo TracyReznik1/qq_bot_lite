@@ -140,12 +140,16 @@ def _query_fingerprint(text: str) -> str:
 def redact_query_text(text: str) -> _NormalizedQuery:
     original = str(text or "")
     original = _strip_context_prefixes(original)
-    original = _CQ_CODE_PATTERN.sub(" ", original)
-    original = _DATA_URL_PATTERN.sub(" ", original)
     removed: list[str] = []
+    original, cq_control_count = _CQ_CODE_PATTERN.subn(" ", original)
+    if cq_control_count:
+        removed.append("cq_control_code")
+    original, data_url_count = _DATA_URL_PATTERN.subn(" ", original)
+    if data_url_count:
+        removed.append("data_url")
 
-    original = _CALLBACK_SECRET_PATTERN.sub(" ", original)
-    if "callback" in original.casefold() or "签名" in original or "signature" in original.casefold():
+    original, callback_secret_count = _CALLBACK_SECRET_PATTERN.subn(" ", original)
+    if callback_secret_count:
         removed.append("callback_secret")
 
     matched_otp = _OTP_PATTERN.search(original)
@@ -435,25 +439,30 @@ class SearchPlanner:
                 )
             )
 
-        # Enforce the required time-bounded freshness query for deep dynamic plans.
-        if (
+        needs_time_bounded_query = (
             decision.route is SearchTier.DEEP
             and decision.freshness is Freshness.HIGH
             and not any(q.purpose is QueryPurpose.TIME_BOUNDED for q in redacted_queries)
-        ):
+        )
+        if needs_time_bounded_query:
             today = self._today()
-            redacted_queries.append(
-                SearchQuery(
-                    query_id=f"initial-{len(redacted_queries) + 1}",
-                    round_kind=SearchRoundKind.INITIAL,
-                    purpose=QueryPurpose.TIME_BOUNDED,
-                    text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
-                    date_from=today,
-                    date_to=today,
-                )
+            time_bounded = SearchQuery(
+                query_id=f"initial-{budget.max_initial_queries}",
+                round_kind=SearchRoundKind.INITIAL,
+                purpose=QueryPurpose.TIME_BOUNDED,
+                text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
+                date_from=today,
+                date_to=today,
             )
-
-        redacted_queries = redacted_queries[: budget.max_initial_queries]
+            if len(redacted_queries) >= budget.max_initial_queries:
+                # Preserve the original direct question (especially CJK/no-space
+                # text) and deterministically reserve the final slot for time.
+                redacted_queries = redacted_queries[: budget.max_initial_queries]
+                redacted_queries[-1] = time_bounded
+            else:
+                redacted_queries.append(time_bounded)
+        else:
+            redacted_queries = redacted_queries[: budget.max_initial_queries]
 
         status = _planning_status(payload, direct_degraded or degraded_due_to_model)
         entities = _string_list(payload.get("entities"))
@@ -507,6 +516,7 @@ class SearchPlanner:
             triggered=True,
             gap_codes=gap.repair_reason_codes,
             repair_query=repair_query,
+            query_redaction_codes=codes,
         )
 
     # ── helpers ─────────────────────────────────────────────────────

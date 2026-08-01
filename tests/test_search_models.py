@@ -358,6 +358,8 @@ class SearchModelContractTests(unittest.TestCase):
             provider_invocation_started=True,
             content_read_count=2,
         )
+        trace.initial_query_redaction_codes = ("cq_control_code", "data_url")
+        trace.adaptive_repair_redaction_codes = ("callback_secret",)
 
         logged = trace.to_log_dict()
         self.assertEqual(2, logged["semantic_query_count"])
@@ -368,6 +370,8 @@ class SearchModelContractTests(unittest.TestCase):
             {"query_id": "repair-1", "purpose": "repair"},
             logged["adaptive_repair_query"],
         )
+        self.assertEqual(["cq_control_code", "data_url"], logged.get("initial_query_redaction_codes"))
+        self.assertEqual(["callback_secret"], logged.get("adaptive_repair_redaction_codes"))
         self.assertNotIn("question", logged)
         self.assertNotIn("answer", logged)
         payload = json.dumps(logged).lower()

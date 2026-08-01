@@ -414,9 +414,14 @@ class RepairPlan:
     triggered: bool
     gap_codes: tuple[str, ...]
     repair_query: SearchQuery | None
+    query_redaction_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, gap_codes=_strings(self.gap_codes, "gap_codes"))
+        _normalize_fields(
+            self,
+            gap_codes=_strings(self.gap_codes, "gap_codes"),
+            query_redaction_codes=_strings(self.query_redaction_codes, "query_redaction_codes"),
+        )
         if self.triggered != (self.repair_query is not None):
             raise ValueError("repair_query must be present exactly when repair is triggered")
 
@@ -682,6 +687,8 @@ class SearchTrace:
     initial_round_started: bool = False
     adaptive_repair_round_started: bool = False
     adaptive_repair_query: SearchQuery | tuple[str, QueryPurpose] | None = None
+    initial_query_redaction_codes: tuple[str, ...] = ()
+    adaptive_repair_redaction_codes: tuple[str, ...] = ()
     retrieval_round_count: int = 0
     executed_queries: tuple[SearchQuery | tuple[str, QueryPurpose], ...] = ()
     provider_configured: bool = False
@@ -720,6 +727,12 @@ class SearchTrace:
         self.executed_queries = _tuple(self.executed_queries)
         self.provider_attempts = _tuple(self.provider_attempts)
         self.provider_failures = _tuple(self.provider_failures)
+        self.initial_query_redaction_codes = _strings(
+            self.initial_query_redaction_codes, "initial_query_redaction_codes"
+        )
+        self.adaptive_repair_redaction_codes = _strings(
+            self.adaptive_repair_redaction_codes, "adaptive_repair_redaction_codes"
+        )
         for attempt in self.provider_attempts:
             if not isinstance(attempt, ProviderAttempt):
                 raise TypeError("provider_attempts must contain ProviderAttempt values")
@@ -740,6 +753,8 @@ class SearchTrace:
             "initial_round_started": self.initial_round_started,
             "adaptive_repair_round_started": self.adaptive_repair_round_started,
             "adaptive_repair_query": _query_metadata(self.adaptive_repair_query),
+            "initial_query_redaction_codes": self.initial_query_redaction_codes,
+            "adaptive_repair_redaction_codes": self.adaptive_repair_redaction_codes,
             "retrieval_round_count": self.retrieval_round_count,
             "executed_queries": [_query_metadata(query) for query in self.executed_queries],
             "provider_configured": self.provider_configured,

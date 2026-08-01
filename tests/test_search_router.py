@@ -198,6 +198,27 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         decision = decide("这种药每天吃多少剂量", NEUTRAL)
         self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
 
+    def test_advisor_failure_floors_actionable_medical_and_chemical_requests_at_deep(self):
+        # Removing the conservative safety signal must make these fall back to
+        # light when the advisor returns no usable classification.
+        cases = (
+            "我发烧39度，该吃多少布洛芬？",
+            "我胸口疼得厉害怎么办？",
+            "这个清洁剂溅进眼睛怎么办？",
+        )
+        for question in cases:
+            with self.subTest(question=question):
+                decision = decide(question, {})
+                self.assertIs(decision.route, SearchTier.DEEP)
+
+    def test_advisor_failure_keeps_stable_regulated_definitions_standard(self):
+        # These are concepts, not personal or urgent action requests. A domain
+        # word alone must not promote them to deep.
+        for question in ("什么是疫苗？", "什么是民法？", "什么是基金？"):
+            with self.subTest(question=question):
+                decision = decide(question, {})
+                self.assertIs(decision.route, SearchTier.STANDARD)
+
     def test_stable_version_definition_is_not_deep(self):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)

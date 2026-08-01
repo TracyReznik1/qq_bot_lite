@@ -103,6 +103,7 @@ class SearchOrchestrator:
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
         trace.initial_query_count = len(plan.initial_queries)
         trace.executed_queries = _query_metadata(plan.initial_queries)
+        trace.initial_query_redaction_codes = plan.query_redaction_codes
 
         trace.provider_configured = any(
             provider.readiness().configured for provider in self._providers
@@ -181,6 +182,7 @@ class SearchOrchestrator:
                 repair_already_planned = True
                 trace.adaptive_repair_round_started = True
                 trace.adaptive_repair_query = (repair.repair_query.query_id, repair.repair_query.purpose)
+                trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
                 trace.retrieval_round_count = 2
                 repair_result = self._run_repair_query(
                     repair,
