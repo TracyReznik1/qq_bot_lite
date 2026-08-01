@@ -114,6 +114,7 @@ class ProviderRegistry:
         """Search with immutable, request-local attempt truth for orchestration."""
         attempts: list[ProviderAttempt] = []
         scheduled_result: ProviderResult | None = None
+        scheduled_attempt: ProviderAttempt | None = None
         duration = max(float(timeout_seconds), 0.0)
         deadline = time.monotonic() + duration
         if duration <= 0:
@@ -143,6 +144,7 @@ class ProviderRegistry:
                 on_attempt_finished=on_attempt_finished,
             )
             scheduled_result = result
+            scheduled_attempt = attempt
             if attempt is not None:
                 attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
@@ -161,14 +163,26 @@ class ProviderRegistry:
                 on_attempt_finished=on_attempt_finished,
             )
             scheduled_result = result
+            scheduled_attempt = attempt
             if attempt is not None:
                 attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
                 return self._outcome(result, attempts)
 
+        if scheduled_result is not None and scheduled_attempt is None:
+            return ProviderSearchOutcome(
+                ProviderResult(
+                    provider=scheduled_result.provider,
+                    status=scheduled_result.status,
+                    hits=scheduled_result.hits,
+                    latency_ms=(
+                        sum(attempt.latency_ms for attempt in attempts)
+                        + scheduled_result.latency_ms
+                    ),
+                ),
+                tuple(attempts),
+            )
         if not attempts:
-            if scheduled_result is not None:
-                return ProviderSearchOutcome(scheduled_result, ())
             # No adapter was actually invoked: this is a readiness failure, not
             # an attempted invocation.
             return ProviderSearchOutcome(

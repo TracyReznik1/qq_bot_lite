@@ -554,7 +554,9 @@ def _registrable_domain(domain: str | None) -> str | None:
 
 
 def _normalized_identity(value: str | None) -> str:
-    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+    """Normalize human provenance with NFC, not compatibility-folding NFKC."""
+    normalized = unicodedata.normalize("NFC", str(value or "")).casefold()
+    return "".join(character for character in normalized if character.isalnum())
 
 
 def _publisher_of(candidate: EvidenceCandidate, verdict: Mapping[str, Any]) -> str | None:
@@ -594,7 +596,9 @@ def _provenance_of(
         prefix, separator, raw_value = flag.partition(":")
         if not separator or prefix not in {"canonical_source", "syndication_source"}:
             continue
-        marker = " ".join(raw_value.strip().casefold().split())
+        marker = " ".join(
+            unicodedata.normalize("NFC", raw_value.strip()).casefold().split()
+        )
         if marker:
             keys.add(f"{prefix}:{marker}")
     return _Provenance(

@@ -503,6 +503,113 @@ class RegistryTests(unittest.TestCase):
         self.assertGreaterEqual(outcome.attempts[1].latency_ms, 35)
         self.assertLess(outcome.attempts[1].latency_ms, 150)
 
+    def test_primary_error_then_queued_fallback_timeout_dominates_without_synthetic_attempt(self):
+        result, primary, fallback, started, finished, callback_counts = (
+            self._primary_error_then_queued_fallback(public=False)
+        )
+
+        self.assertEqual(result.status, ProviderStatus.TIMEOUT)
+        self.assertEqual(primary.calls, ["q1"])
+        self.assertEqual(fallback.calls, [])
+        self.assertEqual(
+            [(attempt.provider, attempt.status) for attempt in result.attempts],
+            [("tavily", ProviderStatus.ERROR)],
+        )
+        self.assertEqual([provider for provider, _query_id in started], ["tavily"])
+        self.assertEqual([attempt.provider for attempt in finished], ["tavily"])
+        self.assertEqual((len(started), len(finished)), callback_counts)
+
+    def test_public_search_reports_queued_fallback_timeout_after_primary_error(self):
+        result, primary, fallback, _started, _finished, _callback_counts = (
+            self._primary_error_then_queued_fallback(public=True)
+        )
+
+        self.assertIsInstance(result, ProviderResult)
+        self.assertEqual(result.status, ProviderStatus.TIMEOUT)
+        self.assertEqual(result.hits, ())
+        self.assertEqual(primary.calls, ["q1"])
+        self.assertEqual(fallback.calls, [])
+
+    def _primary_error_then_queued_fallback(self, *, public):
+        release_workers = threading.Event()
+        seven_workers_started = threading.Event()
+        worker_lock = threading.Lock()
+        started_workers = 0
+
+        def occupy_worker():
+            nonlocal started_workers
+            with worker_lock:
+                started_workers += 1
+                if started_workers == 7:
+                    seven_workers_started.set()
+            release_workers.wait(timeout=2.0)
+
+        blockers = [self.base._ADAPTER_EXECUTOR.submit(occupy_worker) for _ in range(7)]
+        self.assertTrue(seven_workers_started.wait(timeout=1.0))
+        queued_blockers = []
+        adapter_executor = self.base._ADAPTER_EXECUTOR
+
+        class ErrorPrimary:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                queued_blockers.append(
+                    adapter_executor.submit(occupy_worker)
+                )
+                return _provider_result(status=ProviderStatus.ERROR)
+
+        class QueuedFallback:
+            name = "ddgs"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                return _provider_result("ddgs", query_id=search_query.query_id)
+
+        primary = ErrorPrimary()
+        fallback = QueuedFallback()
+        registry = self._registry(primary, fallback)
+        started = []
+        finished = []
+        try:
+            if public:
+                result = registry.search(
+                    query(),
+                    tier=SearchTier.LIGHT,
+                    max_results=1,
+                    timeout_seconds=0.08,
+                )
+            else:
+                result = registry.search_with_attempts(
+                    query(),
+                    tier=SearchTier.LIGHT,
+                    max_results=1,
+                    timeout_seconds=0.08,
+                    on_attempt_started=lambda provider, search_query, _readiness, _started: (
+                        started.append((provider, search_query.query_id))
+                    ),
+                    on_attempt_finished=lambda attempt: finished.append(attempt),
+                )
+            callback_counts = (len(started), len(finished))
+        finally:
+            release_workers.set()
+            for blocker in (*blockers, *queued_blockers):
+                blocker.result(timeout=1.0)
+        time.sleep(0.02)
+        return result, primary, fallback, started, finished, callback_counts
+
     def test_no_usable_tavily_falls_back_to_ddgs(self):
         # An available-but-erroring primary triggers the DDGS availability fallback.
         tavily = mock.Mock()

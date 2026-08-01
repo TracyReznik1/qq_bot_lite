@@ -466,6 +466,115 @@ class EvidenceDedupTests(unittest.TestCase):
                     1,
                 )
 
+    def test_nfc_and_nfd_publishers_are_one_provenance_group_in_both_orders(self):
+        nfc = "ガイド社"
+        nfd = "カ\u3099イト\u3099社"
+
+        for first_publisher, second_publisher in ((nfc, nfd), (nfd, nfc)):
+            with self.subTest(first=first_publisher, second=second_publisher):
+                bundle = self._deep_bridge_bundle(
+                    (
+                        (
+                            "https://primary.example/report",
+                            first_publisher,
+                            (),
+                            "主来源说明当前动态事实。",
+                        ),
+                        (
+                            "https://independent.invalid/report",
+                            second_publisher,
+                            (),
+                            "第二页面采用完全不同的措辞。",
+                        ),
+                    )
+                )
+
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    1,
+                )
+                self.assertIn("single_source_authority", bundle.limitations)
+
+    def test_publisher_nfc_normalization_preserves_meaningful_distinctions(self):
+        distinct_publishers = (
+            ("カ\u3099イト\u3099社", "カイト社"),
+            ("Ｅｘａｍｐｌｅ Ｏｒｇ", "Example Org"),
+        )
+
+        for first_publisher, second_publisher in distinct_publishers:
+            with self.subTest(first=first_publisher, second=second_publisher):
+                bundle = self._deep_bridge_bundle(
+                    (
+                        (
+                            "https://primary.example/report",
+                            first_publisher,
+                            (),
+                            "主来源说明当前动态事实。",
+                        ),
+                        (
+                            "https://independent.invalid/report",
+                            second_publisher,
+                            (),
+                            "第二页面采用完全不同的措辞。",
+                        ),
+                    )
+                )
+
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    2,
+                )
+                self.assertNotIn("single_source_authority", bundle.limitations)
+
+    def test_provenance_markers_use_nfc_without_nfkc_compatibility_folding(self):
+        nfc = "ガイド社"
+        nfd = "カ\u3099イト\u3099社"
+
+        for prefix in ("canonical_source", "syndication_source"):
+            with self.subTest(prefix=prefix, equivalence="nfc_nfd"):
+                bundle = self._deep_bridge_bundle(
+                    (
+                        (
+                            "https://primary.example/report",
+                            "Primary Publisher",
+                            (f"{prefix}:{nfc}",),
+                            "主来源说明当前动态事实。",
+                        ),
+                        (
+                            "https://independent.invalid/report",
+                            "Independent Publisher",
+                            (f"{prefix}:{nfd}",),
+                            "第二页面采用完全不同的措辞。",
+                        ),
+                    )
+                )
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    1,
+                )
+
+            with self.subTest(prefix=prefix, equivalence="fullwidth_ascii"):
+                bundle = self._deep_bridge_bundle(
+                    (
+                        (
+                            "https://primary.example/report",
+                            "Primary Publisher",
+                            (f"{prefix}:Ｅｘａｍｐｌｅ Ｏｒｇ",),
+                            "主来源说明当前动态事实。",
+                        ),
+                        (
+                            "https://independent.invalid/report",
+                            "Independent Publisher",
+                            (f"{prefix}:Example Org",),
+                            "第二页面采用完全不同的措辞。",
+                        ),
+                    )
+                )
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    2,
+                )
+
     def _deep_bridge_bundle(self, specs):
         judged = {
             f"C{index}": judge_ok(
