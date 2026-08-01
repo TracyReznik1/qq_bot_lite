@@ -301,12 +301,17 @@ class _SafetySpan:
 @dataclass(frozen=True)
 class _SafetyView:
     normalized_text: str
+    context_text: str
     active_text: str
     quoted_spans: tuple[_SafetySpan, ...]
     negated_spans: tuple[_SafetySpan, ...]
+    meta_spans: tuple[_SafetySpan, ...]
+    absence_spans: tuple[_SafetySpan, ...]
 
 
-_QUOTE_PAIRS = {"“": "”", "‘": "’", "「": "」", "『": "』", "《": "》"}
+_QUOTE_PAIRS = {
+    "“": "”", "‘": "’", "「": "」", "『": "』", "《": "》", "【": "】",
+}
 _QUOTE_OPEN_FOR_CLOSE = {closer: opener for opener, closer in _QUOTE_PAIRS.items()}
 _SENTENCE_BOUNDARIES = "。！？!?；;\n"
 _QUOTE_META_MARKERS = (
@@ -316,18 +321,36 @@ _QUOTE_META_MARKERS = (
 _NEGATED_META_PATTERN = re.compile(
     r"(?:我)?(?:不是|并非)(?:在)?(?:问|咨询|询问|想知道).{0,80}?(?=[，,。；;！？!?]|$)"
 )
+_META_DECLARATION_PATTERN = re.compile(
+    r"(?:(?:是|作为|属于|用于|叫做|命名为).{0,12}(?:测试|示例|用例|标题|代码|文本|例句)|"
+    r"(?:测试|示例|用例|标题|代码|文本|例句).{0,6}(?:是|为|[:：])|"
+    r"(?:这个|该)?(?:标题|示例|测试用例|代码)(?:是|为|[:：]))"
+)
+_BACKTICK_SPAN_PATTERN = re.compile(r"(?P<ticks>`{1,3}).*?(?P=ticks)", re.DOTALL)
+_ABSENCE_RELATION_PATTERN = re.compile(
+    r"(?:(?:并)?(?:没有|没(?!法|能|敢|缓解|好转|改善|消失))|"
+    r"从来没有|从未|未曾|不曾)"
+    r"(?:出现|发生|经历|遭遇|接触到?|进入|吸入|误吞|误喝|误饮|喝下|饮下)?"
+)
+_RELATION_BOUNDARY_PATTERN = re.compile(r"[，,。；;！？!?\n]|但(?:是)?|不过|然而|却")
 
 _NUMBER_TOKEN = r"(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百两半几]+)"
-_ADMIN_PATTERN = re.compile(r"(?:口服|服用|服|吃|使用|用|注射|滴服)")
-_MEDICATION_CHANGE_PATTERN = re.compile(r"(?:停|换|加|减)(?:用|服|药)?")
+_ADMIN_PATTERN = re.compile(r"(?:口服|服用|服|吃|注射|滴服|用药|使用(?:这个|这种|该)?药)")
+_MEDICATION_CHANGE_PATTERN = re.compile(
+    r"(?:停(?!产|售|工)|停药|停服|加量|增量|减量|减药|换药)"
+)
 _GENERIC_MEDICATION_PATTERN = re.compile(
-    r"(?:(?:这个|这种|该)?药(?:物|品)?|处方药|非处方药|胶囊|片剂|口服液|针剂|滴眼液)"
+    r"(?:(?:这个|这种|该)?药(?!品?说明书|物?手册|品?标签|品?包装|盒|箱|品?广告|品?目录)"
+    r"(?:物|品)?|处方药|非处方药|胶囊|片剂|口服液|针剂|滴眼液)"
 )
 _DOSE_PATTERN = re.compile(
     rf"{_NUMBER_TOKEN}(?:mg|mcg|ug|μg|g|ml|毫克|微克|克|毫升|片|粒|丸|袋|支|滴)"
 )
 _STRONG_DOSE_PATTERN = re.compile(
     rf"{_NUMBER_TOKEN}(?:mg|mcg|ug|μg|g|ml|毫克|微克|克|毫升)"
+)
+_PILL_DOSE_PATTERN = re.compile(
+    rf"{_NUMBER_TOKEN}(?:片|粒|丸|滴)"
 )
 _INTERVAL_PATTERN = re.compile(
     rf"(?:每(?:隔)?{_NUMBER_TOKEN}(?:个)?(?:小时|钟头|天|日)|"
@@ -337,19 +360,11 @@ _INTERVAL_PATTERN = re.compile(
 )
 _MEDICATION_QUESTION_PATTERN = re.compile(
     r"(?:多少|几(?:片|粒|次|回|毫克|微克|克|毫升)|多久|间隔|行不行|可不可以|可以吗|"
-    r"能(?:不能|否)?.{0,8}吗|(?:可以|是否|要不要|该不该).{0,8}吗|"
+    r"能(?:不能|否)?.{0,8}吗|(?:可以|是否|需要|要不要|该不该).{0,8}吗|"
     r"该.{0,8}(?:吗|多少|多久)|怎么(?:吃|用|服)|用量|剂量)"
 )
-_QUANTIFIED_ADMIN_PATTERN = re.compile(
-    r"(?:吃|服(?:用)?|用)(?:多少|几(?:片|粒|毫克|微克|克|毫升))"
-    r"(?P<object>[a-z\u4e00-\u9fff]{2,12})?"
-)
 _LIKELY_MEDICATION_NAME_PATTERN = re.compile(
-    r"(?:霉素|西林|沙星|普利|洛尔|地平|唑|酮|芬|林|胶囊|片剂)$"
-)
-_LIKELY_MEDICATION_ADMIN_PATTERN = re.compile(
-    r"(?P<object>[a-z\u4e00-\u9fff]{2,12}?)(?:能|可以|可不可以|是否|该不该|要不要)?"
-    r"(?:口服|服用|服|吃|用)(?:吗|么|不)?"
+    r"[a-z\u4e00-\u9fff]{1,16}(?:霉素|西林|沙星|普利|洛尔|地平|唑|酮|芬|酚|胺|定|松)"
 )
 _BENIGN_CONSUMPTION_PATTERN = re.compile(
     r"(?:饭|菜|肉|鱼|蛋|奶|茶|咖啡|水果|蔬菜|零食|薯片|饼干|面包|蛋糕|"
@@ -362,9 +377,9 @@ _RED_FLAG_PATTERNS = (
     re.compile(r"呼吸(?:困难|急促|费力|不上来|不过来|不了)"),
     re.compile(r"(?:气喘不上来|喘不上气|喘不过气|透不过气|窒息)"),
     re.compile(
-        r"(?:一侧|单侧|半边|左侧|右侧|左|右).{0,4}"
+        r"(?:一只|一边|一侧|单侧|半边|左侧|右侧|左|右).{0,4}"
         r"(?:手脚|手|脚|肢|臂|胳膊|腿|脸|面|身体).{0,6}"
-        r"(?:无力|麻木|发麻|麻|抬不起来|动不了|歪斜|下垂)"
+        r"(?:无力|没力气|使不上劲|麻木|发麻|麻|抬不起来|抬不动|动不了|歪斜|下垂)"
     ),
     re.compile(r"(?:嘴角|口角).{0,3}(?:歪|歪斜|下垂)"),
     re.compile(r"(?:口齿|言语|讲话|说话|发音).{0,5}(?:不清|含糊|不清楚|困难|说不出)"),
@@ -375,7 +390,7 @@ _TRIAGE_ACTION_PATTERN = re.compile(
     r"(?:怎么办|怎么(?:做|处理|急救)|如何(?:处理|急救)|该(?:怎么|做什么|如何)|"
     r"应该(?:怎么|做什么|如何|采取什么)|采取(?:什么|哪些).{0,5}(?:措施)?|"
     r"要(?:不要)?(?:去医院|就医|急诊|打120|叫救护车)|"
-    r"(?:需要|要|能否|可以|是否).{0,10}(?:冲(?:洗)?|催吐|就医|急诊|医院|打120|处理).{0,3}(?:吗|么)?|"
+    r"(?:需要|要|能否|可以|是否|该(?:不该)?).{0,10}(?:冲(?:洗)?|催吐|就医|急诊|医院|打120|处理).{0,3}(?:吗|么)?|"
     r"(?:冲(?:洗)?|催吐|就医|急诊|打120|叫救护车).{0,3}(?:吗|么|\?|？))"
 )
 
@@ -392,12 +407,13 @@ _EXPOSURE_ROUTE_PATTERNS = (
         r"(?:(?:溅|滴|喷|弄|流|进|入|沾|接触).{0,6}(?:眼(?:里|睛|部)?|入眼|进眼)|"
         r"(?:眼(?:里|睛|部)?).{0,6}(?:溅|滴|喷|弄|流入|进入|接触))"
     ),
-    re.compile(r"(?:误(?:吞|食|服)|(?:吞|咽|喝|吃)(?:下|进|入|了))"),
-    re.compile(r"(?:吸(?:入|进)|闻(?:入|了|到).{0,8}(?:气|烟|雾|味)|呛(?:入|到))"),
+    re.compile(r"(?:误(?:吞|食|服|喝|饮)|不慎(?:吞|喝|饮)|(?:吞|咽|喝|饮|吃)(?:下|进|入|了))"),
+    re.compile(r"(?:吸(?:入|进|到)|闻(?:入|了|到|见)|呛(?:入|到))"),
 )
 _STABLE_SAFETY_INFO_PATTERN = re.compile(
     r"(?:什么是|定义|原理|机制|为什么|为何|副作用|不良反应|禁忌|适应症|"
-    r"常见原因|会有什么后果|有何后果|后果|危害|风险|刺激|科普|了解)"
+    r"常见原因|会有什么后果|有何后果|后果|危害|风险|刺激|科普|了解|"
+    r"(?:主要)?作用|用途|做什么用|用来做什么|代表什么|意味着什么|含义)"
 )
 
 _SAFETY_ACTIONABLE = "actionable"
@@ -464,6 +480,37 @@ def _quoted_spans(text: str) -> tuple[_SafetySpan, ...]:
                 spans.append(_SafetySpan(_sentence_start(text, start), start + 1))
             else:
                 spans.append(_SafetySpan(start, _sentence_end(text, start + 1)))
+    spans.extend(
+        _SafetySpan(match.start(), match.end())
+        for match in _BACKTICK_SPAN_PATTERN.finditer(text)
+    )
+    return tuple(spans)
+
+
+def _meta_declaration_spans(text: str) -> tuple[_SafetySpan, ...]:
+    """Return only clauses that explicitly declare example/title semantics."""
+    spans: list[_SafetySpan] = []
+    clause_start = 0
+    for boundary in _RELATION_BOUNDARY_PATTERN.finditer(text):
+        clause_end = boundary.start()
+        clause = text[clause_start:clause_end]
+        if _META_DECLARATION_PATTERN.search(clause):
+            spans.append(_SafetySpan(clause_start, clause_end))
+        clause_start = boundary.end()
+    if _META_DECLARATION_PATTERN.search(text[clause_start:]):
+        spans.append(_SafetySpan(clause_start, len(text)))
+    return tuple(spans)
+
+
+def _absence_relation_spans(text: str) -> tuple[_SafetySpan, ...]:
+    """Bind an absence auxiliary to predicates in its local relation only."""
+    spans: list[_SafetySpan] = []
+    for match in _ABSENCE_RELATION_PATTERN.finditer(text):
+        prefix = text[max(0, match.start() - 4):match.start()]
+        if re.search(r"(?:不是|并非)$", prefix):
+            continue
+        boundary = _RELATION_BOUNDARY_PATTERN.search(text, match.end())
+        spans.append(_SafetySpan(match.start(), boundary.start() if boundary else len(text)))
     return tuple(spans)
 
 
@@ -474,25 +521,52 @@ def _safety_view(question: str) -> _SafetyView:
     for span in quoted:
         active[span.start : span.end] = " " * (span.end - span.start)
     unquoted = "".join(active)
-    negated = tuple(_SafetySpan(match.start(), match.end()) for match in _NEGATED_META_PATTERN.finditer(unquoted))
-    for span in negated:
+    negated_meta = tuple(
+        _SafetySpan(match.start(), match.end())
+        for match in _NEGATED_META_PATTERN.finditer(unquoted)
+    )
+    declared_meta = _meta_declaration_spans(unquoted)
+    meta = (*negated_meta, *declared_meta)
+    for span in meta:
         active[span.start : span.end] = " " * (span.end - span.start)
+    context_text = re.sub(r"\s+", "", "".join(active))
+    absence = _absence_relation_spans(context_text)
     return _SafetyView(
         normalized_text=normalized,
-        active_text=re.sub(r"\s+", "", "".join(active)),
+        context_text=context_text,
+        active_text=context_text,
         quoted_spans=quoted,
-        negated_spans=negated,
+        negated_spans=(*negated_meta, *absence),
+        meta_spans=meta,
+        absence_spans=absence,
     )
 
 
-def _predicate_is_explicitly_absent(text: str, start: int, end: int) -> bool:
+def _predicate_is_explicitly_absent(
+    text: str,
+    start: int,
+    end: int,
+    absence_spans: tuple[_SafetySpan, ...] = (),
+) -> bool:
+    if any(span.start <= start and end <= span.end for span in absence_spans):
+        return True
     prefix = text[max(0, start - 8) : start]
     suffix = text[end : end + 8]
     if re.search(r"(?:不是|并非)(?:没有|没|无|并无)$", prefix):
         return False
-    if re.search(r"(?:没有|没|并无|无|未出现|否认有?)$", prefix):
+    if re.search(
+        r"(?:(?:并)?(?:没有|没|并无|无)|从来没有|从未|未曾|不曾|否认有?)"
+        r"(?:出现|发生|有|感觉到)?$",
+        prefix,
+    ):
         return True
-    return bool(re.match(r"(?:并)?(?:没有|未)(?:再)?(?:出现|发生)", suffix))
+    return bool(
+        re.match(
+            r"(?:(?:并)?(?:没有|没|未)|从来没有|从未|未曾|不曾)"
+            r"(?:再)?(?:出现|发生)",
+            suffix,
+        )
+    )
 
 
 def _has_triage_action(text: str) -> bool:
@@ -501,29 +575,14 @@ def _has_triage_action(text: str) -> bool:
 
 def _has_medication_administration(text: str) -> bool:
     generic_medication = bool(_GENERIC_MEDICATION_PATTERN.search(text))
+    named_medication = bool(_LIKELY_MEDICATION_NAME_PATTERN.search(text))
     dose_matches = tuple(_DOSE_PATTERN.finditer(text))
     interval_matches = tuple(_INTERVAL_PATTERN.finditer(text))
     administration = bool(_ADMIN_PATTERN.search(text) or _MEDICATION_CHANGE_PATTERN.search(text))
     if not _MEDICATION_QUESTION_PATTERN.search(text):
         return False
-    if generic_medication:
+    if generic_medication or named_medication:
         return administration or bool(dose_matches) or bool(interval_matches)
-    administered_object = _LIKELY_MEDICATION_ADMIN_PATTERN.search(text)
-    if administered_object is not None:
-        medication_object = administered_object.group("object")
-        if (
-            not _BENIGN_CONSUMPTION_PATTERN.search(medication_object)
-            and _LIKELY_MEDICATION_NAME_PATTERN.search(medication_object)
-        ):
-            return True
-    quantified_admin = _QUANTIFIED_ADMIN_PATTERN.search(text)
-    if quantified_admin is not None:
-        medication_object = quantified_admin.group("object") or ""
-        if not _BENIGN_CONSUMPTION_PATTERN.search(medication_object) and (
-            _mentions_red_flag(text)
-            or bool(_LIKELY_MEDICATION_NAME_PATTERN.search(medication_object))
-        ):
-            return True
     if not dose_matches and not interval_matches:
         return False
 
@@ -539,17 +598,26 @@ def _has_medication_administration(text: str) -> bool:
         return False
     if _BENIGN_CONSUMPTION_PATTERN.search(text[semantic_start : semantic_start + 14]):
         return False
-    return bool(interval_matches) or (administration and bool(_STRONG_DOSE_PATTERN.search(text))) or (
-        administration and bool(dose_matches)
+    pill_dose = bool(_PILL_DOSE_PATTERN.search(text))
+    return (
+        (pill_dose and bool(interval_matches))
+        or (administration and pill_dose)
+        or (administration and bool(_STRONG_DOSE_PATTERN.search(text)))
+        or (administration and bool(interval_matches))
     )
 
 
-def _active_red_flag_matches(text: str) -> tuple[re.Match[str], ...]:
+def _active_red_flag_matches(
+    text: str,
+    absence_spans: tuple[_SafetySpan, ...] = (),
+) -> tuple[re.Match[str], ...]:
     matches = [match for pattern in _RED_FLAG_PATTERNS for match in pattern.finditer(text)]
     return tuple(
         match
         for match in matches
-        if not _predicate_is_explicitly_absent(text, match.start(), match.end())
+        if not _predicate_is_explicitly_absent(
+            text, match.start(), match.end(), absence_spans
+        )
     )
 
 
@@ -561,34 +629,44 @@ def _has_hazard_context(text: str) -> bool:
     return bool(_HAZARD_CONTEXT_PATTERN.search(text) or _UNKNOWN_SUBSTANCE_PATTERN.search(text))
 
 
-def _has_active_exposure(text: str) -> bool:
+def _has_active_exposure(
+    text: str,
+    absence_spans: tuple[_SafetySpan, ...] = (),
+) -> bool:
     if not _has_hazard_context(text):
         return False
     for pattern in _EXPOSURE_ROUTE_PATTERNS:
         for match in pattern.finditer(text):
-            if not _predicate_is_explicitly_absent(text, match.start(), match.end()):
+            if not _predicate_is_explicitly_absent(
+                text, match.start(), match.end(), absence_spans
+            ):
                 return True
     return False
 
 
 def _classify_safety_intent(question: str) -> str | None:
     """Classify coherent safety structures after quote and negation scoping."""
-    text = _safety_view(question).active_text
+    view = _safety_view(question)
+    text = view.active_text
     if _has_medication_administration(text):
         return _SAFETY_ACTIONABLE
-    if _has_triage_action(text) and _active_red_flag_matches(text):
+    if _has_triage_action(text) and _active_red_flag_matches(text, view.absence_spans):
         return _SAFETY_ACTIONABLE
-    if _has_triage_action(text) and _has_active_exposure(text):
+    if _has_triage_action(text) and _has_active_exposure(text, view.absence_spans):
         return _SAFETY_ACTIONABLE
 
+    context_text = view.context_text
     safety_topic = (
-        bool(_GENERIC_MEDICATION_PATTERN.search(text))
-        or "副作用" in text
-        or "不良反应" in text
-        or _has_hazard_context(text)
-        or _mentions_red_flag(text)
+        bool(
+            _GENERIC_MEDICATION_PATTERN.search(context_text)
+            or _LIKELY_MEDICATION_NAME_PATTERN.search(context_text)
+        )
+        or "副作用" in context_text
+        or "不良反应" in context_text
+        or _has_hazard_context(context_text)
+        or _mentions_red_flag(context_text)
     )
-    if safety_topic and _STABLE_SAFETY_INFO_PATTERN.search(text):
+    if safety_topic and _STABLE_SAFETY_INFO_PATTERN.search(context_text):
         return _SAFETY_STABLE
     return None
 

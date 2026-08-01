@@ -353,6 +353,72 @@ class RouterConflictAndFloorTests(unittest.TestCase):
             with self.subTest(kind="excluded", question=question):
                 self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
 
+    def test_advisor_failure_covers_round_three_medication_acute_and_exposure_actions(self):
+        actionable_cases = (
+            "布洛芬能停吗？",
+            "布洛芬需要加量吗？",
+            "一只手突然抬不起来，需要去急诊吗？",
+            "误喝洁厕液要催吐吗？",
+            "闻了杀虫剂后头晕，是否要就医？",
+            "阿莫西林可以减量吗？",
+            "一边胳膊突然使不上劲，要叫救护车吗？",
+            "不慎饮下除垢液，需要马上就医吗？",
+            "吸到杀虫喷雾后恶心，该去医院吗？",
+        )
+        for question in actionable_cases:
+            with self.subTest(question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+    def test_advisor_failure_scopes_absence_and_meta_without_hiding_later_emergencies(self):
+        excluded_cases = (
+            "我并没有出现胸痛，只想了解这种情况要去急诊吗？",
+            "从未发生清洁剂入眼，只想了解这种情况需要冲洗吗？",
+            "胸痛怎么办是测试用例标题。",
+            "【胸痛怎么办】只是测试标题。",
+            "`胸痛怎么办`只是代码示例。",
+            "从来没有发生漂白剂入眼，只是在校对急救说明。",
+            "这个标题是胸痛怎么办，仅用于回归测试。",
+        )
+        for question in excluded_cases:
+            with self.subTest(kind="excluded", question=question):
+                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+
+        active_after_excluded_scope = (
+            "我没有出现胸痛，但呼吸困难怎么办？",
+            "从未发生清洁剂入眼；但现在胸口压迫，需要急诊吗？",
+            "胸痛怎么办属于示例标题；但我现在呼吸困难，该怎么办？",
+            "“胸痛怎么办”是示例；但我一只手抬不起来，需要急诊吗？",
+            "【误喝清洁剂要催吐吗】是测试；但我一边胳膊使不上劲，要打120吗？",
+        )
+        for question in active_after_excluded_scope:
+            with self.subTest(kind="active_after_excluded", question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+
+    def test_advisor_failure_binds_dose_frequency_and_change_to_medication_subject(self):
+        benign_overlaps = (
+            "面粉一次用500g可以吗？",
+            "药品说明书每次打印几页可以吗？",
+            "水泥每次用两袋够吗？",
+            "这个药盒每次印几张标签可以吗？",
+            "咖啡粉每天用10g合适吗？",
+        )
+        for question in benign_overlaps:
+            with self.subTest(question=question):
+                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+
+    def test_advisor_failure_floors_stable_effect_use_and_meaning_explanations_at_standard(self):
+        stable_explanations = (
+            "布洛芬的主要作用有哪些？",
+            "对乙酰氨基酚是做什么用的？",
+            "胸痛通常代表什么？",
+            "阿莫西林有什么用途？",
+            "呼吸困难一般意味着什么？",
+            "洁厕剂的作用是什么？",
+        )
+        for question in stable_explanations:
+            with self.subTest(question=question):
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+
     def test_stable_version_definition_is_not_deep(self):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)
