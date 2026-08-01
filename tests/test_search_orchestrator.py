@@ -574,6 +574,98 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertFalse(result.trace.provider_invocation_started)
         self.assertEqual(result.trace.to_log_dict()["semantic_query_count"], 0)
 
+    def test_running_adapter_wrapper_cannot_mutate_after_timeout_trace_is_sealed(self):
+        from concurrent.futures import Future
+        from src.search.providers import base as provider_base
+
+        class RunningBeforeInvokeExecutor:
+            def __init__(self):
+                self.running = threading.Event()
+                self.release = threading.Event()
+                self.sealed = threading.Event()
+                self.thread = None
+
+            def submit(self, operation):
+                owner = self
+
+                class SealObservedFuture(Future):
+                    def cancel(self):
+                        cancelled = super().cancel()
+                        owner.sealed.set()
+                        return cancelled
+
+                future = SealObservedFuture()
+
+                def run():
+                    if not future.set_running_or_notify_cancel():
+                        return
+                    self.running.set()
+                    self.release.wait(timeout=2.0)
+                    try:
+                        value = operation()
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                    else:
+                        future.set_result(value)
+
+                self.thread = threading.Thread(target=run, daemon=True)
+                self.thread.start()
+                if not self.running.wait(timeout=1.0):
+                    raise RuntimeError("test executor did not enter RUNNING state")
+                return future
+
+        class RecordingProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                from src.search.models import ProviderResult
+                return ProviderResult("tavily", ProviderStatus.EMPTY, (), 0)
+
+        executor = RunningBeforeInvokeExecutor()
+        provider = RecordingProvider()
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+        )
+        actual_remaining = orchestrator._registry._remaining
+
+        def controlled_remaining(deadline):
+            if threading.current_thread() is executor.thread:
+                return 1.0
+            return actual_remaining(deadline)
+
+        orchestrator._registry._remaining = controlled_remaining
+        try:
+            with mock.patch.object(provider_base, "_ADAPTER_EXECUTOR", executor):
+                result, elapsed = self._run_with_short_budget(orchestrator)
+            self.assertTrue(executor.running.is_set())
+            self.assertTrue(executor.sealed.wait(timeout=1.0))
+            trace_before_release = result.trace.to_log_dict()
+            calls_before_release = tuple(provider.calls)
+        finally:
+            executor.release.set()
+            executor.thread.join(timeout=1.0)
+
+        self.assertFalse(executor.thread.is_alive())
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(calls_before_release, ())
+        self.assertEqual(tuple(provider.calls), calls_before_release)
+        self.assertEqual(result.trace.provider_attempts, ())
+        self.assertEqual(result.trace.executed_queries, ())
+        self.assertFalse(result.trace.provider_invocation_started)
+        self.assertEqual(result.trace.to_log_dict(), trace_before_release)
+
     def test_fallback_timeout_keeps_completed_primary_and_real_fallback_truth(self):
         class ErrorPrimary:
             name = "tavily"

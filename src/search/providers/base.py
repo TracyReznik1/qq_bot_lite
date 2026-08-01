@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Callable, Iterable, Protocol
 
 from src.search.models import (
@@ -223,15 +224,19 @@ class ProviderRegistry:
                 None,
             )
         readiness = provider.readiness()
-        invocation: dict[str, float] = {}
+        invocation: dict[str, Any] = {"cancelled": False, "started": None}
+        invocation_gate = Lock()
 
         def invoke() -> ProviderResult | None:
-            if self._remaining(deadline) <= 0:
-                return None
-            invocation["started"] = time.monotonic()
+            with invocation_gate:
+                if invocation["cancelled"] or self._remaining(deadline) <= 0:
+                    invocation["cancelled"] = True
+                    return None
+                invocation["started"] = time.monotonic()
+                started_at = invocation["started"]
             if on_attempt_started is not None:
                 try:
-                    on_attempt_started(provider.name, query, readiness, invocation["started"])
+                    on_attempt_started(provider.name, query, readiness, started_at)
                 except Exception:
                     pass
             return provider.search(
@@ -245,8 +250,11 @@ class ProviderRegistry:
         try:
             result = future.result(timeout=remaining)
         except FuturesTimeoutError:
+            with invocation_gate:
+                started = invocation["started"]
+                if started is None:
+                    invocation["cancelled"] = True
             future.cancel()
-            started = invocation.get("started")
             elapsed_ms = int((time.monotonic() - (started or time.monotonic())) * 1000)
             result = ProviderResult(
                 provider=provider.name,
@@ -257,7 +265,8 @@ class ProviderRegistry:
             if started is None:
                 return result, None
         except Exception as exc:
-            started = invocation.get("started", time.monotonic())
+            with invocation_gate:
+                started = invocation["started"] or time.monotonic()
             elapsed_ms = int((time.monotonic() - started) * 1000)
             result = ProviderResult(
                 provider=provider.name,
@@ -275,7 +284,8 @@ class ProviderRegistry:
                     ProviderResult(provider.name, ProviderStatus.TIMEOUT, (), 0),
                     None,
                 )
-            started = invocation.get("started", time.monotonic())
+            with invocation_gate:
+                started = invocation["started"] or time.monotonic()
             elapsed_ms = int((time.monotonic() - started) * 1000)
             result = ProviderResult(
                 provider=provider.name,

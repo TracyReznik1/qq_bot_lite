@@ -6,7 +6,7 @@ import importlib
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from typing import Any
 from unittest import mock
@@ -116,6 +116,39 @@ def _provider_result(provider="tavily", *, status=ProviderStatus.SUCCESS, query_
             ),
         )
     return ProviderResult(provider, status, hits, latency_ms)
+
+
+class RunningBeforeInvokeExecutor:
+    """Marks a Future RUNNING, then pauses before calling its wrapper."""
+
+    def __init__(self):
+        self.running = threading.Event()
+        self.release = threading.Event()
+        self.future = None
+        self.thread = None
+
+    def submit(self, operation):
+        future = Future()
+
+        def run():
+            if not future.set_running_or_notify_cancel():
+                return
+            self.running.set()
+            self.release.wait(timeout=2.0)
+            try:
+                result = operation()
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        thread = threading.Thread(target=run, daemon=True)
+        self.future = future
+        self.thread = thread
+        thread.start()
+        if not self.running.wait(timeout=1.0):
+            raise RuntimeError("test executor did not enter RUNNING state")
+        return future
 
 class TavilyAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -460,6 +493,195 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(started_callbacks, [])
         self.assertEqual(finished_callbacks, [])
 
+    def test_running_wrapper_timeout_seal_prevents_late_internal_invocation(self):
+        result = self._running_before_invoke_timeout(public=False)
+
+        self.assertEqual(result["outcome"].status, ProviderStatus.TIMEOUT)
+        self.assertEqual(result["outcome"].attempts, ())
+        self.assertLess(result["elapsed"], 0.15)
+        self.assertEqual(result["before_release"], ((), (), ()))
+        self.assertEqual(result["after_release"], result["before_release"])
+
+    def test_running_wrapper_timeout_seal_prevents_late_public_invocation(self):
+        result = self._running_before_invoke_timeout(public=True)
+
+        self.assertIsInstance(result["outcome"], ProviderResult)
+        self.assertEqual(result["outcome"].status, ProviderStatus.TIMEOUT)
+        self.assertEqual(result["outcome"].hits, ())
+        self.assertLess(result["elapsed"], 0.15)
+        self.assertEqual(result["before_release"][0], ())
+        self.assertEqual(result["after_release"], result["before_release"])
+
+    def test_invocation_start_winner_is_recorded_as_real_timeout_attempt(self):
+        result = self._invocation_start_wins_timeout()
+
+        self.assertEqual(result["outcome"].status, ProviderStatus.TIMEOUT)
+        self.assertEqual(
+            [(attempt.provider, attempt.status) for attempt in result["outcome"].attempts],
+            [("tavily", ProviderStatus.TIMEOUT)],
+        )
+        self.assertLess(result["elapsed"], 0.15)
+        self.assertEqual(result["before_release"], (("q1",), ("tavily",), ("tavily",)))
+        self.assertEqual(result["after_release"], result["before_release"])
+
+    def test_invocation_gate_stress_preserves_both_race_winners(self):
+        for iteration in range(20):
+            with self.subTest(iteration=iteration, winner="timeout"):
+                timeout_result = self._running_before_invoke_timeout(
+                    public=False,
+                    timeout_seconds=0.005,
+                )
+                self.assertEqual(timeout_result["outcome"].attempts, ())
+                self.assertEqual(
+                    timeout_result["after_release"],
+                    timeout_result["before_release"],
+                )
+
+            with self.subTest(iteration=iteration, winner="start"):
+                start_result = self._invocation_start_wins_timeout(
+                    timeout_seconds=0.005,
+                )
+                self.assertEqual(len(start_result["outcome"].attempts), 1)
+                self.assertEqual(
+                    start_result["after_release"],
+                    start_result["before_release"],
+                )
+
+    def _running_before_invoke_timeout(self, *, public, timeout_seconds=0.05):
+        executor = RunningBeforeInvokeExecutor()
+
+        class RecordingProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                return _provider_result(query_id=search_query.query_id)
+
+        provider = RecordingProvider()
+        registry = self._registry(provider, None)
+        actual_remaining = registry._remaining
+
+        def controlled_remaining(deadline):
+            if threading.current_thread() is executor.thread:
+                return 1.0
+            return actual_remaining(deadline)
+
+        registry._remaining = controlled_remaining
+        started = []
+        finished = []
+        try:
+            with mock.patch.object(self.base, "_ADAPTER_EXECUTOR", executor):
+                began = time.monotonic()
+                if public:
+                    outcome = registry.search(
+                        query(),
+                        tier=SearchTier.LIGHT,
+                        max_results=1,
+                        timeout_seconds=timeout_seconds,
+                    )
+                else:
+                    outcome = registry.search_with_attempts(
+                        query(),
+                        tier=SearchTier.LIGHT,
+                        max_results=1,
+                        timeout_seconds=timeout_seconds,
+                        on_attempt_started=lambda provider_name, search_query, _ready, _at: (
+                            started.append((provider_name, search_query.query_id))
+                        ),
+                        on_attempt_finished=lambda attempt: finished.append(attempt.provider),
+                    )
+                elapsed = time.monotonic() - began
+            self.assertTrue(executor.running.is_set())
+            before_release = (
+                tuple(provider.calls),
+                tuple(started),
+                tuple(finished),
+            )
+        finally:
+            executor.release.set()
+            executor.thread.join(timeout=1.0)
+        self.assertFalse(executor.thread.is_alive())
+        after_release = (
+            tuple(provider.calls),
+            tuple(started),
+            tuple(finished),
+        )
+        return {
+            "outcome": outcome,
+            "elapsed": elapsed,
+            "before_release": before_release,
+            "after_release": after_release,
+        }
+
+    def _invocation_start_wins_timeout(self, *, timeout_seconds=0.05):
+        class BlockingProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.completed = threading.Event()
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                self.entered.set()
+                try:
+                    self.release.wait(timeout=2.0)
+                    return _provider_result(query_id=search_query.query_id)
+                finally:
+                    self.completed.set()
+
+        provider = BlockingProvider()
+        registry = self._registry(provider, None)
+        started = []
+        finished = []
+        began = time.monotonic()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as caller:
+                result_future = caller.submit(
+                    registry.search_with_attempts,
+                    query(),
+                    tier=SearchTier.LIGHT,
+                    max_results=1,
+                    timeout_seconds=timeout_seconds,
+                    on_attempt_started=lambda provider_name, _query, _ready, _at: (
+                        started.append(provider_name)
+                    ),
+                    on_attempt_finished=lambda attempt: finished.append(attempt.provider),
+                )
+                self.assertTrue(provider.entered.wait(timeout=1.0))
+                outcome = result_future.result(timeout=1.0)
+            elapsed = time.monotonic() - began
+            before_release = (
+                tuple(provider.calls),
+                tuple(started),
+                tuple(finished),
+            )
+        finally:
+            provider.release.set()
+            provider.completed.wait(timeout=1.0)
+        after_release = (
+            tuple(provider.calls),
+            tuple(started),
+            tuple(finished),
+        )
+        return {
+            "outcome": outcome,
+            "elapsed": elapsed,
+            "before_release": before_release,
+            "after_release": after_release,
+        }
+
     def test_fallback_timeout_preserves_completed_primary_and_real_fallback_attempt(self):
         class Primary:
             name = "tavily"
@@ -535,6 +757,7 @@ class RegistryTests(unittest.TestCase):
         seven_workers_started = threading.Event()
         worker_lock = threading.Lock()
         started_workers = 0
+        adapter_executor = ThreadPoolExecutor(max_workers=8)
 
         def occupy_worker():
             nonlocal started_workers
@@ -544,10 +767,9 @@ class RegistryTests(unittest.TestCase):
                     seven_workers_started.set()
             release_workers.wait(timeout=2.0)
 
-        blockers = [self.base._ADAPTER_EXECUTOR.submit(occupy_worker) for _ in range(7)]
+        blockers = [adapter_executor.submit(occupy_worker) for _ in range(7)]
         self.assertTrue(seven_workers_started.wait(timeout=1.0))
         queued_blockers = []
-        adapter_executor = self.base._ADAPTER_EXECUTOR
 
         class ErrorPrimary:
             name = "tavily"
@@ -584,29 +806,31 @@ class RegistryTests(unittest.TestCase):
         started = []
         finished = []
         try:
-            if public:
-                result = registry.search(
-                    query(),
-                    tier=SearchTier.LIGHT,
-                    max_results=1,
-                    timeout_seconds=0.08,
-                )
-            else:
-                result = registry.search_with_attempts(
-                    query(),
-                    tier=SearchTier.LIGHT,
-                    max_results=1,
-                    timeout_seconds=0.08,
-                    on_attempt_started=lambda provider, search_query, _readiness, _started: (
-                        started.append((provider, search_query.query_id))
-                    ),
-                    on_attempt_finished=lambda attempt: finished.append(attempt),
-                )
+            with mock.patch.object(self.base, "_ADAPTER_EXECUTOR", adapter_executor):
+                if public:
+                    result = registry.search(
+                        query(),
+                        tier=SearchTier.LIGHT,
+                        max_results=1,
+                        timeout_seconds=0.08,
+                    )
+                else:
+                    result = registry.search_with_attempts(
+                        query(),
+                        tier=SearchTier.LIGHT,
+                        max_results=1,
+                        timeout_seconds=0.08,
+                        on_attempt_started=lambda provider, search_query, _readiness, _started: (
+                            started.append((provider, search_query.query_id))
+                        ),
+                        on_attempt_finished=lambda attempt: finished.append(attempt),
+                    )
             callback_counts = (len(started), len(finished))
         finally:
             release_workers.set()
             for blocker in (*blockers, *queued_blockers):
                 blocker.result(timeout=1.0)
+            adapter_executor.shutdown(wait=True)
         time.sleep(0.02)
         return result, primary, fallback, started, finished, callback_counts
 
