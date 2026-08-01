@@ -36,26 +36,35 @@ class MultimodalChatTests(unittest.TestCase):
     def test_generate_reply_persists_placeholder_not_image_data(self):
         session_key = "test:image-history"
         chat_service.chat_history.pop(session_key, None)
+        from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
+        skip = RetrievalDecision(
+            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
+            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
+            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
+            None, None, (),
+        )
+        orchestrator = mock.Mock(run=lambda req: SearchPipelineResult(
+            skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+        ))
         with (
             mock.patch.object(chat_service, "_ensure_history_loaded"),
             mock.patch.object(chat_service, "_save_history_unlocked"),
-            mock.patch.object(
-                chat_service,
-                "build_untrusted_context",
-                return_value="[非可信上下文]暂无",
-            ),
+            mock.patch("src.chat.prompt.MemoryRetriever", return_value=mock.Mock(retrieve=lambda ctx, query: [])),
             mock.patch.object(
                 chat_service.llm,
                 "chat",
                 return_value=ChatResponse(content="看到了"),
             ),
         ):
-            reply = chat_service.generate_reply(
-                session_key,
-                "帮我看看",
-                tool_context="已有上下文",
-                image_data_urls=["data:image/png;base64,cG5n"],
-            )
+            chat_service._search_orchestrator = orchestrator
+            try:
+                reply = chat_service.generate_reply(
+                    session_key,
+                    "帮我看看",
+                    image_data_urls=["data:image/png;base64,cG5n"],
+                )
+            finally:
+                chat_service._search_orchestrator = None
         history = chat_service.chat_history.pop(session_key)
         self.assertEqual("看到了", reply)
         self.assertEqual("[图片]\n帮我看看", history[0]["content"])

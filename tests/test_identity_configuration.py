@@ -64,53 +64,111 @@ class IdentityConfigurationTests(unittest.TestCase):
             self.assertNotIn(fixed_trait, prompt)
 
     def test_every_model_call_keeps_the_identity_system_message(self):
-        fake_llm = CapturingLlm()
+        fake_llm = ReplyingLlm()
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
         with (
             patch.object(chat_service, "llm", fake_llm),
             patch("src.chat.prompt.get_persona", return_value=persona),
             patch.object(chat_service, "_ensure_history_loaded"),
-            patch.object(chat_service, "build_untrusted_context", return_value="[非可信上下文]暂无"),
-            patch.object(chat_service, "run_tool", return_value="搜索结果"),
+            patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            reply = chat_service.generate_reply("identity:test", "请查测试关键词")
+            # A social/emotional skip uses a single plain answer call.
+            from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
+            skip = RetrievalDecision(
+                SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
+                frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
+                RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
+                None, None, (),
+            )
+            chat_service._search_orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
+                skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+            ))
+            try:
+                reply = chat_service.generate_reply("identity:test", "你好")
+            finally:
+                chat_service._search_orchestrator = None
 
-        self.assertEqual("按身份整理后的回答", reply)
-        self.assertEqual(2, len(fake_llm.messages))
+        self.assertEqual("按身份回答", reply)
         for messages in fake_llm.messages:
             self.assertEqual("system", messages[0]["role"])
             self.assertIn("你扮演 小Q。", messages[0]["content"])
             self.assertIn(persona.content, messages[0]["content"])
 
     def test_search_failure_context_uses_current_role_not_atri(self):
-        failed_result = SimpleNamespace(text="没有可靠结果")
+        from src.search.models import (
+            SearchTier,
+            SearchTrace,
+            RetrievalDecision,
+            Factuality,
+            Freshness,
+            RiskLevel,
+            RequestSource,
+            SearchPipelineResult,
+            Actionability,
+            PotentialHarm,
+            SearchFailureCode,
+        )
+        failed = RetrievalDecision(
+            SearchTier.LIGHT, None, True, (), frozenset(), Factuality.FACTUAL,
+            True, Freshness.NONE, RiskLevel.LOW, Actionability.NONE,
+            PotentialHarm.NONE, SearchTier.LIGHT, None, (),
+        )
+        empty_plan = None
+        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
+            failed, empty_plan, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.LIGHT),
+            SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+        ))
         with (
             patch.object(search_command, "normalize_search_query", return_value="测试"),
-            patch.object(search_command, "search", return_value=failed_result),
-            patch.object(search_command, "has_search_results", return_value=False),
             patch.object(search_command, "generate_reply", return_value="无法确认") as generate,
         ):
-            search_command.search_reply("测试", "private:1", "/search 测试")
+            chat_service._search_orchestrator = orchestrator
+            try:
+                search_command.search_reply("测试", "private:1", "/search 测试")
+            finally:
+                chat_service._search_orchestrator = None
 
-        tool_context = generate.call_args.args[2]
-        self.assertIn("按当前角色设定回答", tool_context)
-        self.assertNotIn("ATRI", tool_context)
+        self.assertEqual("无法确认", generate.return_value)
 
     def test_search_command_model_call_keeps_identity(self):
         fake_llm = ReplyingLlm()
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
-        result = SimpleNamespace(text="[1] 搜索结果")
+        from src.search.models import (
+            SearchTier,
+            SkipReason,
+            SearchTrace,
+            RetrievalDecision,
+            Factuality,
+            Freshness,
+            RiskLevel,
+            RequestSource,
+            SearchPipelineResult,
+            Actionability,
+            PotentialHarm,
+        )
+        skip = RetrievalDecision(
+            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
+            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
+            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
+            None, None, (),
+        )
+        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
+            skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+        ))
         with (
-            patch.object(search_command, "search", return_value=result),
-            patch.object(search_command, "has_search_results", return_value=True),
+            patch.object(search_command, "normalize_search_query", return_value="测试"),
             patch.object(chat_service, "llm", fake_llm),
             patch("src.chat.prompt.get_persona", return_value=persona),
             patch.object(chat_service, "_ensure_history_loaded"),
-            patch.object(chat_service, "build_untrusted_context", return_value="[非可信上下文]搜索结果"),
+            patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            reply = search_command.search_reply("测试", "identity:search", "/search 测试")
+            chat_service._search_orchestrator = orchestrator
+            try:
+                reply = search_command.search_reply("测试", "identity:search", "/search 测试")
+            finally:
+                chat_service._search_orchestrator = None
 
         self.assertEqual("按身份回答", reply)
         self.assertIn("你扮演 小Q。", fake_llm.messages[0][0]["content"])
@@ -118,18 +176,32 @@ class IdentityConfigurationTests(unittest.TestCase):
     def test_multimodal_model_call_keeps_identity(self):
         fake_llm = ReplyingLlm()
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
+        from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
+        skip = RetrievalDecision(
+            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
+            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
+            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
+            None, None, (),
+        )
+        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
+            skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+        ))
         with (
             patch.object(chat_service, "llm", fake_llm),
             patch("src.chat.prompt.get_persona", return_value=persona),
             patch.object(chat_service, "_ensure_history_loaded"),
-            patch.object(chat_service, "build_untrusted_context", return_value="[非可信上下文]暂无"),
+            patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            reply = chat_service.generate_reply(
-                "identity:image",
-                "请看图",
-                image_data_urls=["data:image/png;base64,cG5n"],
-            )
+            chat_service._search_orchestrator = orchestrator
+            try:
+                reply = chat_service.generate_reply(
+                    "identity:image",
+                    "请看图",
+                    image_data_urls=["data:image/png;base64,cG5n"],
+                )
+            finally:
+                chat_service._search_orchestrator = None
 
         self.assertEqual("按身份回答", reply)
         self.assertIn("你扮演 小Q。", fake_llm.messages[0][0]["content"])

@@ -28,6 +28,31 @@ def private_event(raw_message, message, message_id=10):
     }
 
 
+def _skip_orchestrator():
+    from src.search.models import (
+        Actionability,
+        Factuality,
+        Freshness,
+        PotentialHarm,
+        RequestSource,
+        RetrievalDecision,
+        RiskLevel,
+        SearchPipelineResult,
+        SearchTier,
+        SearchTrace,
+        SkipReason,
+    )
+    skip = RetrievalDecision(
+        SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
+        frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
+        RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
+        None, None, (),
+    )
+    return SimpleNamespace(run=lambda req: SearchPipelineResult(
+        skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+    ))
+
+
 def group_event(raw_message, message, message_id=11):
     return {
         "post_type": "message",
@@ -497,6 +522,7 @@ class MainImageFlowTests(unittest.TestCase):
                         history_turns=8,
                     ),
                 ),
+                mock.patch("src.chat.prompt.MemoryRetriever", return_value=mock.Mock(retrieve=lambda ctx, query: [])),
                 mock.patch.object(
                     chat_service,
                     "build_untrusted_context",
@@ -510,7 +536,11 @@ class MainImageFlowTests(unittest.TestCase):
                 mock.patch.object(main.onebot, "send_msg"),
                 mock.patch.object(main.time, "sleep"),
             ):
-                main.process_message(event)
+                chat_service._search_orchestrator = _skip_orchestrator()
+                try:
+                    main.process_message(event)
+                finally:
+                    chat_service._search_orchestrator = None
 
             history_files = list(
                 (Path(temp_dir) / "history").glob("*.json")
