@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -404,6 +405,61 @@ class RegistryTests(unittest.TestCase):
         self.assertGreaterEqual(outcome.attempts[0].latency_ms, 40)
         self.assertLess(outcome.attempts[0].latency_ms, 150)
 
+    def test_ready_calls_queued_past_deadline_are_timeouts_without_attempts(self):
+        release_workers = threading.Event()
+        all_workers_started = threading.Event()
+        worker_lock = threading.Lock()
+        started_workers = 0
+
+        def occupy_worker():
+            nonlocal started_workers
+            with worker_lock:
+                started_workers += 1
+                if started_workers == 8:
+                    all_workers_started.set()
+            release_workers.wait(timeout=2.0)
+
+        blockers = [self.base._ADAPTER_EXECUTOR.submit(occupy_worker) for _ in range(8)]
+        self.assertTrue(all_workers_started.wait(timeout=1.0))
+
+        provider = mock.Mock()
+        provider.name = "tavily"
+        provider.readiness.return_value = ProviderReadiness("tavily", True, True, None)
+        provider.search.side_effect = AssertionError("queued provider must never start")
+        registry = self._registry(provider, None)
+        started_callbacks = []
+        finished_callbacks = []
+
+        def queued_call(index):
+            queued_query = SearchQuery(
+                f"queued-{index}",
+                SearchRoundKind.INITIAL,
+                QueryPurpose.DIRECT,
+                f"queued query {index}",
+            )
+            return registry.search_with_attempts(
+                queued_query,
+                tier=SearchTier.LIGHT,
+                max_results=1,
+                timeout_seconds=0.05,
+                on_attempt_started=lambda *args: started_callbacks.append(args),
+                on_attempt_finished=lambda attempt: finished_callbacks.append(attempt),
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as caller_pool:
+                outcomes = list(caller_pool.map(queued_call, range(4)))
+        finally:
+            release_workers.set()
+            for blocker in blockers:
+                blocker.result(timeout=1.0)
+
+        self.assertEqual([outcome.status for outcome in outcomes], [ProviderStatus.TIMEOUT] * 4)
+        self.assertEqual([outcome.attempts for outcome in outcomes], [()] * 4)
+        self.assertFalse(provider.search.called)
+        self.assertEqual(started_callbacks, [])
+        self.assertEqual(finished_callbacks, [])
+
     def test_fallback_timeout_preserves_completed_primary_and_real_fallback_attempt(self):
         class Primary:
             name = "tavily"
@@ -592,6 +648,38 @@ class RegistryTests(unittest.TestCase):
         self.assertGreaterEqual(result.attempts[1].latency_ms, 5)
         self.assertLess(observed_timeouts[1][1], observed_timeouts[0][1])
         self.assertTrue(all(attempt.invocation_started for attempt in result.attempts))
+
+    def test_attempt_retains_invocation_start_readiness_without_completion_reprobe(self):
+        class FlippingReadinessProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.readiness_calls = 0
+
+            def readiness(self):
+                self.readiness_calls += 1
+                if self.readiness_calls <= 2:
+                    return ProviderReadiness("tavily", True, True, None)
+                return ProviderReadiness(
+                    "tavily",
+                    True,
+                    False,
+                    SearchFailureCode.PROVIDER_UNAVAILABLE,
+                )
+
+            def search(self, search_query, **_kwargs):
+                return _provider_result(query_id=search_query.query_id)
+
+        provider = FlippingReadinessProvider()
+        outcome = self._registry(provider, None).search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=1.0
+        )
+
+        self.assertEqual(provider.readiness_calls, 2)
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertTrue(outcome.attempts[0].configured)
+        self.assertTrue(outcome.attempts[0].available)
+        self.assertTrue(outcome.attempts[0].invocation_started)
 
     def test_no_fallback_after_usable_tavily_hits(self):
         tavily = mock.Mock()

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import inspect
 import re
+import unicodedata
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -306,7 +308,7 @@ class EvidenceAssembler:
         }
 
         admitted: list[EvidenceItem] = []
-        groups: list[dict[str, Any]] = []
+        provenance: list[_Provenance] = []
         seen_canonical: set[str] = set()
         for key in indexed:
             candidate = indexed[key]
@@ -323,12 +325,6 @@ class EvidenceAssembler:
             seen_canonical.add(canonical)
             domain = _domain_of(final_url)
             publisher = _publisher_of(candidate, verdict)
-            group_label = _independence_group(
-                candidate,
-                final_url,
-                groups,
-                publisher=publisher,
-            )
 
             relation = verdict.get("relation", SourceRelation.UNKNOWN)
             if relation is SourceRelation.PRIMARY:
@@ -360,13 +356,15 @@ class EvidenceAssembler:
                 citable=_citable(candidate, plan),
                 safety_flags=candidate.safety_flags,
                 supported_topics=tuple(verdict.get("supported_topics", ())),
-                independence_group=group_label,
+                independence_group=None,
                 conflict_key=verdict.get("conflict_key"),
                 conflict_value=verdict.get("conflict_value"),
                 conflict_relation=verdict.get("conflict_relation"),
             )
             admitted.append(item)
+            provenance.append(_provenance_of(candidate, final_url, publisher=publisher))
 
+        admitted = _assign_independence_groups(admitted, provenance)
         ordered = _order_by_relevance(admitted)
         ordered = _assign_evidence_ids(ordered)
         bundle = self._build_bundle(plan, ordered)
@@ -571,56 +569,87 @@ def _publisher_of(candidate: EvidenceCandidate, verdict: Mapping[str, Any]) -> s
     return None
 
 
-def _independence_group(
+@dataclass(frozen=True)
+class _Provenance:
+    keys: frozenset[str]
+    normalized_excerpt: str
+    stable_key: str
+
+
+def _provenance_of(
     candidate: EvidenceCandidate,
     url: str,
-    groups: list[dict[str, Any]],
     *,
     publisher: str | None,
-) -> str:
-    """Group by source/domain provenance, and collapse syndicated copies.
-
-    Different wording on one domain is never independent. Near-identical text
-    across domains is also one provenance group.
-    """
+) -> _Provenance:
     domain = _domain_of(url) or _canonical_url(url)
     registrable = _registrable_domain(domain)
     publisher_key = _normalized_identity(publisher)
-    normalized = _normalized_identity(candidate.excerpt)[:600]
-    canonical_marker = next(
-        (
-            flag.split(":", 1)[1]
-            for flag in candidate.hit.quality_flags
-            if flag.startswith("canonical_source:") and ":" in flag
-        ),
-        None,
+    keys: set[str] = set()
+    if registrable:
+        keys.add(f"domain:{registrable}")
+    if publisher_key:
+        keys.add(f"publisher:{publisher_key}")
+    for flag in candidate.hit.quality_flags:
+        prefix, separator, raw_value = flag.partition(":")
+        if not separator or prefix not in {"canonical_source", "syndication_source"}:
+            continue
+        marker = " ".join(raw_value.strip().casefold().split())
+        if marker:
+            keys.add(f"{prefix}:{marker}")
+    return _Provenance(
+        keys=frozenset(keys),
+        normalized_excerpt=_normalized_identity(candidate.excerpt)[:600],
+        stable_key=_canonical_url(url),
     )
-    for group in groups:
-        if registrable and registrable in group["registrable_domains"]:
-            group["domains"].add(domain)
-            return group["id"]
-        if publisher_key and publisher_key in group["publishers"]:
-            group["domains"].add(domain)
-            return group["id"]
-        if canonical_marker and canonical_marker == group["canonical_marker"]:
-            group["domains"].add(domain)
-            return group["id"]
-        prior = group["normalized"]
-        if len(normalized) >= 12 and len(prior) >= 12 and SequenceMatcher(None, normalized, prior).ratio() >= 0.92:
-            group["domains"].add(domain)
-            return group["id"]
-    label = f"g{len(groups) + 1}"
-    groups.append(
-        {
-            "id": label,
-            "domains": {domain},
-            "registrable_domains": {registrable} if registrable else set(),
-            "publishers": {publisher_key} if publisher_key else set(),
-            "normalized": normalized,
-            "canonical_marker": canonical_marker,
-        }
+
+
+def _assign_independence_groups(
+    items: Sequence[EvidenceItem],
+    provenance: Sequence[_Provenance],
+) -> list[EvidenceItem]:
+    """Assign order-independent transitive provenance components."""
+    parents = list(range(len(items)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(provenance)):
+        for right in range(left + 1, len(provenance)):
+            left_source = provenance[left]
+            right_source = provenance[right]
+            same_keys = not left_source.keys.isdisjoint(right_source.keys)
+            left_text = left_source.normalized_excerpt
+            right_text = right_source.normalized_excerpt
+            same_text = (
+                len(left_text) >= 12
+                and len(right_text) >= 12
+                and SequenceMatcher(None, left_text, right_text).ratio() >= 0.92
+            )
+            if same_keys or same_text:
+                union(left, right)
+
+    components: dict[int, list[int]] = {}
+    for index in range(len(items)):
+        components.setdefault(find(index), []).append(index)
+    ordered_roots = sorted(
+        components,
+        key=lambda root: min(provenance[index].stable_key for index in components[root]),
     )
-    return label
+    labels = {root: f"g{index}" for index, root in enumerate(ordered_roots, 1)}
+    return [
+        replace(item, independence_group=labels[find(index)])
+        for index, item in enumerate(items)
+    ]
 
 
 def _order_by_relevance(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
@@ -708,13 +737,15 @@ def _detect_conflicts(
     return tuple(sorted(conflicts, key=lambda conflict: conflict.conflict_id))
 
 
-def _normalized_topic(value: str) -> str:
-    return _normalized_identity(value)
+def _canonical_topic(value: str) -> str:
+    """Canonicalize an opaque topic label without erasing meaningful symbols."""
+    normalized = unicodedata.normalize("NFC", str(value or "")).casefold()
+    return " ".join(normalized.split())
 
 
 def _topic_matches(required: str, supported: str) -> bool:
-    required_key = _normalized_topic(required)
-    supported_key = _normalized_topic(supported)
+    required_key = _canonical_topic(required)
+    supported_key = _canonical_topic(supported)
     if not required_key or not supported_key:
         return False
     return supported_key == required_key

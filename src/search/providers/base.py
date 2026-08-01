@@ -113,6 +113,7 @@ class ProviderRegistry:
     ) -> ProviderSearchOutcome:
         """Search with immutable, request-local attempt truth for orchestration."""
         attempts: list[ProviderAttempt] = []
+        scheduled_result: ProviderResult | None = None
         duration = max(float(timeout_seconds), 0.0)
         deadline = time.monotonic() + duration
         if duration <= 0:
@@ -141,6 +142,7 @@ class ProviderRegistry:
                 on_attempt_started=on_attempt_started,
                 on_attempt_finished=on_attempt_finished,
             )
+            scheduled_result = result
             if attempt is not None:
                 attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
@@ -158,12 +160,15 @@ class ProviderRegistry:
                 on_attempt_started=on_attempt_started,
                 on_attempt_finished=on_attempt_finished,
             )
+            scheduled_result = result
             if attempt is not None:
                 attempts.append(attempt)
             if result.status is ProviderStatus.SUCCESS and result.hits:
                 return self._outcome(result, attempts)
 
         if not attempts:
+            if scheduled_result is not None:
+                return ProviderSearchOutcome(scheduled_result, ())
             # No adapter was actually invoked: this is a readiness failure, not
             # an attempted invocation.
             return ProviderSearchOutcome(
@@ -265,7 +270,7 @@ class ProviderRegistry:
                 latency_ms=max(elapsed_ms, 0),
             )
 
-        attempt = self._attempt(provider, query, result)
+        attempt = self._attempt(provider, query, result, readiness)
         if on_attempt_finished is not None:
             try:
                 on_attempt_finished(attempt)
@@ -278,8 +283,12 @@ class ProviderRegistry:
         return max(deadline - time.monotonic(), 0.0)
 
     @staticmethod
-    def _attempt(provider: SearchProvider, query: SearchQuery, result: ProviderResult) -> ProviderAttempt:
-        readiness = provider.readiness()
+    def _attempt(
+        provider: SearchProvider,
+        query: SearchQuery,
+        result: ProviderResult,
+        readiness: ProviderReadiness,
+    ) -> ProviderAttempt:
         return ProviderAttempt(
             provider=provider.name,
             status=result.status,

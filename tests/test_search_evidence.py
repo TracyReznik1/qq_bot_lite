@@ -6,6 +6,7 @@ import importlib
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from itertools import permutations
 
 from src.search.models import (
     CandidateRelevance,
@@ -397,6 +398,102 @@ class EvidenceDedupTests(unittest.TestCase):
         )
         self.assertIn("single_source_authority", bundle.limitations)
 
+    def test_domain_to_publisher_bridge_is_transitive_in_every_order(self):
+        specs = (
+            ("https://www.vendor.example/status", "Vendor Org", (), "厂商主站确认当前状态。"),
+            ("https://news.vendor.example/report", "Affiliate Media", (), "新闻子站采用不同措辞报道。"),
+            ("https://affiliate.invalid/report", "Affiliate Media", (), "关联出版方独立撰写另一篇报道。"),
+        )
+
+        for ordered_specs in permutations(specs):
+            with self.subTest(order=tuple(spec[0] for spec in ordered_specs)):
+                bundle = self._deep_bridge_bundle(ordered_specs)
+                self.assertEqual(len(bundle.evidence_items), 3)
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    1,
+                )
+                self.assertIn("single_source_authority", bundle.limitations)
+
+    def test_publisher_to_canonical_marker_bridge_is_transitive_in_every_order(self):
+        specs = (
+            ("https://publisher.example/a", "Shared Publisher", (), "来源甲采用独立表述。"),
+            (
+                "https://bridge.invalid/b",
+                "Shared Publisher",
+                ("canonical_source:wire-story-42",),
+                "桥接来源乙采用另一种表述。",
+            ),
+            (
+                "https://copy.invalid/c",
+                "Copy Publisher",
+                ("canonical_source:wire-story-42",),
+                "转载来源丙采用第三种表述。",
+            ),
+        )
+
+        for ordered_specs in permutations(specs):
+            with self.subTest(order=tuple(spec[0] for spec in ordered_specs)):
+                bundle = self._deep_bridge_bundle(ordered_specs)
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    1,
+                )
+
+    def test_text_to_syndication_bridge_is_transitive_in_every_order(self):
+        syndicated_text = "同一篇转载文章逐字说明当前动态状态与发布日期。"
+        specs = (
+            ("https://origin.example/a", "Origin Publisher", (), syndicated_text),
+            (
+                "https://bridge.invalid/b",
+                "Bridge Publisher",
+                ("syndication_source:wire-story-99",),
+                syndicated_text,
+            ),
+            (
+                "https://copy.invalid/c",
+                "Copy Publisher",
+                ("syndication_source:wire-story-99",),
+                "转载方针对同一稿件另写摘要。",
+            ),
+        )
+
+        for ordered_specs in permutations(specs):
+            with self.subTest(order=tuple(spec[0] for spec in ordered_specs)):
+                bundle = self._deep_bridge_bundle(ordered_specs)
+                self.assertEqual(
+                    len({item.independence_group for item in bundle.evidence_items}),
+                    1,
+                )
+
+    def _deep_bridge_bundle(self, specs):
+        judged = {
+            f"C{index}": judge_ok(
+                f"C{index}",
+                relation="primary" if index == 1 else "independent",
+                supported=("动态",),
+                publisher=publisher,
+            )
+            for index, (_url, publisher, _flags, _text) in enumerate(specs, 1)
+        }
+        candidates = tuple(
+            replace(
+                candidate(
+                    url=url,
+                    content=text,
+                ),
+                hit=replace(candidate(url=url, content=text).hit, quality_flags=flags),
+                excerpt_origin=ExcerptOrigin.PAGE_EXTRACT,
+                extraction_status="page_extract",
+                content_reads_consumed=1,
+            )
+            for url, _publisher, flags, text in specs
+        )
+        return self.module.EvidenceAssembler(StaticEvidenceJudge(judged)).assemble(
+            plan(required_topics=("动态",), route=SearchTier.DEEP),
+            candidates,
+        )
+
 
 class EvidenceStateTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -723,6 +820,56 @@ class EvidenceStateTests(unittest.TestCase):
 
         self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIn("東京大学の入学要件", bundle.missing_claim_topics)
+
+    def test_meaningful_topic_symbols_do_not_create_c_cpp_csharp_aliases(self):
+        unequal_labels = (
+            ("C", "C++"),
+            ("C++", "C"),
+            ("C", "C#"),
+            ("C#", "C"),
+            ("C++", "C#"),
+            ("C#", "C++"),
+        )
+
+        for required, supported in unequal_labels:
+            with self.subTest(required=required, supported=supported):
+                judge = StaticEvidenceJudge(
+                    {"C1": judge_ok("C1", supported=(supported,), relation="primary")}
+                )
+                bundle = self.module.EvidenceAssembler(judge).assemble(
+                    plan(required_topics=(required,)),
+                    (candidate(content=f"正文只支持 {supported} 标签。"),),
+                )
+                self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+                self.assertIn(required, bundle.missing_claim_topics)
+
+    def test_nfc_and_nfd_topic_labels_are_equivalent_in_both_directions(self):
+        nfc = "がん治療ガイド"
+        nfd = "か\u3099ん治療カ\u3099イト\u3099"
+
+        for required, supported in ((nfc, nfd), (nfd, nfc)):
+            with self.subTest(required=required, supported=supported):
+                judge = StaticEvidenceJudge(
+                    {"C1": judge_ok("C1", supported=(supported,), relation="primary")}
+                )
+                bundle = self.module.EvidenceAssembler(judge).assemble(
+                    plan(required_topics=(required,)),
+                    (candidate(content="がん治療ガイドについて説明する本文。"),),
+                )
+                self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+                self.assertEqual(bundle.missing_claim_topics, ())
+
+    def test_topic_identity_normalizes_case_and_whitespace(self):
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("rust   言語",), relation="primary")}
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(required_topics=("  RUST\t言語  ",)),
+            (candidate(content="Rust 言語について説明する本文。"),),
+        )
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual(bundle.missing_claim_topics, ())
 
 
 class EvidenceGapTests(unittest.TestCase):

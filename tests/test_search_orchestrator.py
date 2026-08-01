@@ -518,6 +518,62 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertTrue(result.trace.provider_invocation_started)
         self._assert_bundle_trace_mirror(result)
 
+    def test_adapter_queue_expiry_is_timeout_without_semantic_execution(self):
+        from src.search.providers import base as provider_base
+
+        release_workers = threading.Event()
+        all_workers_started = threading.Event()
+        worker_lock = threading.Lock()
+        started_workers = 0
+
+        def occupy_worker():
+            nonlocal started_workers
+            with worker_lock:
+                started_workers += 1
+                if started_workers == 8:
+                    all_workers_started.set()
+            release_workers.wait(timeout=2.0)
+
+        blockers = [provider_base._ADAPTER_EXECUTOR.submit(occupy_worker) for _ in range(8)]
+        self.assertTrue(all_workers_started.wait(timeout=1.0))
+
+        class QueuedProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                raise AssertionError("queued provider must never start")
+
+        provider = QueuedProvider()
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+        )
+
+        try:
+            result, elapsed = self._run_with_short_budget(orchestrator)
+        finally:
+            release_workers.set()
+            for blocker in blockers:
+                blocker.result(timeout=1.0)
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(result.trace.provider_attempts, ())
+        self.assertEqual(result.trace.executed_queries, ())
+        self.assertFalse(result.trace.provider_invocation_started)
+        self.assertEqual(result.trace.to_log_dict()["semantic_query_count"], 0)
+
     def test_fallback_timeout_keeps_completed_primary_and_real_fallback_truth(self):
         class ErrorPrimary:
             name = "tavily"
