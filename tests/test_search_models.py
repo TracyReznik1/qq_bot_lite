@@ -3,7 +3,7 @@ import importlib.util
 import json
 import math
 import unittest
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal
 
 
@@ -19,6 +19,122 @@ def model_spec():
         return importlib.util.find_spec("src.search.models")
     except ModuleNotFoundError:
         return None
+
+
+class SearchModelFixtures:
+    """Small valid records used by the exhaustive contract tables."""
+
+    def __init__(self, module):
+        self.m = module
+
+    def decision(self):
+        m = self.m
+        return m.RetrievalDecision(
+            m.SearchTier.LIGHT, None, False, (), frozenset(), m.Factuality.FACTUAL,
+            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
+            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, (),
+        )
+
+    def budget(self):
+        return self.m.DEFAULT_TIER_BUDGETS[self.m.SearchTier.LIGHT]
+
+    def query(self):
+        m = self.m
+        return m.SearchQuery(
+            "q1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "query text"
+        )
+
+    def plan(self):
+        m = self.m
+        return m.SearchPlan(
+            self.decision(), "question", m.PlanningStatus.NORMAL, (), None,
+            (self.query(),), (), frozenset(), (), self.budget(),
+        )
+
+    def repair_plan(self):
+        return self.m.RepairPlan(False, (), None)
+
+    def hit(self):
+        return self.m.ProviderHit(
+            "tavily", "q1", "title", "https://example.invalid",
+            None, None, None, None, (),
+        )
+
+    def evidence_item(self):
+        m = self.m
+        return m.EvidenceItem(
+            "e1", "q1", "tavily", "title", "https://example.invalid",
+            None, "example.invalid", "Example", m.SourceRelation.PRIMARY,
+            None, None, None, "excerpt", m.ExcerptOrigin.PROVIDER_SNIPPET,
+            "ok", 1.0, 1.0, True, m.Freshness.NONE, True, (), (), "source-1",
+        )
+
+    def gap_analysis(self):
+        return self.m.EvidenceGapAnalysis((), (), False, None, ())
+
+    def bundle(self):
+        m = self.m
+        return m.EvidenceBundle(
+            "req-1", self.decision(), self.plan(), (), (), self.gap_analysis(),
+            self.repair_plan(), 1, (), m.EvidenceState.INSUFFICIENT,
+            (), (), (), (),
+        )
+
+    def document(self):
+        return self.m.FetchedDocument(
+            "https://example.invalid", None, None, None, None, "not_read", ()
+        )
+
+    def candidate(self):
+        return self.m.EvidenceCandidate(
+            self.hit(), None, None, None, "provider_snippet", (), 0
+        )
+
+    def claim(self):
+        return self.m.Claim("c1", "b1", "claim", True, ())
+
+    def answer_block(self):
+        return self.m.AnswerBlock("b1", "paragraph", "answer", ())
+
+    def draft(self):
+        return self.m.GroundedDraft((), (), (), (), False)
+
+    def validation_report(self):
+        return self.m.ValidationReport(self.draft(), (), (), (), {}, ())
+
+    def rendered_reply(self):
+        return self.m.RenderedReply("answer", (), (), (), ())
+
+    def trace_with_value(self, location, value):
+        m = self.m
+        trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT)
+        if location == "request_id":
+            trace.request_id = value
+        elif location == "adaptive_repair_query.query_id":
+            trace.adaptive_repair_query = (value, m.QueryPurpose.REPAIR)
+        elif location == "executed_queries[].query_id":
+            trace.executed_queries = ((value, m.QueryPurpose.DIRECT),)
+        elif location == "provider_attempts[].provider":
+            attempt = m.ProviderAttempt("tavily", m.ProviderStatus.SUCCESS, 1, 1)
+            # The final boundary must stay safe even if an upstream record is
+            # populated outside its constructor.
+            object.__setattr__(attempt, "provider", value)
+            trace.provider_attempts = (attempt,)
+        else:
+            raise AssertionError(f"unknown Trace location: {location}")
+        return trace
+
+    @staticmethod
+    def logged_value(logged, location):
+        if location == "request_id":
+            return logged["request_id"]
+        if location == "adaptive_repair_query.query_id":
+            return logged["adaptive_repair_query"]["query_id"]
+        if location == "executed_queries[].query_id":
+            return logged["executed_queries"][0]["query_id"]
+        if location == "provider_attempts[].provider":
+            return logged["provider_attempts"][0]["provider"]
+        raise AssertionError(f"unknown Trace location: {location}")
 
 
 class SearchModelContractTests(unittest.TestCase):
@@ -350,15 +466,137 @@ class SearchModelContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT, provider_attempts=(Decimal("1"),)).to_log_dict()
 
-    def test_trace_final_boundary_redacts_all_identifier_locations(self):
+    def test_trace_final_boundary_uses_closed_identifier_and_provider_tables(self):
         m = models()
-        probes = ("https://private.invalid/a", "sk-live-secret", "qq=123456789", "raw query text", "a@b.com")
-        for probe in probes:
-            with self.subTest(probe=probe):
-                trace = m.SearchTrace(probe, m.RequestSource.CHAT, m.SearchTier.LIGHT, adaptive_repair_query=(probe, m.QueryPurpose.REPAIR), executed_queries=((probe, m.QueryPurpose.DIRECT),))
-                payload = json.dumps(trace.to_log_dict())
-                self.assertNotIn(probe, payload)
-                self.assertIn("[redacted]", payload)
+        fixtures = SearchModelFixtures(m)
+        locations = (
+            "request_id",
+            "adaptive_repair_query.query_id",
+            "executed_queries[].query_id",
+            "provider_attempts[].provider",
+        )
+        forbidden_probes = (
+            "weather",
+            "weather-2026",
+            "raw query text",
+            "http://example.invalid/path",
+            "HTTP://EXAMPLE.INVALID/PATH",
+            "ftp://example.invalid/file",
+            "www.example.invalid",
+            "sk-live-secret",
+            "sk-123456789",
+            "xoxb-123456789-secret",
+            "api_key=secret",
+            "apikey-123456789",
+            "token=secret",
+            "token-123456789",
+            "qq=123456789",
+            "qq:123456789",
+            "qq-123456789",
+            "group=987654321",
+            "group:987654321",
+            "group_id=987654321",
+            "group-987654321",
+            "data:image/png;base64,abc",
+            "DATA:IMAGE/PNG;BASE64,ABC",
+            "cq:image,file=secret.png",
+            "CQ:IMAGE,FILE=SECRET.PNG",
+            "user@example.invalid",
+        )
+        for location in locations:
+            for probe in forbidden_probes:
+                with self.subTest(location=location, probe=probe):
+                    logged = fixtures.trace_with_value(location, probe).to_log_dict()
+                    self.assertEqual(
+                        "[redacted]", fixtures.logged_value(logged, location)
+                    )
+                    payload = json.dumps(logged)
+                    self.assertNotIn(probe, payload)
+
+        valid_ids = (
+            "req-1",
+            "initial-1",
+            "repair-1",
+            "q1",
+            "Q1",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "123e4567-e89b-12d3-a456-426614174000",
+        )
+        for location in locations[:3]:
+            for valid_id in valid_ids:
+                with self.subTest(location=location, valid_id=valid_id):
+                    logged = fixtures.trace_with_value(location, valid_id).to_log_dict()
+                    self.assertEqual(valid_id, fixtures.logged_value(logged, location))
+                    json.dumps(logged)
+        for provider in ("tavily", "ddgs"):
+            with self.subTest(location=locations[3], provider=provider):
+                logged = fixtures.trace_with_value(locations[3], provider).to_log_dict()
+                self.assertEqual(provider, fixtures.logged_value(logged, locations[3]))
+                json.dumps(logged)
+
+    def test_scalar_string_collection_fields_reject_all_21_scalar_inputs(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        cases = (
+            ("SearchQuery.include_domains", fixtures.query(), "include_domains"),
+            ("SearchPlan.entities", fixtures.plan(), "entities"),
+            ("SearchPlan.required_topics", fixtures.plan(), "required_topics"),
+            ("SearchPlan.query_redaction_codes", fixtures.plan(), "query_redaction_codes"),
+            ("RepairPlan.gap_codes", fixtures.repair_plan(), "gap_codes"),
+            ("ProviderHit.quality_flags", fixtures.hit(), "quality_flags"),
+            ("EvidenceItem.safety_flags", fixtures.evidence_item(), "safety_flags"),
+            ("EvidenceItem.supported_topics", fixtures.evidence_item(), "supported_topics"),
+            ("EvidenceGapAnalysis.missing_claim_topics", fixtures.gap_analysis(), "missing_claim_topics"),
+            ("EvidenceBundle.initial_evidence_ids", fixtures.bundle(), "initial_evidence_ids"),
+            ("EvidenceBundle.limitations", fixtures.bundle(), "limitations"),
+            ("FetchedDocument.untrusted_content_flags", fixtures.document(), "untrusted_content_flags"),
+            ("EvidenceCandidate.safety_flags", fixtures.candidate(), "safety_flags"),
+            ("Claim.evidence_ids", fixtures.claim(), "evidence_ids"),
+            ("AnswerBlock.claim_ids", fixtures.answer_block(), "claim_ids"),
+            ("GroundedDraft.limitations", fixtures.draft(), "limitations"),
+            ("ValidationReport.removed_block_ids", fixtures.validation_report(), "removed_block_ids"),
+            ("ValidationReport.limitations", fixtures.validation_report(), "limitations"),
+            ("RenderedReply.chunks", fixtures.rendered_reply(), "chunks"),
+            ("RenderedReply.used_evidence_ids", fixtures.rendered_reply(), "used_evidence_ids"),
+            ("RenderedReply.shown_source_urls", fixtures.rendered_reply(), "shown_source_urls"),
+        )
+        self.assertEqual(21, len(cases))
+        for name, record, field_name in cases:
+            with self.subTest(field=name):
+                with self.assertRaises(TypeError):
+                    replace(record, **{field_name: "abc"})
+
+    def test_nested_record_slots_enforce_all_36_shapes(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        cases = (
+            ("SearchPlan.decision", fixtures.plan(), "decision", fixtures.decision(), fixtures.budget(), False),
+            ("SearchPlan.budget", fixtures.plan(), "budget", fixtures.budget(), fixtures.decision(), False),
+            ("EvidenceBundle.decision", fixtures.bundle(), "decision", fixtures.decision(), fixtures.plan(), False),
+            ("EvidenceBundle.plan", fixtures.bundle(), "plan", fixtures.plan(), fixtures.decision(), False),
+            ("EvidenceBundle.gap_analysis", fixtures.bundle(), "gap_analysis", fixtures.gap_analysis(), fixtures.plan(), False),
+            ("EvidenceBundle.repair_plan", fixtures.bundle(), "repair_plan", fixtures.repair_plan(), fixtures.gap_analysis(), False),
+            ("EvidenceCandidate.hit", fixtures.candidate(), "hit", fixtures.hit(), fixtures.document(), False),
+            ("EvidenceCandidate.document", fixtures.candidate(), "document", fixtures.document(), fixtures.hit(), True),
+            ("ValidationReport.draft", fixtures.validation_report(), "draft", fixtures.draft(), fixtures.answer_block(), False),
+        )
+        self.assertEqual(9, len(cases))
+        for name, record, field_name, correct, wrong, optional in cases:
+            shapes = (
+                ("dict", {"field": "value"}, False),
+                ("wrong_record", wrong, False),
+                ("correct_record", correct, True),
+                ("none", None, optional),
+            )
+            for shape, value, accepted in shapes:
+                with self.subTest(field=name, shape=shape):
+                    if accepted:
+                        updated = replace(record, **{field_name: value})
+                        self.assertIs(value, getattr(updated, field_name))
+                    else:
+                        with self.assertRaises(TypeError):
+                            replace(record, **{field_name: value})
 
     def test_evidence_candidate_read_accounting_is_closed(self):
         m = models()
@@ -392,11 +630,29 @@ class SearchModelContractTests(unittest.TestCase):
 
     def test_provider_readiness_and_result_state_tables(self):
         m = models()
-        for values in ((True, True, None), (False, False, m.SearchFailureCode.PROVIDER_NOT_CONFIGURED), (True, False, m.SearchFailureCode.PROVIDER_UNAVAILABLE)):
-            m.ProviderReadiness("provider", *values)
-        for values in ((False, True, None), (True, True, m.SearchFailureCode.PROVIDER_UNAVAILABLE), (False, False, None)):
-            with self.assertRaises(ValueError):
-                m.ProviderReadiness("provider", *values)
+        valid_readiness_states = {
+            (False, False, m.SearchFailureCode.PROVIDER_NOT_CONFIGURED),
+            (True, False, m.SearchFailureCode.PROVIDER_UNAVAILABLE),
+            (True, True, None),
+        }
+        accepted = 0
+        reasons = (None, *tuple(m.SearchFailureCode))
+        for configured in (False, True):
+            for available in (False, True):
+                for reason in reasons:
+                    values = (configured, available, reason)
+                    with self.subTest(
+                        configured=configured, available=available, reason=reason
+                    ):
+                        if values in valid_readiness_states:
+                            m.ProviderReadiness("provider", *values)
+                            accepted += 1
+                        else:
+                            with self.assertRaises((TypeError, ValueError)):
+                                m.ProviderReadiness("provider", *values)
+        self.assertEqual(44, 4 * len(reasons))
+        self.assertEqual(3, accepted)
+
         hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, ())
         m.ProviderResult("p", m.ProviderStatus.SUCCESS, [hit], 1)
         m.ProviderResult("p", m.ProviderStatus.EMPTY, [], 1)

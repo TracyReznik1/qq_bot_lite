@@ -854,6 +854,6 @@ def _json_safe(value: Any) -> Any:
 
 def _safe_log_identifier(value: Any) -> str:
     import re
-    if not isinstance(value, str) or not re.fullmatch(r"(?:[Qq][0-9]+|[a-z]+-[0-9]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,64})", value):
+    if not isinstance(value, str) or not re.fullmatch(r"(?:req-[0-9]+|initial-[0-9]+|repair-[0-9]+|[Qq][0-9]+|[0-9a-fA-F]{16}|[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", value):
         return "[redacted]"
     return value
