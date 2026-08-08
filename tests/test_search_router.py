@@ -454,6 +454,59 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         self.assertIs(decision.route, SearchTier.DEEP)
 
 
+class FreshnessAndGreetingRegressionTests(unittest.TestCase):
+    def test_model_high_freshness_cannot_remain_light(self):
+        payload = {
+            **NEUTRAL,
+            "freshness": "high",
+            "recommended_tier": "light",
+            "trigger_codes": ["freshness_marker"],
+        }
+        decision = decide("昨天天曼契约EDGVSTEC谁赢了", payload)
+        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.program_minimum_tier, SearchTier.DEEP)
+        self.assertIn(TriggerCode.FRESHNESS_MARKER, decision.trigger_codes)
+        self.assertEqual(decision.trigger_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
+        self.assertEqual(decision.final_reason_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
+
+    def test_model_high_freshness_sets_deep_floor_without_question_signal(self):
+        payload = {
+            **NEUTRAL,
+            "freshness": "high",
+            "recommended_tier": "light",
+            "trigger_codes": ["freshness_marker"],
+        }
+        decision = decide("什么是光合作用", payload)
+        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.program_minimum_tier, SearchTier.DEEP)
+
+    def test_relative_time_and_result_intent_is_deep_without_model_help(self):
+        for question in (
+            "昨天EDG和TEC谁赢了",
+            "前天比赛比分是多少",
+            "本周排名结果如何",
+            "刚刚发生了什么",
+        ):
+            with self.subTest(question=question):
+                self.assertIs(decide(question, NEUTRAL).route, SearchTier.DEEP)
+
+    def test_pure_greetings_skip_search(self):
+        for question in ("你好", "您好！", "下午好", "晚上好，ATRI", "哈喽"):
+            with self.subTest(question=question):
+                decision = decide(question, {})
+                self.assertIs(decision.route, SearchTier.SKIP)
+                self.assertIs(decision.skip_reason, SkipReason.SOCIAL_OR_EMOTIONAL)
+
+    def test_greeting_plus_current_fact_does_not_skip(self):
+        decision = decide("下午好，昨天EDG赢了吗", NEUTRAL)
+        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIsNone(decision.skip_reason)
+
+    def test_result_variant_without_relative_time_stays_light(self):
+        decision = decide("他赢了吗", NEUTRAL)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+
 def _tier_index(tier: SearchTier) -> int:
     return {SearchTier.SKIP: 0, SearchTier.LIGHT: 1, SearchTier.STANDARD: 2, SearchTier.DEEP: 3}[tier]
 

@@ -185,6 +185,35 @@ _DATED_EXTERNAL_CONTEXT = (
     "汇率",
 )
 
+_RELATIVE_TIME_MARKERS = (
+    "今天", "今日", "昨天", "昨日", "前天", "刚刚", "最近", "近期",
+    "目前", "现在", "当前", "实时", "本周", "上周", "本月", "上月",
+    "今年", "去年",
+)
+
+_CURRENT_RESULT_INTENTS = (
+    "谁赢了", "赢了", "胜负", "比分", "赛果", "比赛结果", "排名",
+    "发生了什么", "结果如何", "最新进展",
+)
+
+_PURE_GREETING_PREFIXES = (
+    "你好", "您好", "嗨", "哈喽", "在吗", "早上好", "中午好",
+    "下午好", "晚上好", "晚安",
+)
+
+_GREETING_VOCATIVES = ("", "atri", "亚托莉", "机器人")
+
+
+def _is_pure_greeting(question: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(question or "")).casefold()
+    normalized = re.sub(r"[\s，,。.!！?？、~～]+", "", normalized)
+    return any(
+        normalized == f"{greeting}{vocative}"
+        for greeting in _PURE_GREETING_PREFIXES
+        for vocative in _GREETING_VOCATIVES
+    )
+
+
 # Dynamic-attribute words only force a DEEP/current-state floor when the
 # request asks about the current value/state, not for a stable definition.
 _DYNAMIC_ATTRIBUTE_WORDS = ("版本", "价格", "行情", "利率", "汇率")
@@ -214,6 +243,14 @@ def _detect_current_state(question: str) -> tuple[TriggerCode, ...]:
             if any(context in lowered for context in _DATED_EXTERNAL_CONTEXT):
                 codes.append(TriggerCode.FRESHNESS_MARKER)
                 break
+    if (
+        any(marker in lowered for marker in _RELATIVE_TIME_MARKERS)
+        and (
+            any(context in lowered for context in _DATED_EXTERNAL_CONTEXT)
+            or any(intent in lowered for intent in _CURRENT_RESULT_INTENTS)
+        )
+    ):
+        codes.append(TriggerCode.FRESHNESS_MARKER)
     return _dedupe_codes(codes)
 
 
@@ -928,6 +965,9 @@ _LOGIC_MARKERS = (
 
 
 def _classify_closed_task(question: str) -> SkipReason | None:
+    if _is_pure_greeting(question):
+        return SkipReason.SOCIAL_OR_EMOTIONAL
+
     lowered = question.casefold()
     has_provided_content = any(marker in question for marker in _PROVIDED_CONTENT_MARKERS)
 
@@ -1343,6 +1383,10 @@ def _compute_floors(
     codes: list[TriggerCode] = []
 
     safety_intent = _classify_safety_intent(question)
+    if classification.freshness is Freshness.HIGH:
+        floor = _max_tier(floor, SearchTier.DEEP)
+        codes.append(TriggerCode.FRESHNESS_MARKER)
+
     current_state_codes = (
         () if safety_intent == _SAFETY_STABLE else _detect_current_state(question)
     )
