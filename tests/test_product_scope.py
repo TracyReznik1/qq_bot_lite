@@ -85,6 +85,41 @@ class ProductScopeTests(unittest.TestCase):
         finalize.assert_called_once()
         self.assertIsNotNone(trace.response_started_at)
 
+    def test_compatibility_search_success_has_no_status_banner(self):
+        trace = SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchTier.LIGHT)
+        evidence = SimpleNamespace(
+            evidence_items=(
+                SimpleNamespace(
+                    title="Example",
+                    url="https://example.com/page",
+                    excerpt="版本是3.2",
+                ),
+            ),
+        )
+        pipeline_result = SimpleNamespace(
+            decision=SimpleNamespace(route=SearchTier.LIGHT),
+            evidence=evidence,
+            failure_code=None,
+            trace=trace,
+        )
+        orchestrator = mock.Mock(run=mock.Mock(return_value=pipeline_result))
+        with (
+            mock.patch.object(
+                search_service,
+                "get_search_orchestrator",
+                return_value=orchestrator,
+            ),
+            mock.patch("src.search.orchestrator.finalize_search_trace"),
+        ):
+            result = search_service.search("当前版本是什么")
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("搜索状态：success", result.text)
+        self.assertNotIn("搜索成功", result.text)
+        self.assertNotIn("检索完成", result.text)
+        self.assertIn("版本是3.2", result.text)
+        self.assertIn("https://example.com/page", result.text)
+
     def test_gemini_runtime_uses_native_stateless_generate_content(self):
         source = (
             ROOT / "src" / "services" / "gemini_client.py"

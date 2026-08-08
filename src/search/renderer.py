@@ -28,6 +28,9 @@ _EXPLICIT_SEARCH_FAILED = "你要求了在线搜索，但本次检索未成功�
 _SEMANTIC_UNAVAILABLE = "已获得网页材料，但本次未能完成语义支撑核验；以下表述应谨慎看待。"
 _NO_WEB_DYNAMIC_LIMIT = "根据你的要求，本次没有联网核验；涉及当前状态的结论无法确认。"
 _HIGH_CONSEQUENCE_WARNING = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+_NO_WEB_HIGH_CONSEQUENCE_WARNING = (
+    "重要提示：本次未联网核验，以下内容不能替代适当的专业判断。"
+)
 
 _LIMITATION_DISCLOSURES = {
     "single_source_authority": "证据限制：本次结论主要依赖单一权威来源，缺少独立来源交叉核验。",
@@ -200,7 +203,8 @@ def render_search_reply(
     if decision.route is SearchTier.SKIP:
         disclosures: list[str] = []
         if decision.skip_reason and decision.skip_reason.value == "user_forbid_web":
-            disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
+            if not _is_high_consequence(result):
+                disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
         disclosures.extend(_search_warning_disclosures(result))
         disclosures = _dedupe_strings(disclosures)
         text = _compose_disclosures(_strip_markers(knowledge_fallback_text), disclosures)
@@ -558,15 +562,25 @@ def _limitation_disclosures(evidence: EvidenceBundle) -> list[str]:
     ]
 
 
+def _is_high_consequence(result: SearchPipelineResult) -> bool:
+    decision = result.decision
+    return (
+        decision.potential_harm is PotentialHarm.HIGH
+        or TriggerCode.HIGH_CONSEQUENCE_ACTION in decision.trigger_codes
+    )
+
+
 def _search_warning_disclosures(result: SearchPipelineResult) -> list[str]:
+    if not _is_high_consequence(result):
+        return []
     decision = result.decision
     if (
-        decision.route is not SearchTier.SKIP
-        or decision.potential_harm is PotentialHarm.HIGH
-        or TriggerCode.HIGH_CONSEQUENCE_ACTION in decision.trigger_codes
+        decision.route is SearchTier.SKIP
+        and decision.skip_reason is not None
+        and decision.skip_reason.value == "user_forbid_web"
     ):
-        return [_HIGH_CONSEQUENCE_WARNING]
-    return []
+        return [_NO_WEB_HIGH_CONSEQUENCE_WARNING]
+    return [_HIGH_CONSEQUENCE_WARNING]
 
 
 def _dedupe_strings(values: Sequence[str]) -> list[str]:

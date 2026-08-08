@@ -117,6 +117,24 @@ def result(evidence=None, failure=None, route=SearchTier.STANDARD):
     )
 
 
+def supported_report():
+    draft = GroundedDraft(
+        (AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
+        (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+        (),
+        (),
+        False,
+    )
+    return ValidationReport(
+        draft,
+        draft.answer_blocks,
+        draft.claims,
+        (),
+        {},
+        (),
+    )
+
+
 def high_consequence_result(evidence=None, failure=None):
     m = models()
     d = replace(
@@ -204,6 +222,16 @@ class FailureRenderingTests(unittest.TestCase):
         )
         self.assertIn("当前搜索服务未配置", rendered.text)
 
+    def test_ordinary_failure_keeps_failure_disclosure_without_risk_warning(self):
+        rendered = self.module.render_search_reply(
+            result(None, SearchFailureCode.NO_RESULTS, route=SearchTier.LIGHT),
+            None,
+            knowledge_fallback_text="有限知识",
+            qq_limit=1700,
+        )
+        self.assertIn("在线检索未完成", rendered.text)
+        self.assertNotIn("不能替代适当的专业判断", rendered.text)
+
     def test_dynamic_high_consequence_without_evidence_refusal(self):
         rendered = self.module.render_search_reply(
             result(None, SearchFailureCode.PROVIDER_UNAVAILABLE, route=SearchTier.DEEP), None, qq_limit=1700,
@@ -261,6 +289,7 @@ class ConflictRenderingTests(unittest.TestCase):
         self.assertIn("来源之间存在未解决差异", rendered.text)
         self.assertIn("https://a.example.com", rendered.text)
         self.assertIn("https://b.example.com", rendered.text)
+        self.assertNotIn("不能替代适当的专业判断", rendered.text)
 
     def test_conflict_section_mandatory_even_if_draft_omits(self):
         b = bundle(
@@ -276,6 +305,7 @@ class ConflictRenderingTests(unittest.TestCase):
         report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
         rendered = self.module.render_search_reply(result(b, SearchFailureCode.SOURCE_CONFLICT), report, qq_limit=1700)
         self.assertIn("来源之间存在未解决差异", rendered.text)
+        self.assertNotIn("不能替代适当的专业判断", rendered.text)
 
     def test_structured_conflict_renders_only_members_with_value_date_and_citation(self):
         first_date = datetime(2026, 7, 1, tzinfo=timezone.utc)
@@ -320,6 +350,7 @@ class ConflictRenderingTests(unittest.TestCase):
         self.assertNotIn("not-a-member.example.com", rendered.text)
         self.assertEqual(1, rendered.text.count("来源之间存在未解决差异"))
         self.assertEqual(("E1", "E2"), rendered.used_evidence_ids)
+        self.assertNotIn("不能替代适当的专业判断", rendered.text)
 
     def test_validation_failed_still_renders_conflict_members_limitations_and_warning(self):
         conflict = EvidenceConflict(
@@ -384,6 +415,22 @@ class PartialRenderingTests(unittest.TestCase):
         report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
         rendered = module.render_search_reply(result(b, SearchFailureCode.PARTIAL_EVIDENCE), report, qq_limit=1700)
         self.assertIn("以下只回答已获得证据支持的部分", rendered.text)
+        self.assertNotIn("不能替代适当的专业判断", rendered.text)
+
+    def test_high_consequence_partial_keeps_scope_disclosure_and_one_warning(self):
+        module = renderer_module()
+        b = bundle(
+            (item("E1", "https://a.example.com"),),
+            state=EvidenceState.PARTIAL,
+            missing=("历史",),
+        )
+        rendered = module.render_search_reply(
+            high_consequence_result(b, SearchFailureCode.PARTIAL_EVIDENCE),
+            supported_report(),
+            qq_limit=1700,
+        )
+        self.assertIn("以下只回答已获得证据支持的部分", rendered.text)
+        self.assertEqual(1, rendered.text.count("不能替代适当的专业判断"))
 
 
 class QQSplitTests(unittest.TestCase):
@@ -529,12 +576,12 @@ class HighConsequenceWarningTests(unittest.TestCase):
         d = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
             models().RetrievalRequest("一条腿突然没力气，要去急诊吗？")
         )
-        self.assertIs(d.route, SearchTier.LIGHT)
-        self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, d.trigger_codes)
+        self.assertIs(d.route, SearchTier.DEEP)
+        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, d.trigger_codes)
         p = replace(
             plan(),
             decision=d,
-            budget=models().DEFAULT_TIER_BUDGETS[SearchTier.LIGHT],
+            budget=models().DEFAULT_TIER_BUDGETS[SearchTier.DEEP],
         )
         b = replace(bundle((item(),)), decision=d, plan=p)
         draft = GroundedDraft(
@@ -546,10 +593,10 @@ class HighConsequenceWarningTests(unittest.TestCase):
             draft, draft.answer_blocks, draft.claims, (), {}, (),
         )
         success = models().SearchPipelineResult(
-            d, p, b, trace(SearchTier.LIGHT), None,
+            d, p, b, trace(SearchTier.DEEP), None,
         )
         failure = models().SearchPipelineResult(
-            d, p, None, trace(SearchTier.LIGHT),
+            d, p, None, trace(SearchTier.DEEP),
             SearchFailureCode.PROVIDER_NOT_CONFIGURED,
         )
 
@@ -564,26 +611,20 @@ class HighConsequenceWarningTests(unittest.TestCase):
                 self.assertEqual(1, rendered.text.count(warning))
                 self.assertIn(warning, rendered.degradation_disclosures)
 
-    def test_ordinary_stable_searched_answer_has_one_uncertainty_warning(self):
+    def test_ordinary_success_has_answer_and_source_without_warning_or_status(self):
         module = renderer_module()
-        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-        b = bundle((item(),))
-        draft = GroundedDraft(
-            (AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
-            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
-            (), (), False,
-        )
-        report = ValidationReport(
-            draft, draft.answer_blocks, draft.claims, (), {}, (),
+        rendered = module.render_search_reply(
+            result(bundle((item(),))), supported_report(), qq_limit=1700,
         )
 
-        rendered = module.render_search_reply(result(b), report, qq_limit=1700)
-
-        self.assertEqual(1, rendered.text.count(warning))
         self.assertIn("版本是3.2", rendered.text)
         self.assertIn("https://example.com/page", rendered.text)
+        self.assertNotIn("搜索结果可能不完整或不准确", rendered.text)
+        self.assertNotIn("检索完成", rendered.text)
+        self.assertNotIn("搜索成功", rendered.text)
+        self.assertNotIn("搜索状态：success", rendered.text)
 
-    def test_model_warning_is_replaced_by_one_deterministic_search_warning(self):
+    def test_high_consequence_model_warning_is_replaced_by_one_deterministic_warning(self):
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
         b = bundle((item(),))
@@ -596,12 +637,14 @@ class HighConsequenceWarningTests(unittest.TestCase):
             draft, draft.answer_blocks, draft.claims, (), {}, (),
         )
 
-        rendered = module.render_search_reply(result(b), report, qq_limit=1700)
+        rendered = module.render_search_reply(
+            high_consequence_result(b), report, qq_limit=1700,
+        )
 
         self.assertEqual(1, rendered.text.count(warning))
         self.assertEqual(1, rendered.degradation_disclosures.count(warning))
 
-    def test_closed_skip_has_no_warning_but_no_web_high_consequence_keeps_it(self):
+    def test_closed_skip_has_no_warning_but_no_web_high_consequence_gets_fixed_warning(self):
         from src.search.router import RetrievalBenefitRouter
         from tests.search_fakes import StaticRouterAdvisor
 
@@ -648,7 +691,30 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertEqual("你好呀", social_rendered.text)
         self.assertNotIn(warning, social_rendered.text)
         self.assertIs(no_web_high_consequence.route, SearchTier.SKIP)
-        self.assertEqual(1, no_web_rendered.text.count(warning))
+        self.assertEqual(1, no_web_rendered.text.count("本次未联网核验"))
+        self.assertNotIn("本次没有联网核验", no_web_rendered.text)
+        self.assertNotIn(warning, no_web_rendered.text)
+
+    def test_no_web_high_consequence_uses_no_web_warning_once(self):
+        from src.search.router import RetrievalBenefitRouter
+        from tests.search_fakes import StaticRouterAdvisor
+
+        module = renderer_module()
+        decision = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
+            models().RetrievalRequest("不要联网，我发烧39度，该吃多少布洛芬？")
+        )
+        search_result = models().SearchPipelineResult(
+            decision,
+            None,
+            None,
+            trace(SearchTier.SKIP),
+            SearchFailureCode.USER_FORBID_WEB,
+        )
+        rendered = module.render_search_reply(search_result, None, qq_limit=1700)
+
+        self.assertEqual(1, rendered.text.count("本次未联网核验"))
+        self.assertNotIn("本次没有联网核验", rendered.text)
+        self.assertNotIn("搜索结果可能不完整或不准确", rendered.text)
 
     def test_warning_is_additive_to_grounded_answer_and_not_duplicated(self):
         module = renderer_module()

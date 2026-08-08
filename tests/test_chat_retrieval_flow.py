@@ -23,6 +23,7 @@ from src.search.models import (
     RetrievalDecision,
     RetrievalRequest,
     RiskLevel,
+    SearchFailureCode,
     SearchPipelineResult,
     SearchPlan,
     SearchQuery,
@@ -35,10 +36,7 @@ from src.search.models import (
 from src.services.llm_types import ChatResponse
 
 
-_SEARCH_WARNING = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-_VALIDATION_FAILED_REPLY = (
-    "回答未能通过证据核验，已移除无法确认的内容。\n" + _SEARCH_WARNING
-)
+_VALIDATION_FAILED_REPLY = "回答未能通过证据核验，已移除无法确认的内容。"
 
 
 def models():
@@ -147,7 +145,7 @@ class SkipFlowTests(unittest.TestCase):
         )
         old = getattr(chat_service, "_search_orchestrator", None)
         chat_service._search_orchestrator = orchestrator
-        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        warning = "重要提示：本次未联网核验，以下内容不能替代适当的专业判断。"
         try:
             with (
                 _patch_memory(),
@@ -166,8 +164,10 @@ class SkipFlowTests(unittest.TestCase):
 
         provider.search.assert_not_called()
         answer_chat.assert_not_called()
-        self.assertIn("没有联网核验", reply)
         self.assertEqual(1, reply.count(warning))
+        self.assertEqual(1, reply.count("本次未联网核验"))
+        self.assertNotIn("本次没有联网核验", reply)
+        self.assertNotIn("搜索结果可能不完整或不准确", reply)
         self.assertNotIn("99毫克", reply)
 
 
@@ -234,6 +234,19 @@ class SearchFlowTests(unittest.TestCase):
         _, _, orch = self._run(result, force_search=True)
         request = orch.run.call_args.args[0]
         self.assertIs(request.request_source, RequestSource.COMMAND)
+
+    def test_normal_and_force_search_success_emit_no_status_banner(self):
+        for force_search in (False, True):
+            with self.subTest(force_search=force_search):
+                reply, _llm, _orch = self._run(
+                    search_result(SearchTier.LIGHT, bundle((item(),))),
+                    force_search=force_search,
+                )
+                self.assertIn("版本是3.2", reply)
+                self.assertIn("来源：", reply)
+                for forbidden in ("检索完成", "搜索成功", "搜索状态：success"):
+                    self.assertNotIn(forbidden, reply)
+                self.assertNotIn("不能替代适当的专业判断", reply)
 
     def test_skipped_no_web_dynamic_emits_limitation(self):
         result = search_result(skip_reason=SkipReason.USER_FORBID_WEB)
@@ -303,6 +316,21 @@ class FailureFlowTests(unittest.TestCase):
         reply, llm_chat = self._run(result)
         self.assertIn("在线检索未完成", reply)
         self.assertEqual(1, llm_chat.call_count)
+
+    def test_dynamic_low_risk_failure_does_not_use_memory_or_risk_warning(self):
+        result = search_result(
+            SearchTier.DEEP,
+            failure=SearchFailureCode.PROVIDER_TIMEOUT,
+        )
+        reply, llm_chat = self._run(
+            result,
+            text="昨天天曼契约EDGVSTEC谁赢了",
+        )
+        self.assertEqual(0, llm_chat.call_count)
+        self.assertIn("无法完成在线核验", reply)
+        self.assertNotIn("不能替代适当的专业判断", reply)
+        self.assertNotIn("EDG赢了", reply)
+        self.assertNotIn("TEC赢了", reply)
 
     def test_deep_malformed_draft_returns_validation_failed_and_trace_agrees(self):
         result = search_result(SearchTier.DEEP, bundle((item(),)))
@@ -665,6 +693,7 @@ class PartialConflictFlowTests(unittest.TestCase):
         self.assertIn("版本是3.2", reply)
         self.assertIn("以下只回答已获得证据支持的部分", reply)
         self.assertIn("https://a.example.com", reply)
+        self.assertNotIn("不能替代适当的专业判断", reply)
 
     def test_conflict_bundle_shows_sources(self):
         m = models()
@@ -691,6 +720,7 @@ class PartialConflictFlowTests(unittest.TestCase):
         self.assertIn("来源之间存在未解决差异", reply)
         self.assertIn("https://a.example.com", reply)
         self.assertIn("https://b.example.com", reply)
+        self.assertNotIn("不能替代适当的专业判断", reply)
 
 
 if __name__ == "__main__":

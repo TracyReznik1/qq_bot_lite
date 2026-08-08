@@ -79,7 +79,7 @@ def search(query: str) -> SearchResult:
             )
 
         evidence = result.evidence
-        lines = ["搜索状态：success", f"搜索词：{normalized}", ""]
+        lines: list[str] = []
         for index, item in enumerate(evidence.evidence_items, 1):
             lines.append(
                 f"{index}. {item.title or item.url}\n"
