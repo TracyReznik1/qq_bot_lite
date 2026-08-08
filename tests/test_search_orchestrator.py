@@ -24,6 +24,7 @@ from src.search.models import (
     RetrievalRequest,
     RiskLevel,
     SearchFailureCode,
+    SearchTrace,
     SearchTier,
     SkipReason,
     TriggerCode,
@@ -87,6 +88,18 @@ class OrchestratorRequestIdTests(unittest.TestCase):
             self.assertTrue(value.startswith("req-"))
             self.assertEqual(32, len(value.removeprefix("req-")))
             int(value.removeprefix("req-"), 16)
+
+    def test_uuid_request_ids_survive_trace_safe_log_round_trip(self):
+        module = orchestrator_module()
+        values = [module._new_request_id() for _index in range(1_000)]
+        logged = [
+            SearchTrace(value, RequestSource.CHAT, SearchTier.LIGHT).to_log_dict()[
+                "request_id"
+            ]
+            for value in values
+        ]
+        self.assertEqual(values, logged)
+        self.assertEqual(len(logged), len(set(logged)))
 
 
 def request(question="什么是光合作用", force_search=False):

@@ -50,6 +50,34 @@ SKIP_REASONS = {
     "closed_logic",
     "closed_context_only",
 }
+SKIP_REASON_CONTRACTS: Mapping[str, Mapping[str, Any]] = {
+    "user_forbid_web": {
+        "required_triggers": {"explicit_no_web"},
+        "allowed_triggers": {
+            "explicit_no_web", "explicit_search", "high_consequence_action",
+        },
+        "factuality": "ambiguous",
+        "allowed_degradations": {None, "user_forbid_web"},
+    },
+    "provided_text_transform": {
+        "required_triggers": set(), "allowed_triggers": set(),
+        "factuality": "mixed", "allowed_degradations": {None},
+    },
+    "provided_content_summary": {
+        "required_triggers": set(), "allowed_triggers": set(),
+        "factuality": "mixed", "allowed_degradations": {None},
+    },
+    **{
+        reason: {
+            "required_triggers": set(), "allowed_triggers": set(),
+            "factuality": "non_factual", "allowed_degradations": {None},
+        }
+        for reason in (
+            "social_or_emotional", "creative_or_roleplay", "pure_math",
+            "closed_logic", "closed_context_only",
+        )
+    },
+}
 ACTIONABILITY = {"none", "general", "personalized"}
 POTENTIAL_HARM = {"none", "low", "high"}
 QUERY_PURPOSES = {
@@ -206,7 +234,8 @@ AUDIT_FIELDS = {
     "rendered_disclosures", "stages_started",
 }
 CLAIM_AUDIT_FIELDS = {
-    "claim_id", "material", "retained", "support_label", "evidence_ids", "topic_ids",
+    "claim_id", "material", "retained", "support_label", "evidence_ids",
+    "topic_ids", "partial_topic_ids", "conflict_group_ids", "disclosure_codes",
 }
 EVIDENCE_AUDIT_FIELDS = {"evidence_id", "final_url", "relevance", "citable"}
 CONFLICT_AUDIT_FIELDS = {"group_id", "member_evidence_ids"}
@@ -237,7 +266,8 @@ STAGE_TO_LATENCY = {
 }
 RUN_MANIFEST_FIELDS = {
     "schema_version", "run_id", "provenance", "data_source", "fixture_derived",
-    "case_set_sha256", "predictions_sha256", "run_timestamp", "attestation",
+    "case_set_sha256", "recordings_sha256", "predictions_sha256",
+    "run_timestamp", "attestation",
 }
 SAMPLE_MANIFEST_FIELDS = {
     "schema_version", "sample_id", "provenance", "fixture_derived", "collected_at",
@@ -429,8 +459,48 @@ def _valid_timestamp(value: Any) -> bool:
 def _valid_http_url(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    parsed = urlsplit(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+        and _canonical_hostname(value) is not None
+    )
+
+
+def _canonical_hostname(value: str) -> str | None:
+    try:
+        host = urlsplit(value).hostname
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(host, str) or not host:
+        return None
+    normalized = unicodedata.normalize("NFKC", host).casefold()
+    if normalized.endswith("."):
+        normalized = normalized[:-1]
+    if not normalized or any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        for character in normalized
+    ):
+        return None
+    try:
+        return normalized.encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        return None
+
+
+def _canonical_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if not normalized or any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        for character in normalized
+    ):
+        return None
+    return normalized.casefold()
 
 
 def _normalized_question(value: str) -> str:
@@ -500,7 +570,12 @@ def _artifact_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _attestation_payload(manifest: Mapping[str, Any]) -> bytes:
-    unsigned = {key: value for key, value in manifest.items() if key != "attestation"}
+    unsigned = dict(manifest)
+    attestation = manifest.get("attestation")
+    if isinstance(attestation, Mapping):
+        unsigned["attestation"] = {
+            key: value for key, value in attestation.items() if key != "signature"
+        }
     return json.dumps(
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
@@ -559,7 +634,7 @@ def _fixture_evidence_urls(audits: Sequence[Mapping[str, Any]]) -> list[str]:
             url = item.get("final_url")
             if not isinstance(url, str):
                 continue
-            host = (urlsplit(url).hostname or "").casefold()
+            host = _canonical_hostname(url) or ""
             if (
                 "fixture" in host
                 or host in {"example", "example.com", "example.org", "example.net"}
@@ -577,13 +652,18 @@ def _normalized_identifier(value: Any) -> bool:
     return (
         value == normalized
         and value.casefold() != "unreviewed"
-        and all(not character.isspace() and unicodedata.category(character) != "Cc" for character in value)
+        and all(
+            not character.isspace()
+            and unicodedata.category(character) not in {"Cc", "Cf"}
+            for character in value
+        )
     )
 
 
 def _validate_run_manifest(
     manifest: Mapping[str, Any] | None,
     cases: Sequence[Mapping[str, Any]],
+    recordings: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     trusted_verifier_key: bytes | bytearray | None = None,
 ) -> list[str]:
@@ -610,6 +690,8 @@ def _validate_run_manifest(
         errors.append("run manifest invalid run_timestamp")
     if manifest.get("case_set_sha256") != _artifact_sha256(cases):
         errors.append("run manifest case_set_sha256 does not bind cases")
+    if manifest.get("recordings_sha256") != _artifact_sha256(recordings):
+        errors.append("run manifest recordings_sha256 does not bind provider recordings")
     if manifest.get("predictions_sha256") != _artifact_sha256(predictions):
         errors.append("run manifest predictions_sha256 does not bind predictions")
     fixture = manifest.get("fixture_derived") is True
@@ -1323,15 +1405,29 @@ def _evaluate_offline_impl(
     cases: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     *,
+    provider_recordings: Sequence[Mapping[str, Any]] | None = None,
     run_manifest: Mapping[str, Any] | None = None,
     trusted_verifier_key: bytes | bytearray | None = None,
 ) -> dict[str, Any]:
     failures: list[str] = []
-    artifact_errors = _validate_case_prediction_artifacts(cases, predictions)
+    if provider_recordings is None:
+        artifact_errors = _validate_case_prediction_artifacts(cases, predictions)
+        artifact_errors.append("provider recordings are required for offline evaluation")
+        recordings: Sequence[Mapping[str, Any]] = ()
+    else:
+        recordings = provider_recordings
+        observed_quotas = Counter(
+            case.get("category") for case in cases
+            if isinstance(case, Mapping) and isinstance(case.get("category"), str)
+        )
+        artifact_errors = _validate_integrity_impl(
+            cases, recordings, predictions,
+            expected_case_count=len(cases), category_quotas=observed_quotas,
+        )
     if artifact_errors:
         failures.append("offline case/prediction integrity errors")
     manifest_errors = _validate_run_manifest(
-        run_manifest, cases, predictions, trusted_verifier_key,
+        run_manifest, cases, recordings, predictions, trusted_verifier_key,
     )
     failures.extend(manifest_errors)
     routing = routing_quality_metrics(cases, predictions)
@@ -1406,8 +1502,9 @@ def _evaluate_offline_impl(
     )
     prediction_hash = _artifact_sha256(predictions)
     fixture_models = {
-        str(row.get("model", "")).strip().casefold()
+        identity
         for row in predictions if isinstance(row, Mapping)
+        if (identity := _canonical_identity(row.get("model"))) is not None
     }.intersection(KNOWN_FIXTURE_MODEL_IDENTITIES)
     known_fixture_predictions = prediction_hash in KNOWN_FIXTURE_PREDICTION_HASHES
     fixture_baseline = bool(
@@ -1462,12 +1559,14 @@ def evaluate_offline(
     cases: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     *,
+    provider_recordings: Sequence[Mapping[str, Any]] | None = None,
     run_manifest: Mapping[str, Any] | None = None,
     trusted_verifier_key: bytes | bytearray | None = None,
 ) -> dict[str, Any]:
     try:
         return _evaluate_offline_impl(
-            cases, predictions, run_manifest=run_manifest,
+            cases, predictions, provider_recordings=provider_recordings,
+            run_manifest=run_manifest,
             trusted_verifier_key=trusted_verifier_key,
         )
     except Exception as exc:
@@ -1494,27 +1593,36 @@ def _trusted_verifier_key_from_env(name: str | None) -> tuple[bytes | None, list
 
 def offline(
     cases_path: Path | None = None,
+    recordings_path: Path | None = None,
     predictions_path: Path | None = None,
     manifest_path: Path | None = None,
     verifier_key_env: str | None = None,
 ) -> int:
     custom = any(value is not None for value in (
-        cases_path, predictions_path, manifest_path, verifier_key_env,
+        cases_path, recordings_path, predictions_path, manifest_path,
+        verifier_key_env,
     ))
-    if custom and (cases_path is None or predictions_path is None or manifest_path is None or verifier_key_env is None):
+    if custom and (
+        cases_path is None or recordings_path is None or predictions_path is None
+        or manifest_path is None or verifier_key_env is None
+    ):
         report = {
             "mode": "offline", "certifying": False,
             "errors": [
-                "independent offline evaluation requires --cases, --predictions, "
-                "--manifest, and --verifier-key-env"
+                "independent offline evaluation requires --cases, --recordings, "
+                "--predictions, --manifest, and --verifier-key-env"
             ],
             "failures": ["incomplete independent offline CLI inputs"],
         }
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 1
     resolved_cases = cases_path if cases_path is not None else CASES_PATH
+    resolved_recordings = (
+        recordings_path if recordings_path is not None else PROVIDER_RECORDINGS_PATH
+    )
     resolved_predictions = predictions_path if predictions_path is not None else MODEL_PREDICTIONS_PATH
     cases, case_errors = _load_jsonl_checked(resolved_cases)
+    recordings, recording_errors = _load_jsonl_checked(resolved_recordings)
     predictions, prediction_errors = _load_jsonl_checked(resolved_predictions)
     manifest: Mapping[str, Any] | None = None
     manifest_errors: list[str] = []
@@ -1523,7 +1631,10 @@ def offline(
     if custom:
         manifest, manifest_errors = _load_json_object_checked(manifest_path)
         trusted_key, key_errors = _trusted_verifier_key_from_env(verifier_key_env)
-    load_errors = [*case_errors, *prediction_errors, *manifest_errors, *key_errors]
+    load_errors = [
+        *case_errors, *recording_errors, *prediction_errors,
+        *manifest_errors, *key_errors,
+    ]
     if load_errors:
         report = {
             "mode": "offline", "certifying": False, "errors": load_errors,
@@ -1538,6 +1649,7 @@ def offline(
                 "data_source": "synthetic_provider_fixtures",
                 "fixture_derived": True,
                 "case_set_sha256": _artifact_sha256(cases),
+                "recordings_sha256": _artifact_sha256(recordings),
                 "predictions_sha256": _artifact_sha256(predictions),
                 "run_timestamp": "2026-07-29T00:00:00Z",
                 "attestation": {
@@ -1546,7 +1658,8 @@ def offline(
                 },
             }
         report = evaluate_offline(
-            cases, predictions, run_manifest=manifest,
+            cases, predictions, provider_recordings=recordings,
+            run_manifest=manifest,
             trusted_verifier_key=trusted_key,
         )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -1645,6 +1758,48 @@ def repair_round_count(traces: Iterable[Any]) -> int:
     return sum(1 for trace in traces if bool(_field(trace, "adaptive_repair_round_started")))
 
 
+def _no_attempt_readiness_failure(trace: Mapping[str, Any]) -> str | None:
+    attempts = trace.get("provider_attempts")
+    if (
+        _route(trace) not in TIERS
+        or trace.get("orchestrator_started") is not True
+        or trace.get("provider_invocation_started") is True
+        or trace.get("provider_attempted") is True
+        or not isinstance(attempts, list)
+        or attempts
+    ):
+        return None
+    if trace.get("provider_configured") is False:
+        return "provider_not_configured"
+    if trace.get("provider_configured") is True and (
+        trace.get("degradation_reason") == "provider_unavailable"
+        or (
+            isinstance(trace.get("provider_failures"), list)
+            and "provider_unavailable" in trace.get("provider_failures", [])
+        )
+    ):
+        return "provider_unavailable"
+    return None
+
+
+def _coherent_no_attempt_readiness_failure(
+    trace: Mapping[str, Any], audit: Mapping[str, Any],
+) -> bool:
+    code = _no_attempt_readiness_failure(trace)
+    if code is None:
+        return False
+    failures = trace.get("provider_failures")
+    disclosures = audit.get("rendered_disclosures")
+    return (
+        isinstance(failures, list)
+        and set(failures) == {code}
+        and trace.get("degradation_reason") == code
+        and trace.get("evidence_state") in {None, "insufficient"}
+        and isinstance(disclosures, list)
+        and code in disclosures
+    )
+
+
 def deterministic_invariant_violations(
     traces: Iterable[Any],
     audits_by_request_id: Mapping[str, Mapping[str, Any]] | None = None,
@@ -1680,6 +1835,9 @@ def deterministic_invariant_violations(
         "unconfigured_provider_failure_mismatch": 0,
         "retained_claim_evidence_admission": 0,
         "retained_claim_rendering_contract": 0,
+        "retained_claim_partial_structure": 0,
+        "retained_claim_conflict_structure": 0,
+        "provider_readiness_failure_mismatch": 0,
     }
     allowed_failures = {
         "sufficient": {None, "validation_failed", "provider_timeout"},
@@ -1761,6 +1919,12 @@ def deterministic_invariant_violations(
             for attempt in attempts
             if attempt.get("status") in failure_for_status
         }
+        readiness_failure = (
+            _no_attempt_readiness_failure(trace)
+            if isinstance(trace, Mapping) else None
+        )
+        if readiness_failure is not None:
+            expected_provider_failures.add(readiness_failure)
         actual_provider_failures = {
             _enum_text(value) for value in (_field(trace, "provider_failures", ()) or ())
         }
@@ -1783,19 +1947,26 @@ def deterministic_invariant_violations(
             and audit.get("external_fact_required") is True
             and audit.get("allow_skip") is False
             and orchestrator_started
-            and not bool(_field(trace, "provider_configured"))
-            and not (
-                not provider_attempted
-                and degradation == "provider_not_configured"
-                and "provider_not_configured" in actual_provider_failures
-                and evidence_state in {None, "insufficient"}
-                and "provider_not_configured" in disclosures
-            )
+            and readiness_failure in {
+                "provider_not_configured", "provider_unavailable",
+            }
+            and not _coherent_no_attempt_readiness_failure(trace, audit)
         ):
-            violations["unconfigured_provider_failure_mismatch"] += 1
+            violations["provider_readiness_failure_mismatch"] += 1
+            if readiness_failure == "provider_not_configured":
+                violations["unconfigured_provider_failure_mismatch"] += 1
         evidence_by_id = {
             item.get("evidence_id"): item
             for item in evidence if isinstance(item, Mapping) and _is_nonempty_string(item.get("evidence_id"))
+        }
+        conflict_group_by_id = {
+            group.get("group_id"): group
+            for group in (
+                audit.get("conflict_groups")
+                if isinstance(audit.get("conflict_groups"), list) else []
+            )
+            if isinstance(group, Mapping)
+            and _is_nonempty_string(group.get("group_id"))
         }
         retained_supported = sum(
             1 for claim in claims
@@ -1818,6 +1989,22 @@ def deterministic_invariant_violations(
             if not isinstance(claim, Mapping):
                 continue
             mapped = claim.get("evidence_ids") if isinstance(claim.get("evidence_ids"), list) else []
+            claim_topics = {
+                topic for topic in (claim.get("topic_ids") or ())
+                if isinstance(topic, str)
+            }
+            partial_topics = {
+                topic for topic in (claim.get("partial_topic_ids") or ())
+                if isinstance(topic, str)
+            }
+            conflict_group_ids = {
+                group_id for group_id in (claim.get("conflict_group_ids") or ())
+                if isinstance(group_id, str)
+            }
+            claim_disclosures = {
+                code for code in (claim.get("disclosure_codes") or ())
+                if isinstance(code, str)
+            }
             if any(item not in evidence_by_id for item in mapped) or (
                 claim.get("retained") is True
                 and claim.get("material") is True
@@ -1842,7 +2029,11 @@ def deterministic_invariant_violations(
                     retained_edge_violation = True
                 retained_partial = retained_partial or claim.get("support_label") == "partial"
                 retained_conflict = retained_conflict or claim.get("support_label") == "conflict"
-            if claim.get("retained") is True and missing_topics.intersection(claim.get("topic_ids") or ()):
+            if (
+                claim.get("retained") is True
+                and claim.get("support_label") == "supported"
+                and missing_topics.intersection(claim_topics)
+            ):
                 violations["retained_claim_on_missing_topic"] += 1
             if claim.get("retained") is True and claim.get("support_label") in {"unsupported", "unmapped"}:
                 violations["retained_unsupported_claim"] += 1
@@ -1853,6 +2044,43 @@ def deterministic_invariant_violations(
                 and claim.get("support_label") != "supported"
             ):
                 violations["dynamic_unsupported_conclusion"] += 1
+            if (
+                claim.get("retained") is True
+                and claim.get("material") is True
+                and claim.get("support_label") == "partial"
+                and not (
+                    partial_topics
+                    and partial_topics.issubset(claim_topics)
+                    and partial_topics.issubset(missing_topics)
+                    and not conflict_group_ids
+                    and "partial_evidence" in claim_disclosures
+                    and "partial_evidence" in disclosures
+                )
+            ):
+                violations["retained_claim_partial_structure"] += 1
+            if (
+                claim.get("retained") is True
+                and claim.get("material") is True
+                and claim.get("support_label") == "conflict"
+            ):
+                referenced_groups = [
+                    conflict_group_by_id.get(group_id)
+                    for group_id in conflict_group_ids
+                ]
+                if not (
+                    conflict_group_ids
+                    and not partial_topics
+                    and all(isinstance(group, Mapping) for group in referenced_groups)
+                    and all(
+                        len(group.get("member_evidence_ids") or ()) >= 2
+                        and set(group.get("member_evidence_ids") or ()).issubset(set(mapped))
+                        for group in referenced_groups
+                        if isinstance(group, Mapping)
+                    )
+                    and "source_conflict" in claim_disclosures
+                    and "source_conflict" in disclosures
+                ):
+                    violations["retained_claim_conflict_structure"] += 1
         if retained_material_edge_ids != set(used_ids):
             retained_edge_violation = True
         if retained_edge_violation:
@@ -1969,6 +2197,25 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         errors.append(f"{prefix} skip route requires a closed skip_reason")
     if _closed(route, TIERS) and trace.get("skip_reason") is not None:
         errors.append(f"{prefix} search route cannot set skip_reason")
+    if route == "skip" and _closed(skip_reason, SKIP_REASONS):
+        contract = SKIP_REASON_CONTRACTS[skip_reason]
+        normalized_triggers = {
+            value for value in (trigger_codes or ()) if isinstance(value, str)
+        }
+        skip_contract_valid = (
+            contract["required_triggers"].issubset(normalized_triggers)
+            and normalized_triggers.issubset(contract["allowed_triggers"])
+            and trace.get("factuality") == contract["factuality"]
+            and trace.get("external_fact_required") is False
+            and trace.get("program_minimum_tier") is None
+            and trace.get("provider_configured") is False
+            and trace.get("provider_failures") == []
+            and trace.get("evidence_state") is None
+            and trace.get("degradation_reason") in contract["allowed_degradations"]
+            and trace.get("knowledge_fallback_used") is False
+        )
+        if not skip_contract_valid:
+            errors.append(f"{prefix} skip contract mismatch for {skip_reason}")
     for name in (
         "external_fact_required",
         "orchestrator_started", "initial_round_started",
@@ -2100,6 +2347,10 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         errors.append(f"{prefix} repair_used disagrees with adaptive repair round")
     if repair_started != (trace.get("adaptive_repair_query") is not None):
         errors.append(f"{prefix} adaptive_repair_query disagrees with adaptive repair round")
+    if repair_started and _repair_query_count(trace) != 1:
+        errors.append(f"{prefix} adaptive repair round requires exactly one repair query")
+    if not repair_started and trace.get("adaptive_repair_latency_ms") != 0:
+        errors.append(f"{prefix} non-started adaptive repair requires zero latency")
     if trace.get("provider_attempted") != trace.get("provider_invocation_started"):
         errors.append(f"{prefix} provider_attempted disagrees with provider_invocation_started")
     if trace.get("sufficient_evidence") != (trace.get("evidence_state") == "sufficient"):
@@ -2228,9 +2479,45 @@ def _validate_audit(audit: Mapping[str, Any], index: int) -> list[str]:
                     errors.append(f"{item_prefix} {name} must be boolean")
             if not _closed(claim.get("support_label"), SUPPORT_LABELS):
                 errors.append(f"{item_prefix} invalid support_label")
-            for name in ("evidence_ids", "topic_ids"):
+            for name in (
+                "evidence_ids", "topic_ids", "partial_topic_ids",
+                "conflict_group_ids",
+            ):
                 if not _is_string_list(claim.get(name)) or len(set(claim.get(name) or ())) != len(claim.get(name) or ()):
                     errors.append(f"{item_prefix} invalid {name}")
+            claim_disclosures = claim.get("disclosure_codes")
+            if (
+                not _is_string_list(claim_disclosures)
+                or any(
+                    not _closed(value, DISCLOSURE_CODES)
+                    for value in claim_disclosures or ()
+                )
+                or len(set(claim_disclosures or ())) != len(claim_disclosures or ())
+            ):
+                errors.append(f"{item_prefix} invalid disclosure_codes")
+            support = claim.get("support_label")
+            partial_topics = claim.get("partial_topic_ids")
+            conflict_refs = claim.get("conflict_group_ids")
+            if support == "partial":
+                if (
+                    not _is_string_list(partial_topics, allow_empty=False)
+                    or conflict_refs != []
+                    or not isinstance(claim_disclosures, list)
+                    or "partial_evidence" not in claim_disclosures
+                ):
+                    errors.append(f"{item_prefix} partial claim requires only partial_topic_ids")
+            elif support == "conflict":
+                if (
+                    not _is_string_list(conflict_refs, allow_empty=False)
+                    or partial_topics != []
+                    or not isinstance(claim_disclosures, list)
+                    or "source_conflict" not in claim_disclosures
+                ):
+                    errors.append(f"{item_prefix} conflict claim requires only conflict_group_ids")
+            elif support in SUPPORT_LABELS and (
+                partial_topics != [] or conflict_refs != [] or claim_disclosures != []
+            ):
+                errors.append(f"{item_prefix} non-partial/conflict claim cannot reference partial/conflict structure")
     if _duplicate_values(claim_ids):
         errors.append(f"{prefix} duplicate claim_id")
 
@@ -2334,6 +2621,9 @@ def _validate_trace_audit_pair(
         value for value in (audit.get("stages_started") or ())
         if isinstance(value, str)
     } if isinstance(audit.get("stages_started"), list) else set()
+    repair_stage_started = "adaptive_repair" in stages
+    if repair_stage_started != (trace.get("adaptive_repair_round_started") is True):
+        errors.append(f"{prefix} adaptive_repair stage disagrees with trace repair state")
     for stage, latency_field in STAGE_TO_LATENCY.items():
         latency = trace.get(latency_field)
         if _is_nonnegative_number(latency) and latency > 0 and stage not in stages:
@@ -2446,20 +2736,17 @@ def _evaluate_traces_impl(
     configured_explicit = [
         (label, trace) for label, trace in explicit_rows
         if trace is not None and bool(trace.get("provider_configured"))
+        and _no_attempt_readiness_failure(trace) != "provider_unavailable"
     ]
     configured_factual = [
         (label, trace) for label, trace in d_factual_rows
         if trace is not None and bool(trace.get("provider_configured"))
+        and _no_attempt_readiness_failure(trace) != "provider_unavailable"
     ]
     provider_execution_accounted_numerator = sum(
         trace is not None and (
             attempted(trace)
-            or (
-                trace.get("provider_configured") is False
-                and trace.get("degradation_reason") == "provider_not_configured"
-                and "provider_not_configured" in (trace.get("provider_failures") or ())
-                and "provider_not_configured" in (audit.get("rendered_disclosures") or ())
-            )
+            or _coherent_no_attempt_readiness_failure(trace, audit)
         )
         for audit, trace in d_factual_rows
     )
@@ -2720,6 +3007,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("integrity")
     offline_parser = sub.add_parser("offline")
     offline_parser.add_argument("--cases", type=Path)
+    offline_parser.add_argument("--recordings", type=Path)
     offline_parser.add_argument("--predictions", type=Path)
     offline_parser.add_argument("--manifest", type=Path)
     offline_parser.add_argument("--verifier-key-env")
@@ -2736,7 +3024,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return integrity()
     if args.command == "offline":
         return offline(
-            args.cases, args.predictions, args.manifest, args.verifier_key_env,
+            args.cases, args.recordings, args.predictions, args.manifest,
+            args.verifier_key_env,
         )
     if args.command == "traces":
         return traces(

@@ -97,15 +97,23 @@ def _artifact_sha(rows):
 
 def _attest_manifest(manifest, key=TEST_VERIFIER_KEY):
     attested = copy.deepcopy(manifest)
-    attested.pop("attestation", None)
+    previous = attested.get("attestation")
+    attested["attestation"] = {
+        "algorithm": (
+            previous.get("algorithm", "hmac-sha256")
+            if isinstance(previous, dict) else "hmac-sha256"
+        ),
+        "key_id": (
+            previous.get("key_id", "unit-trusted-verifier-v1")
+            if isinstance(previous, dict) else "unit-trusted-verifier-v1"
+        ),
+    }
     payload = json.dumps(
         attested, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
-    attested["attestation"] = {
-        "algorithm": "hmac-sha256",
-        "key_id": "unit-trusted-verifier-v1",
-        "signature": hmac.new(key, payload, hashlib.sha256).hexdigest(),
-    }
+    attested["attestation"]["signature"] = hmac.new(
+        key, payload, hashlib.sha256,
+    ).hexdigest()
     return attested
 
 
@@ -117,6 +125,7 @@ def _run_manifest(cases, predictions, **overrides):
         "data_source": "reviewed_cases",
         "fixture_derived": False,
         "case_set_sha256": _artifact_sha(cases),
+        "recordings_sha256": _artifact_sha([]),
         "predictions_sha256": _artifact_sha(predictions),
         "run_timestamp": "2026-07-29T00:00:00Z",
     }
@@ -223,7 +232,8 @@ def _audit_row(case_id, *, route="light", **overrides):
         "claims": ([{
             "claim_id": "C1", "material": True, "retained": True,
             "support_label": "supported", "evidence_ids": ["E1"],
-            "topic_ids": ["topic-1"],
+            "topic_ids": ["topic-1"], "partial_topic_ids": [],
+            "conflict_group_ids": [], "disclosure_codes": [],
         }] if searched else []),
         "evidence": ([{
             "evidence_id": "E1", "final_url": url, "relevance": "direct",
@@ -302,6 +312,23 @@ def _certifying_offline_artifacts():
     ])
     manifest = _attest_manifest(_run_manifest(cases, predictions))
     return cases, predictions, manifest
+
+
+def _certifying_offline_artifacts_with_recordings():
+    cases, predictions, _manifest = _certifying_offline_artifacts()
+    recordings = []
+    for index, case in enumerate(cases, 1):
+        case["question"] = f"unique reviewed evaluation question {index}"
+        case["fixture_id"] = f"offline-fixture-{index}"
+        recordings.append(_recording(
+            case["case_id"], case["fixture_id"],
+            query_text=f"unique fixture query {index}",
+            url=f"https://www.noaa.gov/offline-fixture-{index}",
+        ))
+    manifest = _attest_manifest(_run_manifest(
+        cases, predictions, recordings_sha256=_artifact_sha(recordings),
+    ))
+    return cases, recordings, predictions, manifest
 
 
 def _certifying_trace_artifacts():
@@ -1217,9 +1244,12 @@ class StrictReviewRegressionTests(unittest.TestCase):
 class ReReviewRound2Tests(unittest.TestCase):
     def test_positive_trusted_offline_and_trace_artifacts_certify(self):
         tool = evaluate_tool()
-        cases, predictions, run_manifest = _certifying_offline_artifacts()
+        cases, recordings, predictions, run_manifest = (
+            _certifying_offline_artifacts_with_recordings()
+        )
         offline_report = tool.evaluate_offline(
-            cases, predictions, run_manifest=run_manifest,
+            cases, predictions, provider_recordings=recordings,
+            run_manifest=run_manifest,
             trusted_verifier_key=TEST_VERIFIER_KEY,
         )
         self.assertTrue(offline_report["certifying"], offline_report)
@@ -1631,9 +1661,12 @@ class ReReviewRound2Tests(unittest.TestCase):
 
     def test_ir4_offline_cli_has_trusted_independent_run_path_and_safe_guards(self):
         tool = evaluate_tool()
-        cases, predictions, manifest = _certifying_offline_artifacts()
+        cases, recordings, predictions, manifest = (
+            _certifying_offline_artifacts_with_recordings()
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             cases_path = Path(temp_dir) / "cases.jsonl"
+            recordings_path = Path(temp_dir) / "recordings.jsonl"
             predictions_path = Path(temp_dir) / "predictions.jsonl"
             manifest_path = Path(temp_dir) / "manifest.json"
             cases_path.write_text(
@@ -1644,9 +1677,14 @@ class ReReviewRound2Tests(unittest.TestCase):
                 "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions),
                 encoding="utf-8",
             )
+            recordings_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in recordings),
+                encoding="utf-8",
+            )
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             args = [
                 "offline", "--cases", str(cases_path),
+                "--recordings", str(recordings_path),
                 "--predictions", str(predictions_path),
                 "--manifest", str(manifest_path),
                 "--verifier-key-env", "TASK18_TEST_VERIFIER",
@@ -1683,7 +1721,10 @@ class ReReviewRound2Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             fixture_manifest = _attest_manifest(
-                _run_manifest(cases, fixture_predictions)
+                _run_manifest(
+                    cases, fixture_predictions,
+                    recordings_sha256=_artifact_sha(recordings),
+                )
             )
             manifest_path.write_text(json.dumps(fixture_manifest), encoding="utf-8")
             fixture_output = io.StringIO()
@@ -1696,6 +1737,488 @@ class ReReviewRound2Tests(unittest.TestCase):
             fixture_report = json.loads(fixture_output.getvalue())
             self.assertFalse(fixture_report["certifying"])
             self.assertEqual("fixture_baseline", fixture_report["artifact_class"])
+
+
+class ReReviewRound3Tests(unittest.TestCase):
+    def test_c2_attestation_metadata_is_covered_by_signature(self):
+        tool = evaluate_tool()
+        cases, predictions, manifest = _certifying_offline_artifacts()
+        for field, value in (
+            ("key_id", "different-trusted-key"),
+            ("algorithm", "hmac-sha512"),
+        ):
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(manifest)
+                mutated["attestation"][field] = value
+                report = tool.evaluate_offline(
+                    cases, predictions, run_manifest=mutated,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertFalse(report["certifying"])
+                self.assertFalse(report["trusted_attestation_verified"])
+                self.assertIn("attestation", "\n".join(report["failures"]))
+
+    def test_c3_unicode_fixture_identity_and_dns_root_dot_are_noncertifying(self):
+        tool = evaluate_tool()
+        cases, predictions, _manifest = _certifying_offline_artifacts()
+        for prediction in predictions:
+            prediction["model"] = "fixture\u200b-baseline"
+        manifest = _attest_manifest(_run_manifest(cases, predictions))
+        report = tool.evaluate_offline(
+            cases, predictions, run_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(report["certifying"])
+        self.assertIn("model", "\n".join((*report["errors"], *report["failures"])))
+
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        audits[0]["evidence"][0]["final_url"] = "https://example.com./source"
+        audits[0]["shown_source_urls"] = ["https://example.com./source"]
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        report = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(report["certifying"])
+        self.assertIn("fixture/example evidence URL", "\n".join(report["failures"]))
+
+    def test_c4_offline_requires_bound_recordings_and_full_integrity(self):
+        tool = evaluate_tool()
+        cases, recordings, predictions, manifest = (
+            _certifying_offline_artifacts_with_recordings()
+        )
+        try:
+            positive = tool.evaluate_offline(
+                cases, predictions, provider_recordings=recordings,
+                run_manifest=manifest, trusted_verifier_key=TEST_VERIFIER_KEY,
+            )
+        except TypeError as exc:
+            self.fail(f"offline API lacks provider_recordings input: {exc}")
+        self.assertTrue(positive["certifying"], positive)
+
+        mutations = (
+            (
+                "duplicate-question",
+                lambda c, r: c[1].__setitem__("question", c[0]["question"]),
+                "duplicate normalized question",
+            ),
+            (
+                "duplicate-fixture-id",
+                lambda c, r: r[1].__setitem__("fixture_id", r[0]["fixture_id"]),
+                "duplicate recording fixture_id",
+            ),
+            (
+                "reference-mismatch",
+                lambda c, r: r[0].__setitem__("case_id", c[1]["case_id"]),
+                "references another case",
+            ),
+        )
+        for name, mutate, expected in mutations:
+            with self.subTest(mutation=name):
+                changed_cases = copy.deepcopy(cases)
+                changed_recordings = copy.deepcopy(recordings)
+                mutate(changed_cases, changed_recordings)
+                changed_manifest = _attest_manifest(_run_manifest(
+                    changed_cases, predictions,
+                    recordings_sha256=_artifact_sha(changed_recordings),
+                ))
+                report = tool.evaluate_offline(
+                    changed_cases, predictions,
+                    provider_recordings=changed_recordings,
+                    run_manifest=changed_manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertFalse(report["certifying"])
+                self.assertIn(expected, "\n".join(report["errors"]))
+
+    def test_c4_offline_cli_requires_and_validates_recordings(self):
+        tool = evaluate_tool()
+        cases, recordings, predictions, manifest = (
+            _certifying_offline_artifacts_with_recordings()
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = {
+                "cases": root / "cases.jsonl",
+                "recordings": root / "recordings.jsonl",
+                "predictions": root / "predictions.jsonl",
+                "manifest": root / "manifest.json",
+            }
+            for name, rows in (
+                ("cases", cases), ("recordings", recordings),
+                ("predictions", predictions),
+            ):
+                paths[name].write_text(
+                    "\n".join(json.dumps(row) for row in rows), encoding="utf-8",
+                )
+            paths["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+            args = [
+                "offline", "--cases", str(paths["cases"]),
+                "--recordings", str(paths["recordings"]),
+                "--predictions", str(paths["predictions"]),
+                "--manifest", str(paths["manifest"]),
+                "--verifier-key-env", "TASK18_TEST_VERIFIER",
+            ]
+            output = io.StringIO()
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {"TASK18_TEST_VERIFIER": TEST_VERIFIER_KEY.decode()},
+                ), contextlib.redirect_stdout(output):
+                    status = tool.main(args)
+            except SystemExit as exc:
+                self.fail(f"offline CLI lacks --recordings: {exc}")
+            self.assertEqual(0, status, output.getvalue())
+            self.assertTrue(json.loads(output.getvalue())["certifying"])
+
+            missing_output = io.StringIO()
+            with mock.patch.dict(
+                os.environ,
+                {"TASK18_TEST_VERIFIER": TEST_VERIFIER_KEY.decode()},
+            ), contextlib.redirect_stdout(missing_output):
+                missing_status = tool.main([
+                    value for value in args
+                    if value not in {"--recordings", str(paths["recordings"])}
+                ])
+            self.assertNotEqual(0, missing_status)
+            self.assertFalse(json.loads(missing_output.getvalue())["certifying"])
+
+            cli_mutations = (
+                (
+                    "duplicate-question",
+                    lambda c, r: c[1].__setitem__("question", c[0]["question"]),
+                    "duplicate normalized question",
+                ),
+                (
+                    "duplicate-fixture-id",
+                    lambda c, r: r[1].__setitem__("fixture_id", r[0]["fixture_id"]),
+                    "duplicate recording fixture_id",
+                ),
+                (
+                    "reference-mismatch",
+                    lambda c, r: r[0].__setitem__("case_id", c[1]["case_id"]),
+                    "references another case",
+                ),
+            )
+            for name, mutate, expected in cli_mutations:
+                with self.subTest(cli_mutation=name):
+                    changed_cases = copy.deepcopy(cases)
+                    changed_recordings = copy.deepcopy(recordings)
+                    mutate(changed_cases, changed_recordings)
+                    paths["cases"].write_text(
+                        "\n".join(json.dumps(row) for row in changed_cases),
+                        encoding="utf-8",
+                    )
+                    paths["recordings"].write_text(
+                        "\n".join(json.dumps(row) for row in changed_recordings),
+                        encoding="utf-8",
+                    )
+                    changed_manifest = _attest_manifest(_run_manifest(
+                        changed_cases, predictions,
+                        recordings_sha256=_artifact_sha(changed_recordings),
+                    ))
+                    paths["manifest"].write_text(
+                        json.dumps(changed_manifest), encoding="utf-8",
+                    )
+                    changed_output = io.StringIO()
+                    with mock.patch.dict(
+                        os.environ,
+                        {"TASK18_TEST_VERIFIER": TEST_VERIFIER_KEY.decode()},
+                    ), contextlib.redirect_stdout(changed_output):
+                        changed_status = tool.main(args)
+                    self.assertNotEqual(0, changed_status)
+                    changed_report = json.loads(changed_output.getvalue())
+                    self.assertFalse(changed_report["certifying"])
+                    self.assertIn(expected, "\n".join(changed_report["errors"]))
+
+    def test_c5_partial_and_conflict_structure_is_owned_by_each_claim(self):
+        tool = evaluate_tool()
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        trace = traces[0]
+        audit = audits[0]
+        trace.update(
+            supported_claim_count=0, evidence_state="partial",
+            sufficient_evidence=False, degradation_reason="partial_evidence",
+        )
+        audit["claims"][0]["support_label"] = "partial"
+        audit["missing_claim_topics"] = ["unrelated-topic"]
+        audit["rendered_disclosures"] = ["partial_evidence"]
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        report = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(report["certifying"])
+        self.assertGreater(
+            report["deterministic_invariant_violations"].get(
+                "retained_claim_partial_structure", 0,
+            ),
+            0,
+        )
+
+    def test_c5_valid_per_claim_partial_and_conflict_structures_certify(self):
+        tool = evaluate_tool()
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        trace, audit = traces[0], audits[0]
+        trace.update(
+            supported_claim_count=0, evidence_state="partial",
+            sufficient_evidence=False, degradation_reason="partial_evidence",
+        )
+        audit["claims"][0].update(
+            support_label="partial", partial_topic_ids=["topic-1"],
+            disclosure_codes=["partial_evidence"],
+        )
+        audit["missing_claim_topics"] = ["topic-1"]
+        audit["rendered_disclosures"] = ["partial_evidence"]
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        partial = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertTrue(partial["certifying"], partial)
+
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        trace, audit = traces[0], audits[0]
+        trace.update(
+            supported_claim_count=0, citable_evidence_count=2,
+            citation_count=2, evidence_state="conflicting",
+            sufficient_evidence=False, degradation_reason="source_conflict",
+        )
+        audit["claims"][0].update(
+            support_label="conflict", evidence_ids=["E1", "E2"],
+            conflict_group_ids=["group-1"],
+            disclosure_codes=["source_conflict"],
+        )
+        audit["evidence"].append({
+            "evidence_id": "E2", "final_url": "https://www.noaa.gov/conflict",
+            "relevance": "direct", "citable": True,
+        })
+        audit["used_evidence_ids"] = ["E1", "E2"]
+        audit["shown_source_urls"] = [
+            audit["evidence"][0]["final_url"], "https://www.noaa.gov/conflict",
+        ]
+        audit["conflict_groups"] = [{
+            "group_id": "group-1", "member_evidence_ids": ["E1", "E2"],
+        }]
+        audit["rendered_disclosures"] = ["source_conflict"]
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        conflict = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertTrue(conflict["certifying"], conflict)
+
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        trace = traces[0]
+        audit = audits[0]
+        trace.update(
+            supported_claim_count=0, citable_evidence_count=2,
+            citation_count=2, evidence_state="conflicting",
+            sufficient_evidence=False, degradation_reason="source_conflict",
+        )
+        audit["claims"][0].update(
+            support_label="conflict", evidence_ids=["E1", "E2"],
+        )
+        audit["evidence"].append({
+            "evidence_id": "E2", "final_url": "https://www.noaa.gov/conflict",
+            "relevance": "direct", "citable": True,
+        })
+        audit["used_evidence_ids"] = ["E1", "E2"]
+        audit["shown_source_urls"] = [
+            audit["evidence"][0]["final_url"], "https://www.noaa.gov/conflict",
+        ]
+        audit["conflict_groups"] = [{
+            "group_id": "unrelated-group", "member_evidence_ids": ["E1", "E2"],
+        }]
+        audit["rendered_disclosures"] = ["source_conflict"]
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        report = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(report["certifying"])
+        self.assertGreater(
+            report["deterministic_invariant_violations"].get(
+                "retained_claim_conflict_structure", 0,
+            ),
+            0,
+        )
+
+    def test_c6_no_attempt_readiness_failures_are_coherent_and_accounted(self):
+        tool = evaluate_tool()
+
+        def artifacts(code):
+            traces, audits, _manifest = _certifying_trace_artifacts()
+            trace, audit = traces[0], audits[0]
+            trace.update(
+                provider_configured=(code == "provider_unavailable"),
+                provider_attempts=[], provider_invocation_started=False,
+                provider_attempted=False, provider_failures=[code],
+                candidate_url_count=0, content_read_count=0,
+                citable_evidence_count=0,
+                evidence_state=(None if code == "provider_not_configured" else "insufficient"),
+                sufficient_evidence=False, claim_count=0,
+                supported_claim_count=0, citation_count=0,
+                degradation_reason=code,
+            )
+            audit.update(
+                claims=[], evidence=[], used_evidence_ids=[],
+                shown_source_urls=[], rendered_disclosures=[code],
+            )
+            return traces, audits
+
+        for code in ("provider_not_configured", "provider_unavailable"):
+            with self.subTest(code=code, mutation="valid"):
+                traces, audits = artifacts(code)
+                manifest = _attest_manifest(_sample_manifest(traces, audits))
+                report = tool.evaluate_traces(
+                    traces, audits, sample_manifest=manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertTrue(report["certifying"], report)
+                self.assertEqual(
+                    1.0,
+                    report["rates"]["provider_execution_accounted_rate"]["rate"],
+                )
+                self.assertEqual(1, report["execution_failures"][code])
+
+            for mutation in (
+                "missing-code", "mismatched-code", "wrong-degradation",
+                "wrong-disclosure",
+            ):
+                with self.subTest(code=code, mutation=mutation):
+                    traces, audits = artifacts(code)
+                    if mutation == "missing-code":
+                        traces[0]["provider_failures"] = []
+                    elif mutation == "mismatched-code":
+                        traces[0]["provider_failures"] = [
+                            "provider_unavailable"
+                            if code == "provider_not_configured"
+                            else "provider_not_configured"
+                        ]
+                    elif mutation == "wrong-degradation":
+                        traces[0]["degradation_reason"] = (
+                            "provider_unavailable"
+                            if code == "provider_not_configured"
+                            else "provider_not_configured"
+                        )
+                    else:
+                        audits[0]["rendered_disclosures"] = []
+                    manifest = _attest_manifest(_sample_manifest(traces, audits))
+                    report = tool.evaluate_traces(
+                        traces, audits, sample_manifest=manifest,
+                        trusted_verifier_key=TEST_VERIFIER_KEY,
+                    )
+                    self.assertFalse(report["certifying"])
+
+    def test_i1_adaptive_repair_stage_is_bidirectional(self):
+        tool = evaluate_tool()
+        traces, audits, _manifest = _certifying_trace_artifacts()
+        audits[0]["stages_started"].append("adaptive_repair")
+        manifest = _attest_manifest(_sample_manifest(traces, audits))
+        report = tool.evaluate_traces(
+            traces, audits, sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(report["certifying"])
+        self.assertIn("adaptive_repair stage", "\n".join(report["errors"]))
+
+        for mutation in ("positive-latency", "two-repair-queries"):
+            with self.subTest(mutation=mutation):
+                traces, audits, _manifest = _certifying_trace_artifacts()
+                trace = traces[0]
+                if mutation == "positive-latency":
+                    trace["adaptive_repair_latency_ms"] = 1
+                else:
+                    trace.update(
+                        adaptive_repair_round_started=True,
+                        adaptive_repair_query={
+                            "query_id": "repair-1", "purpose": "repair",
+                        },
+                        repair_used=True, repair_query_count=2,
+                        retrieval_round_count=2,
+                        adaptive_repair_latency_ms=1,
+                        executed_queries=[
+                            {"query_id": "q-1", "purpose": "direct"},
+                            {"query_id": "repair-1", "purpose": "repair"},
+                            {"query_id": "repair-2", "purpose": "repair"},
+                        ],
+                    )
+                    audits[0]["stages_started"].append("adaptive_repair")
+                manifest = _attest_manifest(_sample_manifest(traces, audits))
+                report = tool.evaluate_traces(
+                    traces, audits, sample_manifest=manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertFalse(report["certifying"])
+                self.assertIn("adaptive repair", "\n".join(report["errors"]))
+
+    def test_i2_each_skip_reason_rejects_search_trigger_contradictions(self):
+        tool = evaluate_tool()
+        factuality = {
+            "user_forbid_web": "ambiguous",
+            "provided_text_transform": "mixed",
+            "provided_content_summary": "mixed",
+        }
+        for reason in sorted(tool.SKIP_REASONS):
+            with self.subTest(reason=reason):
+                traces, audits, _manifest = _certifying_trace_artifacts()
+                triggers = ["explicit_no_web"] if reason == "user_forbid_web" else []
+                trace = _raw_trace_row(
+                    f"skip-{reason}", route="skip", skip_reason=reason,
+                    trigger_codes=triggers,
+                    factuality=factuality.get(reason, "non_factual"),
+                )
+                audit = _audit_row(
+                    f"skip-{reason}", route="skip", skip_reason=reason,
+                )
+                traces.append(trace)
+                audits.append(audit)
+                manifest = _attest_manifest(_sample_manifest(traces, audits))
+                positive = tool.evaluate_traces(
+                    traces, audits, sample_manifest=manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertTrue(positive["certifying"], positive)
+
+                trace["trigger_codes"] = ["explicit_search"]
+                manifest = _attest_manifest(_sample_manifest(traces, audits))
+                negative = tool.evaluate_traces(
+                    traces, audits, sample_manifest=manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertFalse(negative["certifying"])
+                self.assertIn("skip contract", "\n".join(negative["errors"]))
+
+    def test_i2_skip_contract_rejects_factuality_external_and_failure_states(self):
+        tool = evaluate_tool()
+        for field, value in (
+            ("factuality", "mixed"),
+            ("external_fact_required", True),
+            ("provider_failures", ["provider_timeout"]),
+            ("degradation_reason", "provider_timeout"),
+        ):
+            with self.subTest(field=field):
+                traces, audits, _manifest = _certifying_trace_artifacts()
+                trace = _raw_trace_row(
+                    f"skip-{field}", route="skip", skip_reason="pure_math",
+                )
+                trace[field] = value
+                audit = _audit_row(
+                    f"skip-{field}", route="skip", skip_reason="pure_math",
+                    external_fact_required=(
+                        True if field == "external_fact_required" else False
+                    ),
+                )
+                traces.append(trace)
+                audits.append(audit)
+                manifest = _attest_manifest(_sample_manifest(traces, audits))
+                report = tool.evaluate_traces(
+                    traces, audits, sample_manifest=manifest,
+                    trusted_verifier_key=TEST_VERIFIER_KEY,
+                )
+                self.assertFalse(report["certifying"])
+                self.assertIn("skip contract", "\n".join(report["errors"]))
 
 
 if __name__ == "__main__":
