@@ -207,7 +207,10 @@ def render_search_reply(
                 disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
         disclosures.extend(_search_warning_disclosures(result))
         disclosures = _dedupe_strings(disclosures)
-        text = _compose_disclosures(_strip_markers(knowledge_fallback_text), disclosures)
+        text = _compose_disclosures(
+            _strip_markers(knowledge_fallback_text, strip_search_warnings=True),
+            disclosures,
+        )
         chunks = split_qq_reply(text, qq_limit)
         rendered = RenderedReply(
             text=text,
@@ -240,7 +243,10 @@ def render_search_reply(
         if knowledge_fallback_text:
             base = _STABLE_FALLBACK_PREFIX
             disclosures.append(_STABLE_FALLBACK_PREFIX)
-            text = _strip_markers(knowledge_fallback_text)
+            text = _strip_markers(
+                knowledge_fallback_text,
+                strip_search_warnings=True,
+            )
         else:
             disclosures.append(base)
             text = ""
@@ -288,7 +294,11 @@ def render_search_reply(
         else:
             disclosures = _search_warning_disclosures(result)
             text = _compose_disclosures(
-                _strip_markers(knowledge_fallback_text or ""), disclosures,
+                _strip_markers(
+                    knowledge_fallback_text or "",
+                    strip_search_warnings=True,
+                ),
+                disclosures,
             )
         chunks = split_qq_reply(text, qq_limit)
         rendered = RenderedReply(
@@ -417,7 +427,7 @@ def _render_validated(
                     if eid in numbered and numbered[eid] not in used_here:
                         used_here.append(numbered[eid])
         citations = used_here
-        text = _strip_markers(block.text)
+        text = _strip_markers(block.text, strip_search_warnings=True)
         if citations:
             text = f"{text}{''.join(f'[{number}]' for number in citations)}"
         body_parts.append(text)
@@ -630,7 +640,7 @@ def _bounded_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
-def _strip_markers(text: str) -> str:
+def _strip_markers(text: str, *, strip_search_warnings: bool = False) -> str:
     text = str(text or "")
     # Discard everything from a model-written source heading onward; the
     # deterministic renderer owns the source list.
@@ -638,4 +648,7 @@ def _strip_markers(text: str) -> str:
     text = text.split("@@SOURCE_BOUNDARY@@", 1)[0]
     text = _SOURCE_MARKER.sub("", text)
     text = re.sub(r"\[(?:SRCH|MEM|CHAT):[^\]]*\]", "", text)
+    if strip_search_warnings:
+        text = text.replace(_HIGH_CONSEQUENCE_WARNING, "")
+        text = text.replace(_NO_WEB_HIGH_CONSEQUENCE_WARNING, "")
     return re.sub(r"\n{3,}", "\n\n", text).strip()

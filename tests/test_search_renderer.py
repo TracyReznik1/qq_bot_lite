@@ -223,10 +223,11 @@ class FailureRenderingTests(unittest.TestCase):
         self.assertIn("当前搜索服务未配置", rendered.text)
 
     def test_ordinary_failure_keeps_failure_disclosure_without_risk_warning(self):
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
         rendered = self.module.render_search_reply(
             result(None, SearchFailureCode.NO_RESULTS, route=SearchTier.LIGHT),
             None,
-            knowledge_fallback_text="有限知识",
+            knowledge_fallback_text=f"有限知识\n{warning}",
             qq_limit=1700,
         )
         self.assertIn("在线检索未完成", rendered.text)
@@ -623,6 +624,24 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertNotIn("检索完成", rendered.text)
         self.assertNotIn("搜索成功", rendered.text)
         self.assertNotIn("搜索状态：success", rendered.text)
+
+    def test_ordinary_model_warning_is_removed_from_grounded_answer(self):
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", f"版本是3.2\n{warning}", ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+
+        rendered = module.render_search_reply(
+            result(bundle((item(),))), report, qq_limit=1700,
+        )
+
+        self.assertIn("版本是3.2", rendered.text)
+        self.assertIn("https://example.com/page", rendered.text)
+        self.assertNotIn(warning, rendered.text)
 
     def test_high_consequence_model_warning_is_replaced_by_one_deterministic_warning(self):
         module = renderer_module()
