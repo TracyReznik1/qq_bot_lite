@@ -186,6 +186,26 @@ class RouterTableTests(unittest.TestCase):
         self.assertIs(decision.route, SearchTier.LIGHT)
 
 
+class WarningSignalBoundaryTests(unittest.TestCase):
+    def test_one_leg_sudden_weakness_is_high_consequence(self):
+        decision = decide("一条腿突然没力气，要去急诊吗？", {})
+        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+        self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+
+    def test_stable_or_negated_leg_text_is_not_high_consequence(self):
+        for question in (
+            "一条腿没力气可能有哪些一般原因",
+            "我并没有一条腿突然没力气，只是在引用这个句子",
+        ):
+            with self.subTest(question=question):
+                decision = decide(question, NEUTRAL)
+                self.assertNotIn(
+                    TriggerCode.HIGH_CONSEQUENCE_ACTION,
+                    decision.trigger_codes,
+                )
+
+
 class RouterConflictAndFloorTests(unittest.TestCase):
     """C2 regression: forced search + no-web conflict, mixed floors, advisor failure."""
 

@@ -414,7 +414,7 @@ _RED_FLAG_PATTERNS = (
     re.compile(r"呼吸(?:困难|急促|费力|不上来|不过来|不了)"),
     re.compile(r"(?:气喘不上来|喘不上气|喘不过气|透不过气|窒息)"),
     re.compile(
-        r"(?:一只|一边|一侧|单侧|半边|左侧|右侧|左|右).{0,4}"
+        r"(?:一只|一条|一边|一侧|单侧|半边|左侧|右侧|左|右).{0,4}"
         r"(?:手脚|手|脚|肢|臂|胳膊|腿|脸|面|身体).{0,6}"
         r"(?:无力|没力气|使不上劲|麻木|发麻|麻|抬不起来|抬不动|动不了|歪斜|下垂)"
     ),
@@ -1331,6 +1331,9 @@ class RetrievalBenefitRouter:
         floor = floors if floors is not None else SearchTier.LIGHT
         if not floor_codes:
             floor_codes = (TriggerCode.FACTUAL_DEFAULT,)
+        deterministic_high_consequence = (
+            TriggerCode.HIGH_CONSEQUENCE_ACTION in floor_codes
+        )
 
         # A closed-task skip is only accepted when the whole request carries no
         # search trigger and no forced floor.
@@ -1364,7 +1367,11 @@ class RetrievalBenefitRouter:
             freshness=classification.freshness,
             risk=classification.risk,
             actionability=classification.actionability,
-            potential_harm=classification.potential_harm,
+            potential_harm=(
+                PotentialHarm.HIGH
+                if deterministic_high_consequence
+                else classification.potential_harm
+            ),
             program_minimum_tier=floor,
             model_recommended_tier=recommended,
             final_reason_codes=final_reason_codes,
