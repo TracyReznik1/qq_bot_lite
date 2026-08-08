@@ -935,7 +935,12 @@ def _build_production_orchestrator() -> SearchOrchestrator:
     router = RetrievalBenefitRouter(LLMRoutingAdvisor(llm))
     planner = SearchPlanner(llm)
     judge = LLMEvidenceJudge(llm)
-    providers: list[Any] = []
+    providers: list[Any] = [
+        DDGSSearchProvider(
+            proxy_url=config.proxy_url,
+            timeout_seconds=config.request_timeout,
+        )
+    ]
     if config.tavily_api_key:
         providers.append(
             TavilySearchProvider(
@@ -943,12 +948,6 @@ def _build_production_orchestrator() -> SearchOrchestrator:
                 proxy_url=config.proxy_url,
             )
         )
-    providers.append(
-        DDGSSearchProvider(
-            proxy_url=config.proxy_url,
-            timeout_seconds=config.request_timeout,
-        )
-    )
     return SearchOrchestrator(
         router=router,
         planner=planner,

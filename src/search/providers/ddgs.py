@@ -82,7 +82,7 @@ def _ddgs_hit(item: dict[str, Any], query_id: str) -> ProviderHit:
         score=None,
         published_at=_parse_datetime(item.get("date")),
         raw_content=None,
-        quality_flags=("availability_fallback",),
+        quality_flags=(),
     )
 
 

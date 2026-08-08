@@ -693,30 +693,30 @@ class OrchestratorDeadlineTests(unittest.TestCase):
 
     def test_fallback_timeout_keeps_completed_primary_and_real_fallback_truth(self):
         class ErrorPrimary:
-            name = "tavily"
-
-            def readiness(self):
-                return ProviderReadiness("tavily", True, True, None)
-
-            def search(self, _query, **_kwargs):
-                time.sleep(0.01)
-                from src.search.models import ProviderResult
-                return ProviderResult("tavily", ProviderStatus.ERROR, (), 1)
-
-        class SlowFallback:
             name = "ddgs"
 
             def readiness(self):
                 return ProviderReadiness("ddgs", True, True, None)
 
+            def search(self, _query, **_kwargs):
+                time.sleep(0.01)
+                from src.search.models import ProviderResult
+                return ProviderResult("ddgs", ProviderStatus.ERROR, (), 1)
+
+        class SlowFallback:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
             def search(self, search_query, **_kwargs):
                 time.sleep(0.25)
                 from src.search.models import ProviderHit, ProviderResult
                 provider_hit = ProviderHit(
-                    "ddgs", search_query.query_id, "late", "https://late.example/item",
+                    "tavily", search_query.query_id, "late", "https://late.example/item",
                     "late", None, None, None, (),
                 )
-                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (provider_hit,), 1)
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
 
         orchestrator = self.module.SearchOrchestrator(
             router=_make_router(router_payload("light")),
@@ -733,8 +733,8 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertEqual(
             [(attempt.provider, attempt.status) for attempt in result.trace.provider_attempts],
             [
-                ("tavily", ProviderStatus.ERROR),
-                ("ddgs", ProviderStatus.TIMEOUT),
+                ("ddgs", ProviderStatus.ERROR),
+                ("tavily", ProviderStatus.TIMEOUT),
             ],
         )
         self._assert_bundle_trace_mirror(result)
@@ -1240,6 +1240,57 @@ class OrchestratorSingletonTests(unittest.TestCase):
         second = module.get_search_orchestrator()
         self.assertIsNot(first, second)
         module.reset_search_orchestrator()
+
+
+class OrchestratorProductionGraphTests(unittest.TestCase):
+    def test_production_provider_graph_uses_only_ddgs_without_tavily_key(self):
+        module = orchestrator_module()
+        fake_config = SimpleNamespace(
+            tavily_api_key="",
+            proxy_url="",
+            request_timeout=18.0,
+        )
+        ddgs = SimpleNamespace(name="ddgs")
+
+        with (
+            mock.patch.object(module, "config", fake_config),
+            mock.patch(
+                "src.services.llm_client.get_llm_client",
+                return_value=SimpleNamespace(chat=mock.Mock()),
+            ),
+            mock.patch.object(module, "DDGSSearchProvider", return_value=ddgs),
+            mock.patch.object(module, "TavilySearchProvider") as tavily_constructor,
+        ):
+            orchestrator = module._build_production_orchestrator()
+
+        self.assertEqual([provider.name for provider in orchestrator._providers], ["ddgs"])
+        tavily_constructor.assert_not_called()
+
+    def test_production_provider_graph_is_ddgs_then_tavily(self):
+        module = orchestrator_module()
+        fake_config = SimpleNamespace(
+            tavily_api_key="test-key",
+            proxy_url="",
+            request_timeout=18.0,
+        )
+        ddgs = SimpleNamespace(name="ddgs")
+        tavily = SimpleNamespace(name="tavily")
+
+        with (
+            mock.patch.object(module, "config", fake_config),
+            mock.patch(
+                "src.services.llm_client.get_llm_client",
+                return_value=SimpleNamespace(chat=mock.Mock()),
+            ),
+            mock.patch.object(module, "DDGSSearchProvider", return_value=ddgs),
+            mock.patch.object(module, "TavilySearchProvider", return_value=tavily),
+        ):
+            orchestrator = module._build_production_orchestrator()
+
+        self.assertEqual(
+            [provider.name for provider in orchestrator._providers],
+            ["ddgs", "tavily"],
+        )
 
 
 if __name__ == "__main__":

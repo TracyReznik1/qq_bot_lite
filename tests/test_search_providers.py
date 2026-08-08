@@ -317,8 +317,8 @@ class DDGSAdapterTests(unittest.TestCase):
         self.assertEqual(hit.url, "https://baike.example.com/guanghezuoyong")
         self.assertIsNone(hit.score)
         self.assertIsNone(hit.raw_content)
-        # DDGS hits are weak until relevance/content support is established.
-        self.assertIn("availability_fallback", hit.quality_flags)
+        self.assertNotIn("availability_fallback", hit.quality_flags)
+        self.assertEqual(hit.quality_flags, ())
 
     def test_keeps_date_when_present(self):
         client = FakeDDGSClient(results=[_ddgs_hit(date="2026-07-28")])
@@ -871,6 +871,27 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(result.attempts[0].provider, "tavily")
         ddgs.search.assert_not_called()
         tavily.search.assert_called_once()
+
+    def test_all_unavailable_providers_are_not_invoked(self):
+        ddgs = mock.Mock()
+        ddgs.name = "ddgs"
+        ddgs.readiness.return_value = ProviderReadiness(
+            "ddgs", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE,
+        )
+        tavily = mock.Mock()
+        tavily.name = "tavily"
+        tavily.readiness.return_value = ProviderReadiness(
+            "tavily", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE,
+        )
+
+        result = self._registry(tavily, ddgs).search_with_attempts(
+            query(), tier=SearchTier.LIGHT, max_results=5, timeout_seconds=8.0,
+        )
+
+        self.assertEqual(result.status, ProviderStatus.UNAVAILABLE)
+        self.assertEqual(result.attempts, ())
+        ddgs.search.assert_not_called()
+        tavily.search.assert_not_called()
 
     def test_fallback_same_query_id_is_one_semantic_query(self):
         ddgs = self._ready_provider("ddgs", status=ProviderStatus.ERROR)

@@ -42,7 +42,7 @@ class HealthModelChainTests(unittest.TestCase):
         self.assertIn("search_providers", response)
 
     def test_health_search_providers_without_secrets(self):
-        from src.search.models import ProviderReadiness, SearchFailureCode
+        from src.search.models import ProviderReadiness
         fake_config = SimpleNamespace(
             gemini_api_key="secret-g",
             deepseek_api_key="secret-d",
@@ -54,8 +54,8 @@ class HealthModelChainTests(unittest.TestCase):
             ),
         )
         readiness = (
+            ProviderReadiness("ddgs", True, True, None),
             ProviderReadiness("tavily", True, True, None),
-            ProviderReadiness("ddgs", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE),
         )
         orchestrator = SimpleNamespace(_providers=(_ReadinessProvider(readiness[0]), _ReadinessProvider(readiness[1])))
 
@@ -68,7 +68,12 @@ class HealthModelChainTests(unittest.TestCase):
 
         self.assertTrue(response["search_ready"])
         self.assertEqual(2, len(response["search_providers"]))
-        self.assertEqual("tavily", response["search_providers"][0]["provider"])
+        self.assertEqual("ddgs", response["search_providers"][0]["provider"])
+        self.assertEqual("tavily", response["search_providers"][1]["provider"])
+        self.assertTrue(response["search_providers"][0]["configured"])
+        self.assertTrue(response["search_providers"][0]["available"])
+        self.assertTrue(response["search_providers"][1]["configured"])
+        self.assertTrue(response["search_providers"][1]["available"])
         serialized = str(response)
         self.assertNotIn("api_key", serialized.casefold())
 
