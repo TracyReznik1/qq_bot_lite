@@ -32,13 +32,23 @@ Every row requires a real `reviewed_by` / `reviewed_at`. The reserved value
 reviewed all 140 rows, the offline acceptance thresholds cannot be certified.
 
 The checked-in `model_predictions.jsonl` is a router-only fixture baseline. The
-offline command binds it to a closed `search-eval-run-v1` manifest with
-`provenance=fixture_baseline`, `data_source=synthetic_provider_fixtures`, and
-`fixture_derived=true`. It is useful for exercising deterministic plumbing, but
-it is not an independent model run and can never certify model quality. A model
-name is not provenance. An independent run needs a manifest whose hashes bind
-the exact case and prediction arrays and whose run timestamp matches every
-prediction row.
+argument-free offline command classifies it as an untrusted fixture diagnostic.
+It is useful for exercising deterministic plumbing, but it is not an independent
+model run and can never certify model quality. The evaluator blacklists the
+checked-in fixture prediction hash and known fixture model identities even when
+a caller re-labels a manifest as independent. A model name, a hash, or an
+artifact-authored boolean is not provenance.
+
+A certifying independent run needs a closed `search-eval-run-v1` manifest whose
+hashes bind the exact canonical case and prediction arrays, whose timestamp
+matches every prediction, and whose `attestation` is a valid HMAC-SHA256 over
+the canonical manifest excluding `attestation`. Canonical JSON is UTF-8,
+key-sorted, compact (`separators=(",", ":")`), and preserves non-ASCII text.
+The closed attestation object contains only `algorithm="hmac-sha256"`, `key_id`,
+and a lowercase 64-character `signature`. The verifier secret must be supplied
+separately through the callable API or a named CLI environment variable; it is
+never read from the manifest or printed. Missing/short/wrong verifier secrets,
+invalid signatures, and unexpected attestation fields are non-certifying.
 
 The CLI returns nonzero while owner review, reviewed final-tier targets,
 independent predictions, or semantic samples are missing. A zero-sample or
@@ -119,16 +129,29 @@ schemas. Query, repair, and retrieval-round counts are derived from validated
 query metadata; a contradictory serialized counter is an integrity error.
 
 Trace mode also requires a closed `search-trace-sample-v1` manifest. Its hashes
-bind the exact raw Trace and audit arrays. Only
-`provenance=controlled_production` with `fixture_derived=false` can certify;
-synthetic fixtures remain diagnostic.
+bind the exact raw Trace and audit arrays, and it uses the same externally
+verified HMAC attestation contract. Only `provenance=controlled_production` with
+`fixture_derived=false` can certify; synthetic fixtures and evidence URLs on
+fixture/example/test hosts remain diagnostic regardless of manifest claims.
+
+The current production transition is exact: `final_tier == route`. Tier budgets
+are always selected from `route`. For every joined row, the trace must also
+reconcile with the external audit's skip reason, external-fact requirement,
+program minimum tier, explicit/no-web trigger, and acceptable final-tier target.
+Factual non-skip audits require both a minimum tier and one or more acceptable
+non-skip targets at or above that floor.
 
 Explicit no-web rows are excluded before both `D_factual` and explicit-search
 denominators are formed. Legal closed-context rows are excluded before
 `D_factual`. The report separately shows both exclusion counts, the no-web
 zero-provider rate, and a closed per-`skip_reason` breakdown.
 Provider-not-configured and provider-unavailable rows remain execution failures;
-they are never rewritten as route skips.
+they are never rewritten as route skips. A routed, orchestrated required-search
+row with no configured provider must record the `provider_not_configured`
+degradation, deduplicated provider failure code, matching disclosure, no attempt,
+and a non-success evidence outcome. `provider_execution_accounted_rate` gates
+the whole applicable factual population, so declaring a provider unconfigured
+cannot remove a row from acceptance.
 
 The JSON report includes numerator, denominator, and rate for factual route
 coverage, orchestrator start, provider attempt, sufficient Evidence, and the
@@ -150,15 +173,23 @@ cover provider/evidence contradictions, Claim-to-Evidence-to-final-URL mapping,
 used-versus-shown sources, relevance admission, count reconciliation, partial
 missing topics, retained unsupported or missing-topic claims, conflict members,
 dynamic unsupported conclusions, and required failure/conflict disclosures.
+Every retained material claim must map only to existing direct/relevant,
+citable, used, cited, and shown Evidence edges; unrelated good Evidence cannot
+admit a bad claim edge. Any retained partial/conflicting claim forces the
+corresponding non-definitive evidence state, degradation structure, missing-topic
+or conflict membership, and rendered disclosure, independent of subgroup.
 
 Every Trace latency field is reported with nearest-rank P50/P95/P99, including
 route, planning, initial/total provider search, initial/total content read,
 initial/total Evidence assembly, gap analysis, adaptive repair, answer,
 structural validation, semantic validation, QQ rendering, retrieval pipeline,
 and total response latency. Each percentile uses only audit rows where that
-stage actually started, so a not-run zero is excluded; route and total response
-have their own declared denominators. Every required stage and tier with zero
-samples is non-evaluable and non-certifying. Retrieval P95 is evaluated separately by final tier
+stage actually started, so a not-run zero is excluded; a zero is included when
+the stage did start. Positive latency and downstream execution facts are
+cross-checked against `stages_started`, preventing a slow executed stage from
+being omitted. Route and total response have their own declared denominators.
+Every required stage and tier with zero samples is non-evaluable and
+non-certifying. Retrieval P95 is evaluated separately by route
 (`light <= 6 s`, `standard <= 15 s`, `deep <= 30 s`); answer, validation, and
 render time are not folded into it.
 
@@ -167,9 +198,17 @@ render time are not folded into it.
 ```powershell
 python tools/evaluate_search.py integrity
 python tools/evaluate_search.py offline
-python tools/evaluate_search.py traces --traces path\to\search-traces.jsonl --labels path\to\human-audit.jsonl --manifest path\to\sample-manifest.json
+python tools/evaluate_search.py offline --cases path\to\reviewed-cases.jsonl --predictions path\to\independent-predictions.jsonl --manifest path\to\signed-run-manifest.json --verifier-key-env SEARCH_EVAL_VERIFIER_KEY
+python tools/evaluate_search.py traces --traces path\to\search-traces.jsonl --labels path\to\human-audit.jsonl --manifest path\to\signed-sample-manifest.json --verifier-key-env SEARCH_EVAL_VERIFIER_KEY
 python tools/evaluate_search.py online --limit 10
 ```
+
+The named environment variable above is illustrative; choose a deployment-owned
+name and inject its secret outside the artifact directory. The argument-free
+offline command is deliberately non-certifying. Independent offline mode
+requires all four explicit options. Trace mode requires the signed manifest and
+verifier option. Any absent input, invalid JSON/schema/hash/signature, fixture
+re-label, missing prediction, or zero required sample exits nonzero.
 
 Online provider runs are opt-in and never part of `unittest`.
 Without separate user authorization and credentials, `online` reports

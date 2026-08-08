@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import replace
 from threading import Lock
 from typing import Any, Callable, Sequence
+from uuid import uuid4
 
 from src.config import config
 from src.search.evidence import EvidenceAssembler, LLMEvidenceJudge
@@ -43,6 +44,10 @@ from src.search.providers.base import ProviderSearchOutcome
 from src.search.router import LLMRoutingAdvisor, RetrievalBenefitRouter
 
 logger = logging.getLogger("qq-bot")
+
+
+def _new_request_id() -> str:
+    return f"req-{uuid4().hex}"
 
 
 class _QueryAttemptTracker:
@@ -122,7 +127,7 @@ class SearchOrchestrator:
     def run(self, request: RetrievalRequest) -> SearchPipelineResult:
         response_started = self._monotonic()
         trace = SearchTrace(
-            request_id=f"req-{int(response_started * 1000) % 1000000}",
+            request_id=_new_request_id(),
             request_source=request.request_source,
             route=SearchTier.LIGHT,
             response_started_at=response_started,

@@ -78,6 +78,17 @@ def skip_payload(reason="social_or_emotional"):
     }
 
 
+class OrchestratorRequestIdTests(unittest.TestCase):
+    def test_request_ids_are_collision_resistant_uuid_hex_values(self):
+        module = orchestrator_module()
+        values = [module._new_request_id() for _index in range(10_000)]
+        self.assertEqual(len(values), len(set(values)))
+        for value in values:
+            self.assertTrue(value.startswith("req-"))
+            self.assertEqual(32, len(value.removeprefix("req-")))
+            int(value.removeprefix("req-"), 16)
+
+
 def request(question="什么是光合作用", force_search=False):
     return RetrievalRequest(
         question,
