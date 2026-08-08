@@ -525,17 +525,31 @@ def _quoted_spans(text: str) -> tuple[_SafetySpan, ...]:
 
 
 def _meta_declaration_spans(text: str) -> tuple[_SafetySpan, ...]:
-    """Return only clauses that explicitly declare example/title semantics."""
+    """Return explicit meta clauses and their immediately preceding question."""
     spans: list[_SafetySpan] = []
     clause_start = 0
+    preceding_question_boundary: int | None = None
     for boundary in _RELATION_BOUNDARY_PATTERN.finditer(text):
         clause_end = boundary.start()
         clause = text[clause_start:clause_end]
         if _META_DECLARATION_PATTERN.search(clause):
-            spans.append(_SafetySpan(clause_start, clause_end))
+            span_start = (
+                _sentence_start(text, preceding_question_boundary)
+                if preceding_question_boundary is not None
+                else clause_start
+            )
+            spans.append(_SafetySpan(span_start, clause_end))
+        preceding_question_boundary = (
+            boundary.start() if boundary.group() in {"?", "？"} else None
+        )
         clause_start = boundary.end()
     if _META_DECLARATION_PATTERN.search(text[clause_start:]):
-        spans.append(_SafetySpan(clause_start, len(text)))
+        span_start = (
+            _sentence_start(text, preceding_question_boundary)
+            if preceding_question_boundary is not None
+            else clause_start
+        )
+        spans.append(_SafetySpan(span_start, len(text)))
     return tuple(spans)
 
 
