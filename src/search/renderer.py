@@ -202,13 +202,23 @@ def render_search_reply(
 
     if decision.route is SearchTier.SKIP:
         disclosures: list[str] = []
-        if decision.skip_reason and decision.skip_reason.value == "user_forbid_web":
-            if not _is_high_consequence(result):
-                disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
+        is_no_web = bool(
+            decision.skip_reason
+            and decision.skip_reason.value == "user_forbid_web"
+        )
+        is_high_consequence = _is_high_consequence(result)
+        if is_no_web and not is_high_consequence:
+            disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
         disclosures.extend(_search_warning_disclosures(result))
         disclosures = _dedupe_strings(disclosures)
+        body = _strip_markers(
+            knowledge_fallback_text,
+            strip_search_warnings=True,
+        )
+        if is_no_web and is_high_consequence:
+            body = body.replace(_NO_WEB_DYNAMIC_LIMIT, "").strip()
         text = _compose_disclosures(
-            _strip_markers(knowledge_fallback_text, strip_search_warnings=True),
+            body,
             disclosures,
         )
         chunks = split_qq_reply(text, qq_limit)

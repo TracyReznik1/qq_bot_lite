@@ -729,11 +729,20 @@ class HighConsequenceWarningTests(unittest.TestCase):
             trace(SearchTier.SKIP),
             SearchFailureCode.USER_FORBID_WEB,
         )
-        rendered = module.render_search_reply(search_result, None, qq_limit=1700)
+        rendered = module.render_search_reply(
+            search_result,
+            None,
+            knowledge_fallback_text=(
+                "有限说明\n"
+                "根据你的要求，本次没有联网核验；涉及当前状态的结论无法确认。"
+            ),
+            qq_limit=1700,
+        )
 
         self.assertEqual(1, rendered.text.count("本次未联网核验"))
         self.assertNotIn("本次没有联网核验", rendered.text)
         self.assertNotIn("搜索结果可能不完整或不准确", rendered.text)
+        self.assertIn("有限说明", rendered.text)
 
     def test_warning_is_additive_to_grounded_answer_and_not_duplicated(self):
         module = renderer_module()
