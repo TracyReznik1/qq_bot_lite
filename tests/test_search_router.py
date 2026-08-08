@@ -194,10 +194,20 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
     def test_meta_title_suffix_is_not_high_consequence(self):
-        decision = decide("一条腿突然没力气，要去急诊吗？这只是测试用例标题。", {})
-        self.assertIs(decision.route, SearchTier.LIGHT)
-        self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-        self.assertIs(decision.potential_harm, PotentialHarm.NONE)
+        for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+            with self.subTest(advisor=label):
+                decision = decide("一条腿突然没力气，要去急诊吗？这只是测试用例标题。", advisor)
+                self.assertIs(decision.route, SearchTier.LIGHT)
+                self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+                self.assertIs(decision.potential_harm, PotentialHarm.NONE)
+
+    def test_negated_meta_title_suffix_keeps_high_consequence(self):
+        for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+            with self.subTest(advisor=label):
+                decision = decide("一条腿突然没力气，要去急诊吗？这不是测试用例标题。", advisor)
+                self.assertIs(decision.route, SearchTier.DEEP)
+                self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+                self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
     def test_meta_title_suffix_keeps_later_emergency_active(self):
         decision = decide(
