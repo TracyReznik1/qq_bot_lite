@@ -201,7 +201,7 @@ def render_search_reply(
         disclosures: list[str] = []
         if decision.skip_reason and decision.skip_reason.value == "user_forbid_web":
             disclosures.append(_NO_WEB_DYNAMIC_LIMIT)
-        disclosures.extend(_high_consequence_disclosures(result))
+        disclosures.extend(_search_warning_disclosures(result))
         disclosures = _dedupe_strings(disclosures)
         text = _compose_disclosures(_strip_markers(knowledge_fallback_text), disclosures)
         chunks = split_qq_reply(text, qq_limit)
@@ -242,7 +242,7 @@ def render_search_reply(
             text = ""
         if explicit_add:
             disclosures.append(_EXPLICIT_SEARCH_FAILED)
-        disclosures.extend(_high_consequence_disclosures(result))
+        disclosures.extend(_search_warning_disclosures(result))
         disclosures = _dedupe_strings(disclosures)
         text = _compose_disclosures(text, disclosures)
         chunks = split_qq_reply(text, qq_limit)
@@ -264,7 +264,7 @@ def render_search_reply(
             return _finish_render(result, rendered, render_started)
         disclosures = _dedupe_strings([
             _FIXED_DISCLOSURES[SearchFailureCode.VALIDATION_FAILED],
-            *_high_consequence_disclosures(result),
+            *_search_warning_disclosures(result),
         ])
         text = _compose_disclosures("", disclosures)
         rendered = RenderedReply(
@@ -282,7 +282,7 @@ def render_search_reply(
             rendered = _render_validation_failure(result, evidence, qq_limit)
             return _finish_render(result, rendered, render_started)
         else:
-            disclosures = _high_consequence_disclosures(result)
+            disclosures = _search_warning_disclosures(result)
             text = _compose_disclosures(
                 _strip_markers(knowledge_fallback_text or ""), disclosures,
             )
@@ -321,7 +321,7 @@ def _render_validation_failure(
     if evidence.evidence_state is EvidenceState.CONFLICTING:
         disclosures.append(_CONFLICT_PREFIX)
     disclosures.extend(_limitation_disclosures(evidence))
-    disclosures.extend(_high_consequence_disclosures(result))
+    disclosures.extend(_search_warning_disclosures(result))
     disclosures = _dedupe_strings(disclosures)
 
     source_lines: list[str] = []
@@ -401,7 +401,7 @@ def _render_validated(
     if _semantic_unavailable(validation):
         disclosures.append(_SEMANTIC_UNAVAILABLE)
     disclosures.extend(_limitation_disclosures(evidence))
-    disclosures.extend(_high_consequence_disclosures(result))
+    disclosures.extend(_search_warning_disclosures(result))
     disclosures = _dedupe_strings(disclosures)
 
     for block in validation.retained_blocks:
@@ -558,10 +558,11 @@ def _limitation_disclosures(evidence: EvidenceBundle) -> list[str]:
     ]
 
 
-def _high_consequence_disclosures(result: SearchPipelineResult) -> list[str]:
+def _search_warning_disclosures(result: SearchPipelineResult) -> list[str]:
     decision = result.decision
     if (
-        decision.potential_harm is PotentialHarm.HIGH
+        decision.route is not SearchTier.SKIP
+        or decision.potential_harm is PotentialHarm.HIGH
         or TriggerCode.HIGH_CONSEQUENCE_ACTION in decision.trigger_codes
     ):
         return [_HIGH_CONSEQUENCE_WARNING]

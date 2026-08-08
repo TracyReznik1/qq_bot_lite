@@ -30,6 +30,7 @@ from src.search.models import (
     SearchRoundKind,
     SearchTier,
     SearchTrace,
+    SkipReason,
     SourceRelation,
     SupportLabel,
     TriggerCode,
@@ -519,6 +520,136 @@ class RenderPlainReplyTests(unittest.TestCase):
 
 
 class HighConsequenceWarningTests(unittest.TestCase):
+    def test_empty_advisor_language_miss_warns_on_search_success_and_failure(self):
+        from src.search.router import RetrievalBenefitRouter
+        from tests.search_fakes import StaticRouterAdvisor
+
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        d = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
+            models().RetrievalRequest("一条腿突然没力气，要去急诊吗？")
+        )
+        self.assertIs(d.route, SearchTier.LIGHT)
+        self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, d.trigger_codes)
+        p = replace(
+            plan(),
+            decision=d,
+            budget=models().DEFAULT_TIER_BUDGETS[SearchTier.LIGHT],
+        )
+        b = replace(bundle((item(),)), decision=d, plan=p)
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "请根据检索结果及时就医", ("C1",)),),
+            (Claim("C1", "B1", "请根据检索结果及时就医", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(
+            draft, draft.answer_blocks, draft.claims, (), {}, (),
+        )
+        success = models().SearchPipelineResult(
+            d, p, b, trace(SearchTier.LIGHT), None,
+        )
+        failure = models().SearchPipelineResult(
+            d, p, None, trace(SearchTier.LIGHT),
+            SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+        )
+
+        for path, search_result, validation in (
+            ("success", success, report),
+            ("failure", failure, None),
+        ):
+            with self.subTest(path=path):
+                rendered = module.render_search_reply(
+                    search_result, validation, qq_limit=1700,
+                )
+                self.assertEqual(1, rendered.text.count(warning))
+                self.assertIn(warning, rendered.degradation_disclosures)
+
+    def test_ordinary_stable_searched_answer_has_one_uncertainty_warning(self):
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        b = bundle((item(),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(
+            draft, draft.answer_blocks, draft.claims, (), {}, (),
+        )
+
+        rendered = module.render_search_reply(result(b), report, qq_limit=1700)
+
+        self.assertEqual(1, rendered.text.count(warning))
+        self.assertIn("版本是3.2", rendered.text)
+        self.assertIn("https://example.com/page", rendered.text)
+
+    def test_model_warning_is_replaced_by_one_deterministic_search_warning(self):
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        b = bundle((item(),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", f"版本是3.2\n{warning}", ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(
+            draft, draft.answer_blocks, draft.claims, (), {}, (),
+        )
+
+        rendered = module.render_search_reply(result(b), report, qq_limit=1700)
+
+        self.assertEqual(1, rendered.text.count(warning))
+        self.assertEqual(1, rendered.degradation_disclosures.count(warning))
+
+    def test_closed_skip_has_no_warning_but_no_web_high_consequence_keeps_it(self):
+        from src.search.router import RetrievalBenefitRouter
+        from tests.search_fakes import StaticRouterAdvisor
+
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        router = RetrievalBenefitRouter(StaticRouterAdvisor({}))
+        social = models().RetrievalDecision(
+            SearchTier.SKIP,
+            SkipReason.SOCIAL_OR_EMOTIONAL,
+            False,
+            (),
+            frozenset(),
+            Factuality.NON_FACTUAL,
+            False,
+            Freshness.NONE,
+            RiskLevel.LOW,
+            models().Actionability.NONE,
+            models().PotentialHarm.NONE,
+            None,
+            None,
+            (),
+        )
+        no_web_high_consequence = router.decide(
+            models().RetrievalRequest("不要联网，我发烧39度，该吃多少布洛芬？")
+        )
+
+        social_rendered = module.render_search_reply(
+            models().SearchPipelineResult(
+                social, None, None, trace(SearchTier.SKIP), None,
+            ),
+            None,
+            knowledge_fallback_text="你好呀",
+            qq_limit=1700,
+        )
+        no_web_rendered = module.render_search_reply(
+            models().SearchPipelineResult(
+                no_web_high_consequence, None, None, trace(SearchTier.SKIP), None,
+            ),
+            None,
+            qq_limit=1700,
+        )
+
+        self.assertIs(social.route, SearchTier.SKIP)
+        self.assertEqual("你好呀", social_rendered.text)
+        self.assertNotIn(warning, social_rendered.text)
+        self.assertIs(no_web_high_consequence.route, SearchTier.SKIP)
+        self.assertEqual(1, no_web_rendered.text.count(warning))
+
     def test_warning_is_additive_to_grounded_answer_and_not_duplicated(self):
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"

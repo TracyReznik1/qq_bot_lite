@@ -35,6 +35,12 @@ from src.search.models import (
 from src.services.llm_types import ChatResponse
 
 
+_SEARCH_WARNING = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+_VALIDATION_FAILED_REPLY = (
+    "回答未能通过证据核验，已移除无法确认的内容。\n" + _SEARCH_WARNING
+)
+
+
 def models():
     return __import__("src.search.models", fromlist=["RetrievalRequest"])
 
@@ -309,7 +315,7 @@ class FailureFlowTests(unittest.TestCase):
         ):
             reply = chat_service.generate_reply("private:1", "我该吃多少药")
 
-        self.assertEqual("回答未能通过证据核验，已移除无法确认的内容。", reply)
+        self.assertEqual(_VALIDATION_FAILED_REPLY, reply)
         finalize.assert_called_once()
         finalized_result = finalize.call_args.args[0]
         self.assertIs(finalized_result.failure_code, models().SearchFailureCode.VALIDATION_FAILED)
@@ -338,7 +344,7 @@ class FailureFlowTests(unittest.TestCase):
             reply = chat_service.generate_reply("private:1", "我该吃多少药")
 
         self.assertEqual(1, llm_chat.call_count)
-        self.assertEqual("回答未能通过证据核验，已移除无法确认的内容。", reply)
+        self.assertEqual(_VALIDATION_FAILED_REPLY, reply)
         self.assertNotIn("99毫克", reply)
         self.assertNotIn("[1]", reply)
         finalized_result = finalize.call_args.args[0]
@@ -369,7 +375,7 @@ class FailureFlowTests(unittest.TestCase):
             reply = chat_service.generate_reply("private:1", "当前版本是什么")
 
         self.assertEqual(2, llm_chat.call_count)
-        self.assertEqual("回答未能通过证据核验，已移除无法确认的内容。", reply)
+        self.assertEqual(_VALIDATION_FAILED_REPLY, reply)
         self.assertIs(
             finalize.call_args.args[0].failure_code,
             models().SearchFailureCode.VALIDATION_FAILED,
@@ -568,7 +574,7 @@ class TraceLifecycleTests(unittest.TestCase):
         finally:
             chat_service._search_orchestrator = old
 
-        self.assertEqual("回答未能通过证据核验，已移除无法确认的内容。", reply)
+        self.assertEqual(_VALIDATION_FAILED_REPLY, reply)
         self.assertEqual(2, llm_calls)
         finalize.assert_called_once()
         append.assert_called_once()
