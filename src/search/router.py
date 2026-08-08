@@ -359,9 +359,14 @@ _NEGATED_META_PATTERN = re.compile(
     r"(?:我)?(?:不是|并非)(?:在)?(?:问|咨询|询问|想知道).{0,80}?(?=[，,。；;！？!?]|$)"
 )
 _META_DECLARATION_PATTERN = re.compile(
-    r"(?:(?<!不)(?:是|作为|属于|用于|叫做|命名为).{0,12}(?:测试|示例|用例|标题|代码|文本|例句)|"
+    r"(?:(?:是|作为|属于|用于|叫做|命名为).{0,12}(?:测试|示例|用例|标题|代码|文本|例句)|"
     r"(?:测试|示例|用例|标题|代码|文本|例句).{0,6}(?:是|为|[:：])|"
     r"(?:这个|该)?(?:标题|示例|测试用例|代码)(?:是|为|[:：]))"
+)
+_META_DECLARATION_NEGATION_PATTERN = re.compile(
+    r"(?:不(?:是|作为|属于|用于|叫做|命名为)|并非|"
+    r"未(?:作为|属于|用于|叫做|命名为)|"
+    r"没(?:有)?(?:作为|属于|用于|叫做|命名为))"
 )
 _BACKTICK_SPAN_PATTERN = re.compile(r"(?P<ticks>`{1,3}).*?(?P=ticks)", re.DOTALL)
 _ABSENCE_RELATION_PATTERN = re.compile(
@@ -524,6 +529,19 @@ def _quoted_spans(text: str) -> tuple[_SafetySpan, ...]:
     return tuple(spans)
 
 
+def _is_affirmative_meta_declaration(clause: str) -> bool:
+    """Only affirmative complete tail clauses may mask a safety question."""
+    compact = "".join(
+        character
+        for character in clause
+        if not character.isspace() and unicodedata.category(character) != "Cf"
+    )
+    return (
+        _META_DECLARATION_PATTERN.search(compact) is not None
+        and _META_DECLARATION_NEGATION_PATTERN.search(compact) is None
+    )
+
+
 def _meta_declaration_spans(text: str) -> tuple[_SafetySpan, ...]:
     """Return explicit meta clauses and their immediately preceding question."""
     spans: list[_SafetySpan] = []
@@ -532,7 +550,7 @@ def _meta_declaration_spans(text: str) -> tuple[_SafetySpan, ...]:
     for boundary in _RELATION_BOUNDARY_PATTERN.finditer(text):
         clause_end = boundary.start()
         clause = text[clause_start:clause_end]
-        if _META_DECLARATION_PATTERN.search(clause):
+        if _is_affirmative_meta_declaration(clause):
             span_start = (
                 _sentence_start(text, preceding_question_boundary)
                 if preceding_question_boundary is not None
@@ -543,7 +561,7 @@ def _meta_declaration_spans(text: str) -> tuple[_SafetySpan, ...]:
             boundary.start() if boundary.group() in {"?", "？"} else None
         )
         clause_start = boundary.end()
-    if _META_DECLARATION_PATTERN.search(text[clause_start:]):
+    if _is_affirmative_meta_declaration(text[clause_start:]):
         span_start = (
             _sentence_start(text, preceding_question_boundary)
             if preceding_question_boundary is not None

@@ -193,21 +193,40 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
         self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
-    def test_meta_title_suffix_is_not_high_consequence(self):
-        for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
-            with self.subTest(advisor=label):
-                decision = decide("一条腿突然没力气，要去急诊吗？这只是测试用例标题。", advisor)
-                self.assertIs(decision.route, SearchTier.LIGHT)
-                self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-                self.assertIs(decision.potential_harm, PotentialHarm.NONE)
+    def test_affirmative_meta_tail_variants_are_not_high_consequence(self):
+        suffixes = (
+            "这只是测试用例标题。",
+            "这个问题用于测试。",
+            "这个问题命名为测试用例。",
+            "这个问题作为示例。",
+        )
+        for suffix in suffixes:
+            for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+                with self.subTest(suffix=suffix, advisor=label):
+                    decision = decide("一条腿突然没力气，要去急诊吗？" + suffix, advisor)
+                    self.assertIs(decision.route, SearchTier.LIGHT)
+                    self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+                    self.assertIs(decision.potential_harm, PotentialHarm.NONE)
 
-    def test_negated_meta_title_suffix_keeps_high_consequence(self):
-        for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
-            with self.subTest(advisor=label):
-                decision = decide("一条腿突然没力气，要去急诊吗？这不是测试用例标题。", advisor)
-                self.assertIs(decision.route, SearchTier.DEEP)
-                self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-                self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+    def test_negated_meta_tail_variants_keep_high_consequence(self):
+        suffixes = (
+            "这不是测试用例标题。",
+            "这不 是测试用例标题。",
+            "这不　是测试用例标题。",
+            "这不\u200b是测试用例标题。",
+            "这个问题不是用于测试的。",
+            "这不是命名为测试用例。",
+            "这不是作为示例。",
+            "这个问题并非用于测试。",
+            "这个问题未用于测试。",
+        )
+        for suffix in suffixes:
+            for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+                with self.subTest(suffix=suffix, advisor=label):
+                    decision = decide("一条腿突然没力气，要去急诊吗？" + suffix, advisor)
+                    self.assertIs(decision.route, SearchTier.DEEP)
+                    self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+                    self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
     def test_meta_title_suffix_keeps_later_emergency_active(self):
         decision = decide(
