@@ -71,8 +71,15 @@ AttemptStartedObserver = Callable[[str, SearchQuery, ProviderReadiness, float], 
 AttemptFinishedObserver = Callable[[ProviderAttempt], None]
 
 
+_TAVILY_FALLBACK_RESERVE_SECONDS = {
+    SearchTier.LIGHT: 3.5,
+    SearchTier.STANDARD: 5.0,
+    SearchTier.DEEP: 8.0,
+}
+
+
 class ProviderRegistry:
-    """Owns ordered adapters; selects Tavily first, DDGS as availability fallback."""
+    """Select DDGS first and use Tavily as the bounded fallback."""
 
     def __init__(self, providers: Iterable[SearchProvider] | None = None) -> None:
         self._providers: list[SearchProvider] = list(providers or ())
@@ -130,6 +137,7 @@ class ProviderRegistry:
             )
 
         primary = self._primary_provider()
+        fallback = self._fallback_provider()
         if (
             primary is not None
             and primary.readiness().available
@@ -140,7 +148,7 @@ class ProviderRegistry:
                 query,
                 tier=tier,
                 max_results=max_results,
-                deadline=deadline,
+                deadline=self._primary_deadline(deadline, tier, fallback),
                 on_attempt_started=on_attempt_started,
                 on_attempt_finished=on_attempt_finished,
             )
@@ -151,7 +159,6 @@ class ProviderRegistry:
             if result.status is ProviderStatus.SUCCESS and result.hits:
                 return self._outcome(result, attempts)
 
-        fallback = self._fallback_provider()
         remaining = self._remaining(deadline)
         if fallback is not None and fallback.readiness().available and remaining > 0:
             result, attempt = self._call_until_deadline(
@@ -337,16 +344,31 @@ class ProviderRegistry:
         )
 
     def _primary_provider(self) -> SearchProvider | None:
-        for provider in self._providers:
-            if provider.name == "tavily":
-                return provider
-        return None
+        return self._provider_named("ddgs")
 
     def _fallback_provider(self) -> SearchProvider | None:
-        for provider in self._providers:
-            if provider.name == "ddgs":
-                return provider
-        return None
+        return self._provider_named("tavily")
+
+    def _provider_named(self, name: str) -> SearchProvider | None:
+        return next(
+            (provider for provider in self._providers if provider.name == name),
+            None,
+        )
+
+    def _primary_deadline(
+        self,
+        deadline: float,
+        tier: SearchTier,
+        fallback: SearchProvider | None,
+    ) -> float:
+        reserve = _TAVILY_FALLBACK_RESERVE_SECONDS[tier]
+        if (
+            fallback is not None
+            and fallback.readiness().available
+            and self._remaining(deadline) > reserve
+        ):
+            return deadline - reserve
+        return deadline
 
     def _readiness_provider_name(self) -> str:
         if self._providers:
