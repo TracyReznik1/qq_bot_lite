@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from datetime import date, datetime
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -48,7 +49,7 @@ SKIP_REASONS = {
     "closed_context_only",
 }
 ACTIONABILITY = {"none", "general", "personalized"}
-POTENTIAL_HARM = {"none", "low", "medium", "high"}
+POTENTIAL_HARM = {"none", "low", "high"}
 QUERY_PURPOSES = {
     "direct", "primary", "independent", "time_bounded", "disambiguation",
     "counterevidence", "repair",
@@ -82,6 +83,7 @@ CASE_FIELDS = {
     "acceptable_source_relations", "semantic_labels", "expected_outcome",
     "fixture_id", "label_status", "reviewed_by", "reviewed_at",
 }
+CASE_OPTIONAL_FIELDS = {"dynamic", "high_consequence", "expected_final_tier", "acceptable_final_tiers"}
 RECORDING_FIELDS = {
     "fixture_id", "case_id", "provider", "query_text", "title", "url",
     "excerpt", "expected_fetch_status",
@@ -90,10 +92,14 @@ PREDICTION_COMMON_FIELDS = {
     "case_id", "component", "model", "model_version", "prompt_schema_version",
     "run_timestamp",
 }
-PREDICTION_ALLOWED_FIELDS = PREDICTION_COMMON_FIELDS | {
-    "predicted_tier", "predictions", "label_id", "predicted",
-    "predicted_label", "predicted_query_purposes", "predicted_initial_query_count",
-    "predicted_repair_used",
+PREDICTION_FIELDS = {
+    "router": PREDICTION_COMMON_FIELDS | {"predicted_tier"},
+    "planner": PREDICTION_COMMON_FIELDS | {
+        "predicted_query_purposes", "predicted_initial_query_count", "predicted_repair_used",
+    },
+    "claim_discovery": PREDICTION_COMMON_FIELDS | {"predictions"},
+    "semantic_support": PREDICTION_COMMON_FIELDS | {"predictions"},
+    "relevance": PREDICTION_COMMON_FIELDS | {"predictions"},
 }
 HUMAN_LABEL_FIELDS = {
     "question", "allow_skip", "skip_reason", "minimum_tier",
@@ -152,6 +158,89 @@ LATENCY_FIELDS = (
     "retrieval_pipeline_latency_ms",
     "total_response_latency_ms",
 )
+
+REQUEST_SOURCES = {"chat", "command", "compatibility"}
+FACTUALITIES = {"non_factual", "factual", "mixed", "ambiguous"}
+TRIGGER_CODES = {
+    "explicit_no_web", "explicit_search", "explicit_verification",
+    "explicit_source_request", "freshness_marker", "dynamic_attribute",
+    "regulated_domain_foundation", "high_consequence_action",
+    "current_rule_or_policy", "controversy_or_conflict",
+    "external_fact_explanation_or_comparison", "recommendation_or_evaluation",
+    "ambiguous_entity", "multi_hop_complexity", "mixed_task", "factual_default",
+    "classifier_uncertain",
+}
+REDACTION_CODES = {
+    "cq_control_code", "data_url", "callback_secret", "one_time_code",
+    "password", "bank_account", "card_cvv", "hard_secret", "phone_number",
+    "email_address", "empty_after_redaction", "invalid_redaction_code",
+}
+PROVIDER_NAMES = {"tavily", "ddgs", "[redacted]"}
+QUERY_FIELDS = {"query_id", "purpose"}
+PROVIDER_ATTEMPT_FIELDS = {
+    "provider", "status", "count", "latency_ms", "query_id", "configured",
+    "available", "invocation_started",
+}
+TRACE_FIELDS = {
+    "request_id", "request_source", "route", "skip_reason", "trigger_codes",
+    "factuality", "external_fact_required", "program_minimum_tier", "final_tier",
+    "orchestrator_started", "initial_query_count", "initial_round_started",
+    "adaptive_repair_round_started", "adaptive_repair_query",
+    "initial_query_redaction_codes", "adaptive_repair_redaction_codes",
+    "retrieval_round_count", "executed_queries", "provider_configured",
+    "provider_attempts", "provider_invocation_started", "provider_failures",
+    "candidate_url_count", "citable_evidence_count", "evidence_state",
+    "repair_used", "claim_count", "supported_claim_count", "citation_count",
+    "knowledge_fallback_used", "degradation_reason", "content_read_count",
+    "provider_attempted", "sufficient_evidence", "semantic_query_count",
+    "repair_query_count", *LATENCY_FIELDS,
+}
+AUDIT_FIELDS = {
+    "case_id", "request_id", "category", "allow_skip", "skip_reason",
+    "external_fact_required", "explicit_search", "dynamic", "high_consequence",
+    "minimum_tier", "acceptable_final_tiers", "label_status", "reviewed_by",
+    "reviewed_at", "claims", "evidence", "used_evidence_ids",
+    "shown_source_urls", "missing_claim_topics", "conflict_groups",
+    "rendered_disclosures", "stages_started",
+}
+CLAIM_AUDIT_FIELDS = {
+    "claim_id", "material", "retained", "support_label", "evidence_ids", "topic_ids",
+}
+EVIDENCE_AUDIT_FIELDS = {"evidence_id", "final_url", "relevance", "citable"}
+CONFLICT_AUDIT_FIELDS = {"group_id", "member_evidence_ids"}
+DISCLOSURE_CODES = {
+    "partial_evidence", "source_conflict", "verification_failed",
+    "dynamic_unverified", "provider_not_configured", "provider_unavailable",
+    "provider_timeout", "no_results", "content_unreadable",
+    "insufficient_evidence", "semantic_validation_unavailable",
+    "user_forbid_web", "explicit_search_failure", "single_source_authority",
+}
+STAGE_TO_LATENCY = {
+    "route": "route_latency_ms",
+    "query_planning": "query_planning_latency_ms",
+    "initial_provider_search": "initial_provider_search_latency_ms",
+    "provider_search_total": "provider_search_total_latency_ms",
+    "initial_content_read": "initial_content_read_latency_ms",
+    "content_read_total": "content_read_total_latency_ms",
+    "initial_evidence_assembly": "initial_evidence_assembly_latency_ms",
+    "evidence_assembly_total": "evidence_assembly_total_latency_ms",
+    "gap_analysis": "gap_analysis_latency_ms",
+    "adaptive_repair": "adaptive_repair_latency_ms",
+    "answer_generation": "answer_generation_latency_ms",
+    "structural_validation": "structural_validation_latency_ms",
+    "semantic_validation": "semantic_validation_latency_ms",
+    "qq_render": "qq_render_latency_ms",
+    "retrieval_pipeline": "retrieval_pipeline_latency_ms",
+    "total_response": "total_response_latency_ms",
+}
+RUN_MANIFEST_FIELDS = {
+    "schema_version", "run_id", "provenance", "data_source", "fixture_derived",
+    "case_set_sha256", "predictions_sha256", "run_timestamp",
+}
+SAMPLE_MANIFEST_FIELDS = {
+    "schema_version", "sample_id", "provenance", "fixture_derived", "collected_at",
+    "traces_sha256", "audits_sha256",
+}
 
 _SECRET_MARKERS = ("AIza", "sk-", "qq:1000")
 
@@ -235,15 +324,28 @@ def _nearest_rank(values: Sequence[float], percentile: float) -> float | int | N
     return ordered[rank - 1]
 
 
-def latency_percentiles(traces: Iterable[Any]) -> dict[str, dict[str, float | int | None]]:
+def latency_percentiles(
+    traces: Iterable[Any],
+    audits_by_request_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, float | int | bool | None]]:
     rows = tuple(traces)
-    result: dict[str, dict[str, float | int | None]] = {}
+    result: dict[str, dict[str, float | int | bool | None]] = {}
     for field in LATENCY_FIELDS:
+        stage = next(name for name, latency in STAGE_TO_LATENCY.items() if latency == field)
         values = [
             value for row in rows
+            if (
+                audits_by_request_id is None
+                or stage in (
+                    audits_by_request_id.get(str(_field(row, "request_id")), {}).get(
+                        "stages_started", []
+                    )
+                )
+            )
             if _is_nonnegative_number(value := _field(row, field))
         ]
         result[field] = {
+            "evaluable": bool(values),
             "sample_count": len(values),
             "p50": _nearest_rank(values, 0.50),
             "p95": _nearest_rank(values, 0.95),
@@ -374,13 +476,116 @@ def _duplicate_values(values: Iterable[Any]) -> list[Any]:
     return [value for value, count in counts.items() if value and count > 1]
 
 
+def _artifact_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalized_identifier(value: Any) -> bool:
+    if not _is_nonempty_string(value):
+        return False
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    return (
+        value == normalized
+        and value.casefold() != "unreviewed"
+        and all(not character.isspace() and unicodedata.category(character) != "Cc" for character in value)
+    )
+
+
+def _validate_run_manifest(
+    manifest: Mapping[str, Any] | None,
+    cases: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    if not isinstance(manifest, Mapping):
+        return ["run manifest is required"]
+    errors: list[str] = []
+    missing = sorted(RUN_MANIFEST_FIELDS - set(manifest))
+    unexpected = sorted(set(manifest) - RUN_MANIFEST_FIELDS)
+    if missing:
+        errors.append(f"run manifest missing fields: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"run manifest unexpected fields: {', '.join(unexpected)}")
+    if manifest.get("schema_version") != "search-eval-run-v1":
+        errors.append("run manifest invalid schema_version")
+    if not _normalized_identifier(manifest.get("run_id")):
+        errors.append("run manifest invalid run_id")
+    if manifest.get("provenance") not in {"independent_model_run", "fixture_baseline"}:
+        errors.append("run manifest invalid provenance")
+    if manifest.get("data_source") not in {"reviewed_cases", "synthetic_provider_fixtures"}:
+        errors.append("run manifest invalid data_source")
+    if type(manifest.get("fixture_derived")) is not bool:
+        errors.append("run manifest fixture_derived must be boolean")
+    if not _valid_timestamp(manifest.get("run_timestamp")):
+        errors.append("run manifest invalid run_timestamp")
+    if manifest.get("case_set_sha256") != _artifact_sha256(cases):
+        errors.append("run manifest case_set_sha256 does not bind cases")
+    if manifest.get("predictions_sha256") != _artifact_sha256(predictions):
+        errors.append("run manifest predictions_sha256 does not bind predictions")
+    fixture = manifest.get("fixture_derived") is True
+    if manifest.get("provenance") == "fixture_baseline" and not fixture:
+        errors.append("fixture_baseline provenance requires fixture_derived=true")
+    if manifest.get("data_source") == "synthetic_provider_fixtures" and not fixture:
+        errors.append("synthetic fixture data source requires fixture_derived=true")
+    if manifest.get("provenance") == "independent_model_run" and fixture:
+        errors.append("independent_model_run cannot be fixture-derived")
+    if manifest.get("provenance") == "independent_model_run" and manifest.get("data_source") != "reviewed_cases":
+        errors.append("independent_model_run requires reviewed_cases data source")
+    if manifest.get("provenance") == "fixture_baseline" and manifest.get("data_source") != "synthetic_provider_fixtures":
+        errors.append("fixture_baseline requires synthetic_provider_fixtures data source")
+    if any(row.get("run_timestamp") != manifest.get("run_timestamp") for row in predictions):
+        errors.append("run manifest run_timestamp does not match every prediction")
+    run_signatures = {
+        (row.get("model"), row.get("model_version"), row.get("prompt_schema_version"))
+        for row in predictions
+    }
+    if len(run_signatures) > 1:
+        errors.append("run manifest binds predictions from multiple model runs")
+    return errors
+
+
+def _validate_sample_manifest(
+    manifest: Mapping[str, Any] | None,
+    traces: Sequence[Mapping[str, Any]],
+    audits: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    if not isinstance(manifest, Mapping):
+        return ["controlled sample manifest is required"]
+    errors: list[str] = []
+    missing = sorted(SAMPLE_MANIFEST_FIELDS - set(manifest))
+    unexpected = sorted(set(manifest) - SAMPLE_MANIFEST_FIELDS)
+    if missing:
+        errors.append(f"sample manifest missing fields: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"sample manifest unexpected fields: {', '.join(unexpected)}")
+    if manifest.get("schema_version") != "search-trace-sample-v1":
+        errors.append("sample manifest invalid schema_version")
+    if not _normalized_identifier(manifest.get("sample_id")):
+        errors.append("sample manifest invalid sample_id")
+    if manifest.get("provenance") not in {"controlled_production", "synthetic_fixture"}:
+        errors.append("sample manifest invalid provenance")
+    if type(manifest.get("fixture_derived")) is not bool:
+        errors.append("sample manifest fixture_derived must be boolean")
+    if not _valid_timestamp(manifest.get("collected_at")):
+        errors.append("sample manifest invalid collected_at")
+    if manifest.get("traces_sha256") != _artifact_sha256(traces):
+        errors.append("sample manifest traces_sha256 does not bind traces")
+    if manifest.get("audits_sha256") != _artifact_sha256(audits):
+        errors.append("sample manifest audits_sha256 does not bind audits")
+    if manifest.get("provenance") == "controlled_production" and manifest.get("fixture_derived") is not False:
+        errors.append("controlled_production must not be fixture-derived")
+    if manifest.get("provenance") == "synthetic_fixture" and manifest.get("fixture_derived") is not True:
+        errors.append("synthetic_fixture requires fixture_derived=true")
+    return errors
+
+
 # ── integrity ──────────────────────────────────────────────────────────
 
 def _validate_case(case: Mapping[str, Any], index: int) -> list[str]:
     prefix = f"case row {index}"
     errors: list[str] = []
     missing = sorted(CASE_FIELDS - set(case))
-    unexpected = sorted(set(case) - CASE_FIELDS)
+    unexpected = sorted(set(case) - CASE_FIELDS - CASE_OPTIONAL_FIELDS)
     if missing:
         errors.append(f"{prefix} missing fields: {', '.join(missing)}")
     if unexpected:
@@ -399,6 +604,21 @@ def _validate_case(case: Mapping[str, Any], index: int) -> list[str]:
         errors.append(f"case {display} invalid skip_reason")
     if case.get("minimum_tier") is not None and case.get("minimum_tier") not in TIERS:
         errors.append(f"case {display} invalid minimum_tier")
+    for name in ("dynamic", "high_consequence"):
+        if name in case and type(case.get(name)) is not bool:
+            errors.append(f"case {display} {name} must be boolean")
+    expected_tier = case.get("expected_final_tier")
+    acceptable_tiers = case.get("acceptable_final_tiers")
+    if expected_tier is not None and expected_tier not in ROUTES:
+        errors.append(f"case {display} invalid expected_final_tier")
+    if acceptable_tiers is not None and (
+        not _is_string_list(acceptable_tiers, allow_empty=False)
+        or any(tier not in ROUTES for tier in acceptable_tiers or ())
+        or len(set(acceptable_tiers or ())) != len(acceptable_tiers or ())
+    ):
+        errors.append(f"case {display} invalid acceptable_final_tiers")
+    if expected_tier is not None and acceptable_tiers is not None:
+        errors.append(f"case {display} cannot set both expected_final_tier and acceptable_final_tiers")
     if type(case.get("external_fact_required")) is not bool:
         errors.append(f"case {display} external_fact_required must be boolean")
     if case.get("actionability") not in ACTIONABILITY:
@@ -429,8 +649,7 @@ def _validate_case(case: Mapping[str, Any], index: int) -> list[str]:
 
     reviewed = (
         case.get("label_status") == "reviewed"
-        and _is_nonempty_string(case.get("reviewed_by"))
-        and case.get("reviewed_by") != "unreviewed"
+        and _normalized_identifier(case.get("reviewed_by"))
         and _valid_date(case.get("reviewed_at"))
     )
     if not reviewed:
@@ -459,6 +678,16 @@ def _validate_case(case: Mapping[str, Any], index: int) -> list[str]:
             if not isinstance(label, dict):
                 errors.append(f"case {display} semantic label {label_index} must be an object")
                 continue
+            unexpected_label_fields = sorted(set(label) - {"label_id", "component", "expected"})
+            missing_label_fields = sorted({"label_id", "component", "expected"} - set(label))
+            if missing_label_fields:
+                errors.append(
+                    f"case {display} semantic label {label_index} missing fields: {', '.join(missing_label_fields)}"
+                )
+            if unexpected_label_fields:
+                errors.append(
+                    f"case {display} semantic label {label_index} unexpected fields: {', '.join(unexpected_label_fields)}"
+                )
             label_id = label.get("label_id")
             component = label.get("component")
             expected = label.get("expected")
@@ -510,16 +739,35 @@ def _prediction_items(prediction: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if _is_nonempty_string(prediction.get("label_id")):
         return [{
             "label_id": prediction.get("label_id"),
-            "predicted": prediction.get("predicted", prediction.get("predicted_label")),
+            "predicted": prediction.get("predicted"),
         }]
     return []
+
+
+def _recursive_human_label_fields(value: Any, path: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key in HUMAN_LABEL_FIELDS or key == "expected":
+                found.append(child_path)
+            found.extend(_recursive_human_label_fields(nested, child_path))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            found.extend(_recursive_human_label_fields(nested, f"{path}[{index}]"))
+    return found
 
 
 def _validate_prediction(prediction: Mapping[str, Any], index: int, case_ids: set[str]) -> list[str]:
     prefix = f"prediction row {index}"
     errors: list[str] = []
-    missing = sorted(PREDICTION_COMMON_FIELDS - set(prediction))
-    unexpected = sorted(set(prediction) - PREDICTION_ALLOWED_FIELDS)
+    component = prediction.get("component")
+    if component in QUALITY_COMPONENTS and "label_id" in prediction:
+        allowed_fields = PREDICTION_COMMON_FIELDS | {"label_id", "predicted"}
+    else:
+        allowed_fields = PREDICTION_FIELDS.get(component, PREDICTION_COMMON_FIELDS)
+    missing = sorted(allowed_fields - set(prediction))
+    unexpected = sorted(set(prediction) - allowed_fields)
     if missing:
         errors.append(f"{prefix} missing fields: {', '.join(missing)}")
     if unexpected:
@@ -527,22 +775,43 @@ def _validate_prediction(prediction: Mapping[str, Any], index: int, case_ids: se
     leaked = sorted(set(prediction).intersection(HUMAN_LABEL_FIELDS))
     if leaked:
         errors.append(f"{prefix} contains human-label field: {', '.join(leaked)}")
+    recursive_leaks = sorted(
+        path for path in _recursive_human_label_fields(prediction)
+        if "." in path or "[" in path
+    )
+    if recursive_leaks:
+        errors.append(
+            f"{prefix} contains recursive human-label field: {', '.join(recursive_leaks)}"
+        )
     case_id = prediction.get("case_id")
     if not _is_nonempty_string(case_id):
         errors.append(f"{prefix} missing case_id")
     elif case_id not in case_ids:
         errors.append(f"{prefix} unknown case_id {case_id}")
-    component = prediction.get("component")
     if component not in PREDICTION_COMPONENTS:
         errors.append(f"{prefix} invalid component")
     for name in ("model", "model_version", "prompt_schema_version"):
-        if not _is_nonempty_string(prediction.get(name)):
+        if not _normalized_identifier(prediction.get(name)):
             errors.append(f"{prefix} missing {name}")
     if not _valid_timestamp(prediction.get("run_timestamp")):
         errors.append(f"{prefix} invalid run_timestamp")
     if component == "router" and prediction.get("predicted_tier") not in ROUTES:
         errors.append(f"{prefix} invalid predicted_tier")
+    if component == "planner":
+        purposes = prediction.get("predicted_query_purposes")
+        if not _is_string_list(purposes) or any(value not in QUERY_PURPOSES for value in purposes or ()):
+            errors.append(f"{prefix} invalid predicted_query_purposes")
+        if not _is_int(prediction.get("predicted_initial_query_count")):
+            errors.append(f"{prefix} predicted_initial_query_count must be a non-negative integer")
+        if type(prediction.get("predicted_repair_used")) is not bool:
+            errors.append(f"{prefix} predicted_repair_used must be boolean")
     if component in QUALITY_COMPONENTS:
+        if "predictions" in prediction and not isinstance(prediction.get("predictions"), list):
+            errors.append(f"{prefix} predictions must be a list")
+        if isinstance(prediction.get("predictions"), list):
+            for item_index, item in enumerate(prediction["predictions"], 1):
+                if not isinstance(item, Mapping):
+                    errors.append(f"{prefix} prediction {item_index} must be an object")
         items = _prediction_items(prediction)
         if not items:
             errors.append(f"{prefix} quality prediction requires predictions")
@@ -553,6 +822,12 @@ def _validate_prediction(prediction: Mapping[str, Any], index: int, case_ids: se
             "relevance": RELEVANCE_LABELS,
         }[component]
         for item_index, item in enumerate(items, 1):
+            missing_item = sorted({"label_id", "predicted"} - set(item))
+            unexpected_item = sorted(set(item) - {"label_id", "predicted"})
+            if missing_item:
+                errors.append(f"{prefix} prediction {item_index} missing fields: {', '.join(missing_item)}")
+            if unexpected_item:
+                errors.append(f"{prefix} prediction {item_index} unexpected fields: {', '.join(unexpected_item)}")
             label_id = item.get("label_id")
             predicted = item.get("predicted", item.get("predicted_label"))
             if not _is_nonempty_string(label_id):
@@ -563,6 +838,63 @@ def _validate_prediction(prediction: Mapping[str, Any], index: int, case_ids: se
                 seen.add(label_id)
             if predicted not in allowed:
                 errors.append(f"{prefix} prediction {item_index} invalid predicted label")
+    return errors
+
+
+def _validate_case_prediction_artifacts(
+    cases: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    errors: list[str] = []
+    for index, case in enumerate(cases, 1):
+        errors.extend(_validate_case(case, index))
+    case_ids = {
+        case.get("case_id") for case in cases if _is_nonempty_string(case.get("case_id"))
+    }
+    for case_id in _duplicate_values(case.get("case_id") for case in cases):
+        errors.append(f"duplicate case_id {case_id}")
+    for index, prediction in enumerate(predictions, 1):
+        errors.extend(_validate_prediction(prediction, index, case_ids))
+
+    singleton_keys = [
+        (row.get("case_id"), row.get("component"))
+        for row in predictions
+        if _is_nonempty_string(row.get("case_id"))
+        and row.get("component") not in QUALITY_COMPONENTS
+    ]
+    for case_id, component in _duplicate_values(singleton_keys):
+        errors.append(f"duplicate prediction for case_id {case_id} component {component}")
+    quality_keys = [
+        (row.get("case_id"), row.get("component"), item.get("label_id"))
+        for row in predictions
+        if _is_nonempty_string(row.get("case_id")) and row.get("component") in QUALITY_COMPONENTS
+        for item in _prediction_items(row)
+        if _is_nonempty_string(item.get("label_id"))
+    ]
+    for case_id, component, label_id in _duplicate_values(quality_keys):
+        errors.append(
+            f"duplicate prediction for case_id {case_id} component {component} label_id {label_id}"
+        )
+    human_keys = {
+        (case.get("case_id"), label.get("component"), label.get("label_id"))
+        for case in cases
+        for label in (case.get("semantic_labels") or ())
+        if isinstance(label, Mapping)
+        and _is_nonempty_string(case.get("case_id"))
+        and label.get("component") in QUALITY_COMPONENTS
+        and _is_nonempty_string(label.get("label_id"))
+    }
+    predicted_keys = set(quality_keys)
+    for case_id, component, label_id in sorted(human_keys - predicted_keys):
+        errors.append(f"missing quality prediction for {case_id}/{component}/{label_id}")
+    for case_id, component, label_id in sorted(predicted_keys - human_keys):
+        errors.append(f"quality prediction has no external human label {case_id}/{component}/{label_id}")
+    router_ids = {
+        row.get("case_id") for row in predictions
+        if row.get("component") == "router" and _is_nonempty_string(row.get("case_id"))
+    }
+    for case_id in sorted(case_ids - router_ids):
+        errors.append(f"missing router prediction for case_id {case_id}")
     return errors
 
 
@@ -636,6 +968,20 @@ def validate_integrity(
         errors.append(
             f"duplicate prediction for case_id {case_id} component {component} label_id {label_id}"
         )
+    human_quality_keys = {
+        (case.get("case_id"), label.get("component"), label.get("label_id"))
+        for case in cases
+        for label in (case.get("semantic_labels") or ())
+        if isinstance(label, Mapping)
+        and _is_nonempty_string(case.get("case_id"))
+        and label.get("component") in QUALITY_COMPONENTS
+        and _is_nonempty_string(label.get("label_id"))
+    }
+    predicted_quality_keys = set(quality_prediction_keys)
+    for case_id, component, label_id in sorted(human_quality_keys - predicted_quality_keys):
+        errors.append(f"missing quality prediction for {case_id}/{component}/{label_id}")
+    for case_id, component, label_id in sorted(predicted_quality_keys - human_quality_keys):
+        errors.append(f"quality prediction has no external human label {case_id}/{component}/{label_id}")
     router_case_ids = {
         prediction.get("case_id") for prediction in predictions
         if prediction.get("component") == "router" and _is_nonempty_string(prediction.get("case_id"))
@@ -675,13 +1021,9 @@ def integrity() -> int:
 
 def _case_groups(case: Mapping[str, Any]) -> set[str]:
     groups = {"overall"}
-    if case.get("category") == "dynamic_fact" or case.get("dynamic") is True:
+    if case.get("dynamic") is True:
         groups.add("dynamic")
-    if (
-        case.get("potential_harm") == "high"
-        or case.get("actionability") == "personalized"
-        or case.get("high_consequence") is True
-    ):
+    if case.get("high_consequence") is True:
         groups.add("high_consequence")
     return groups
 
@@ -759,6 +1101,23 @@ def quality_metrics(
                 if label_component == component and group in groups
             )
             metric["missing_prediction_count"] = metric["label_count"] - metric["sample_count"]
+            flag = group if group in {"dynamic", "high_consequence"} else None
+            missing_group_labels = sum(
+                1
+                for case in cases
+                if flag is not None
+                and any(
+                    isinstance(label, Mapping) and label.get("component") == component
+                    for label in (case.get("semantic_labels") or ())
+                )
+                and type(case.get(flag)) is not bool
+            )
+            metric["missing_subgroup_label_count"] = missing_group_labels
+            if missing_group_labels:
+                metric["evaluable"] = False
+                for name in ("precision", "recall", "f1", "macro_precision", "macro_recall", "macro_f1"):
+                    if name in metric:
+                        metric[name] = None
             result[component][group] = metric
     result["errors"] = errors
     return result
@@ -773,10 +1132,12 @@ def in_d_factual(case: Mapping[str, Any]) -> bool:
     return case.get("external_fact_required") is not False
 
 
-def evaluate_offline(
-    cases: Sequence[Mapping[str, Any]],
-    predictions: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
+_TIER_RANK = {"skip": 0, "light": 1, "standard": 2, "deep": 3}
+
+
+def _router_pairs(
+    cases: Sequence[Mapping[str, Any]], predictions: Sequence[Mapping[str, Any]],
+) -> tuple[list[tuple[Mapping[str, Any], str]], list[str]]:
     failures: list[str] = []
     router_rows: dict[str, Mapping[str, Any]] = {}
     for row in predictions:
@@ -787,9 +1148,7 @@ def evaluate_offline(
             failures.append(f"duplicate router prediction for case_id {case_id}")
             continue
         router_rows[case_id] = row
-
-    confusion: Counter[tuple[str, str]] = Counter()
-    route_pairs: list[tuple[Mapping[str, Any], str]] = []
+    pairs: list[tuple[Mapping[str, Any], str]] = []
     for case in cases:
         case_id = case.get("case_id")
         if not _is_nonempty_string(case_id):
@@ -798,17 +1157,78 @@ def evaluate_offline(
         if row is None:
             failures.append(f"missing router prediction for case_id {case_id}")
             continue
-        expected = case.get("minimum_tier") or "skip"
         predicted = row.get("predicted_tier")
         if predicted not in ROUTES:
             failures.append(f"invalid router prediction for case_id {case_id}")
             continue
-        confusion[(predicted, expected)] += 1
-        route_pairs.append((case, predicted))
+        pairs.append((case, predicted))
+    return pairs, failures
 
-    tier = tier_metrics(confusion)
+
+def routing_quality_metrics(
+    cases: Sequence[Mapping[str, Any]], predictions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    pairs, errors = _router_pairs(cases, predictions)
+    confusion: Counter[tuple[str, str]] = Counter()
+    floor_violations = 0
+    target_samples = 0
+    acceptable_matches = 0
+    missing_targets = 0
+    for case, predicted in pairs:
+        minimum = case.get("minimum_tier") or "skip"
+        if _TIER_RANK[predicted] < _TIER_RANK.get(minimum, 0):
+            floor_violations += 1
+        exact = case.get("expected_final_tier")
+        acceptable = case.get("acceptable_final_tiers")
+        if exact in ROUTES:
+            targets = (exact,)
+        elif isinstance(acceptable, list) and acceptable and all(tier in ROUTES for tier in acceptable):
+            targets = tuple(acceptable)
+        else:
+            missing_targets += 1
+            continue
+        target_samples += 1
+        if predicted in targets:
+            acceptable_matches += 1
+            confusion[(predicted, predicted)] += 1
+        else:
+            confusion[(predicted, targets[0])] += 1
+    metrics = tier_metrics(confusion) if target_samples else {
+        "macro_precision": None, "macro_recall": None, "macro_f1": None,
+    }
+    return {
+        "router_sample_count": len(pairs),
+        "minimum_tier_violations": floor_violations,
+        "tier_target_evaluable": target_samples > 0 and missing_targets == 0,
+        "tier_target_sample_count": target_samples,
+        "missing_tier_target_count": missing_targets,
+        "acceptable_tier_matches": acceptable_matches,
+        "tier_metrics": metrics,
+        "errors": errors,
+    }
+
+
+def evaluate_offline(
+    cases: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
+    *,
+    run_manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    failures: list[str] = []
+    artifact_errors = _validate_case_prediction_artifacts(cases, predictions)
+    if artifact_errors:
+        failures.append("offline case/prediction integrity errors")
+    manifest_errors = _validate_run_manifest(run_manifest, cases, predictions)
+    failures.extend(manifest_errors)
+    routing = routing_quality_metrics(cases, predictions)
+    failures.extend(routing["errors"])
+    route_pairs, _ = _router_pairs(cases, predictions)
+    tier = routing["tier_metrics"]
     mandatory = [(case, prediction) for case, prediction in route_pairs if in_d_factual(case)]
-    explicit = [(case, prediction) for case, prediction in route_pairs if case.get("category") == "explicit_search"]
+    explicit = [
+        (case, prediction) for case, prediction in route_pairs
+        if case.get("category") == "explicit_search" and case.get("skip_reason") != "user_forbid_web"
+    ]
     legal_skip = [
         (case, prediction) for case, prediction in route_pairs
         if case.get("allow_skip") and case.get("external_fact_required") is False
@@ -836,6 +1256,10 @@ def evaluate_offline(
     failures.extend(quality["errors"])
     if not route_pairs:
         failures.append("router zero samples")
+    if routing["minimum_tier_violations"]:
+        failures.append("minimum tier safety-floor violations")
+    if not routing["tier_target_evaluable"]:
+        failures.append("reviewed final-tier targets missing or zero samples")
     elif tier["macro_f1"] < 0.90:
         failures.append("tier macro F1 below 0.90")
     if mandatory_rate["denominator"] == 0:
@@ -862,13 +1286,19 @@ def evaluate_offline(
             if any(metric[name] < threshold for name in names):
                 failures.append(f"{component} {group} PRF below {threshold:.2f}")
 
-    fixture_baseline = any(row.get("model") == "fixture-baseline" for row in predictions)
+    manifest_valid = not manifest_errors
+    fixture_baseline = bool(
+        manifest_valid and (
+            run_manifest.get("provenance") == "fixture_baseline"
+            or run_manifest.get("fixture_derived") is True
+            or run_manifest.get("data_source") == "synthetic_provider_fixtures"
+        )
+    )
     if fixture_baseline:
         failures.append("fixture baseline is diagnostic and non-certifying")
     owner_reviewed = all(
         case.get("label_status") == "reviewed"
-        and _is_nonempty_string(case.get("reviewed_by"))
-        and case.get("reviewed_by") != "unreviewed"
+        and _normalized_identifier(case.get("reviewed_by"))
         and _valid_date(case.get("reviewed_at"))
         for case in cases
     ) and bool(cases)
@@ -879,10 +1309,17 @@ def evaluate_offline(
     return {
         "mode": "offline",
         "certifying": not failures,
-        "artifact_class": "fixture_baseline" if fixture_baseline else "independent_predictions",
+        "artifact_class": (
+            "fixture_baseline" if fixture_baseline
+            else "independent_predictions" if manifest_valid
+            else "unverified_provenance"
+        ),
         "case_count": len(cases),
         "router_sample_count": len(route_pairs),
         "tier_metrics": tier,
+        "routing_quality": routing,
+        "errors": artifact_errors,
+        "run_manifest_valid": manifest_valid,
         "mandatory_search_route_rate": mandatory_rate,
         "explicit_search_route_rate": explicit_rate,
         "legal_non_factual_meaningless_search_rate": meaningless,
@@ -898,7 +1335,17 @@ def offline() -> int:
     if load_errors:
         report = {"mode": "offline", "certifying": False, "failures": load_errors}
     else:
-        report = evaluate_offline(cases, predictions)
+        fixture_manifest = {
+            "schema_version": "search-eval-run-v1",
+            "run_id": "checked-in-fixture-baseline-v1",
+            "provenance": "fixture_baseline",
+            "data_source": "synthetic_provider_fixtures",
+            "fixture_derived": True,
+            "case_set_sha256": _artifact_sha256(cases),
+            "predictions_sha256": _artifact_sha256(predictions),
+            "run_timestamp": "2026-07-29T00:00:00Z",
+        }
+        report = evaluate_offline(cases, predictions, run_manifest=fixture_manifest)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["certifying"] else 1
 
@@ -906,9 +1353,6 @@ def offline() -> int:
 # ── trace metrics and acceptance ───────────────────────────────────────
 
 def _semantic_query_count(trace: Any) -> int:
-    value = _field(trace, "semantic_query_count")
-    if _is_int(value):
-        return value
     executed = _field(trace, "executed_queries", ()) or ()
     query_ids: set[str] = set()
     for query in executed:
@@ -920,14 +1364,45 @@ def _semantic_query_count(trace: Any) -> int:
             query_id = getattr(query, "query_id", None)
         if _is_nonempty_string(query_id):
             query_ids.add(query_id)
-    return len(query_ids)
+    if isinstance(trace, Mapping) and "executed_queries" in trace:
+        return len(query_ids)
+    value = _field(trace, "semantic_query_count")
+    return value if _is_int(value) else 0
 
 
 def _repair_query_count(trace: Any) -> int:
+    executed = _field(trace, "executed_queries", ()) or ()
+    query_ids: set[str] = set()
+    for query in executed:
+        purpose = query.get("purpose") if isinstance(query, Mapping) else getattr(query, "purpose", None)
+        query_id = query.get("query_id") if isinstance(query, Mapping) else getattr(query, "query_id", None)
+        if _enum_text(purpose) == "repair" and _is_nonempty_string(query_id):
+            query_ids.add(query_id)
+    if isinstance(trace, Mapping) and "executed_queries" in trace:
+        return len(query_ids)
     value = _field(trace, "repair_query_count")
-    if _is_int(value):
-        return value
-    return int(bool(_field(trace, "adaptive_repair_round_started")))
+    return value if _is_int(value) else int(bool(_field(trace, "adaptive_repair_round_started")))
+
+
+def _initial_query_count(trace: Any) -> int:
+    executed = _field(trace, "executed_queries", ()) or ()
+    query_ids: set[str] = set()
+    for query in executed:
+        purpose = query.get("purpose") if isinstance(query, Mapping) else getattr(query, "purpose", None)
+        query_id = query.get("query_id") if isinstance(query, Mapping) else getattr(query, "query_id", None)
+        if _enum_text(purpose) != "repair" and _is_nonempty_string(query_id):
+            query_ids.add(query_id)
+    if isinstance(trace, Mapping) and "executed_queries" in trace:
+        return len(query_ids)
+    return _counter(trace, "initial_query_count")
+
+
+def _retrieval_round_count(trace: Any) -> int:
+    if isinstance(trace, Mapping) and "executed_queries" in trace:
+        return int(bool(_field(trace, "initial_round_started"))) + int(
+            bool(_field(trace, "adaptive_repair_round_started"))
+        )
+    return _counter(trace, "retrieval_round_count")
 
 
 def budget_violations(traces: Iterable[Any]) -> dict[str, int]:
@@ -938,17 +1413,17 @@ def budget_violations(traces: Iterable[Any]) -> dict[str, int]:
     )
     violations = {name: 0 for name in names}
     for trace in traces:
-        route = _route(trace)
+        route = _enum_text(_field(trace, "final_tier")) or _route(trace)
         budget = TIER_BUDGETS.get(route)
         if budget is None:
             continue
         observed = {
-            "initial_query_count": _counter(trace, "initial_query_count"),
+            "initial_query_count": _initial_query_count(trace),
             "candidate_url_count": _counter(trace, "candidate_url_count"),
             "content_read_count": _counter(trace, "content_read_count"),
             "semantic_query_count": _semantic_query_count(trace),
             "repair_query_count": _repair_query_count(trace),
-            "retrieval_round_count": _counter(trace, "retrieval_round_count"),
+            "retrieval_round_count": _retrieval_round_count(trace),
         }
         for name, value in observed.items():
             if value > budget[name]:
@@ -967,7 +1442,10 @@ def repair_round_count(traces: Iterable[Any]) -> int:
     return sum(1 for trace in traces if bool(_field(trace, "adaptive_repair_round_started")))
 
 
-def deterministic_invariant_violations(traces: Iterable[Any]) -> dict[str, int]:
+def deterministic_invariant_violations(
+    traces: Iterable[Any],
+    audits_by_request_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, int]:
     violations = {
         "skip_with_provider_attempt": 0,
         "search_without_orchestrator": 0,
@@ -978,6 +1456,24 @@ def deterministic_invariant_violations(traces: Iterable[Any]) -> dict[str, int]:
         "knowledge_fallback_with_citation": 0,
         "sufficient_without_citable_evidence": 0,
         "failure_state_mismatch": 0,
+        "evidence_without_provider_attempt": 0,
+        "provider_configuration_contradiction": 0,
+        "audit_count_mismatch": 0,
+        "claim_evidence_mapping": 0,
+        "invalid_evidence_url": 0,
+        "citable_without_relevance": 0,
+        "used_evidence_mapping": 0,
+        "shown_source_mapping": 0,
+        "partial_without_missing_topics_or_disclosure": 0,
+        "retained_claim_on_missing_topic": 0,
+        "conflict_without_members_or_disclosure": 0,
+        "failure_without_disclosure": 0,
+        "dynamic_unsupported_conclusion": 0,
+        "retained_unsupported_claim": 0,
+        "final_tier_below_audit_floor": 0,
+        "final_tier_outside_reviewed_target": 0,
+        "evidence_without_successful_provider": 0,
+        "provider_failure_mismatch": 0,
     }
     allowed_failures = {
         "sufficient": {None, "validation_failed", "provider_timeout"},
@@ -990,9 +1486,20 @@ def deterministic_invariant_violations(traces: Iterable[Any]) -> dict[str, int]:
     }
     for trace in traces:
         route = _route(trace)
+        attempts = tuple(
+            attempt for attempt in (_field(trace, "provider_attempts", ()) or ())
+            if isinstance(attempt, Mapping)
+        )
         provider_attempted = bool(
             _field(trace, "provider_invocation_started", _field(trace, "provider_attempted", False))
-        ) or bool(_field(trace, "provider_attempts", ()))
+        ) or any(
+            isinstance(attempt, Mapping) and attempt.get("invocation_started") is True
+            for attempt in attempts
+        )
+        successful_provider = any(
+            attempt.get("invocation_started") is True and attempt.get("status") == "success"
+            for attempt in attempts
+        )
         orchestrator_started = bool(_field(trace, "orchestrator_started"))
         evidence_state = _enum_text(_field(trace, "evidence_state")) or None
         degradation = _enum_text(_field(trace, "degradation_reason")) or None
@@ -1020,6 +1527,139 @@ def deterministic_invariant_violations(traces: Iterable[Any]) -> dict[str, int]:
             violations["failure_state_mismatch"] += 1
         if route == "skip" and degradation not in {None, "user_forbid_web"}:
             violations["failure_state_mismatch"] += 1
+        if (
+            evidence_state in {"sufficient", "partial", "conflicting"}
+            or claim_count or citable or citations
+        ) and not provider_attempted:
+            violations["evidence_without_provider_attempt"] += 1
+        if (not bool(_field(trace, "provider_configured"))) and (
+            provider_attempted
+            or evidence_state in {"sufficient", "partial", "conflicting"}
+            or claim_count or citable or citations
+        ):
+            violations["provider_configuration_contradiction"] += 1
+        if (
+            evidence_state in {"sufficient", "partial", "conflicting"}
+            or claim_count or citable or citations
+        ) and not successful_provider:
+            violations["evidence_without_successful_provider"] += 1
+        failure_for_status = {
+            "empty": "no_results",
+            "timeout": "provider_timeout",
+            "error": "provider_unavailable",
+            "not_configured": "provider_not_configured",
+            "unavailable": "provider_unavailable",
+        }
+        expected_provider_failures = Counter(
+            failure_for_status[attempt.get("status")]
+            for attempt in attempts
+            if attempt.get("status") in failure_for_status
+        )
+        actual_provider_failures = Counter(
+            _enum_text(value) for value in (_field(trace, "provider_failures", ()) or ())
+        )
+        if expected_provider_failures != actual_provider_failures:
+            violations["provider_failure_mismatch"] += 1
+
+        audit = None
+        if audits_by_request_id is not None:
+            audit = audits_by_request_id.get(str(_field(trace, "request_id", "")))
+        if not isinstance(audit, Mapping):
+            continue
+        claims = audit.get("claims") if isinstance(audit.get("claims"), list) else []
+        evidence = audit.get("evidence") if isinstance(audit.get("evidence"), list) else []
+        used_ids = audit.get("used_evidence_ids") if isinstance(audit.get("used_evidence_ids"), list) else []
+        shown_urls = audit.get("shown_source_urls") if isinstance(audit.get("shown_source_urls"), list) else []
+        missing_topics = set(audit.get("missing_claim_topics") or ())
+        disclosures = set(audit.get("rendered_disclosures") or ())
+        evidence_by_id = {
+            item.get("evidence_id"): item
+            for item in evidence if isinstance(item, Mapping) and _is_nonempty_string(item.get("evidence_id"))
+        }
+        retained_supported = sum(
+            1 for claim in claims
+            if isinstance(claim, Mapping)
+            and claim.get("retained") is True
+            and claim.get("support_label") == "supported"
+        )
+        if (
+            claim_count != len(claims)
+            or supported_count != retained_supported
+            or citable != sum(item.get("citable") is True for item in evidence if isinstance(item, Mapping))
+            or citations != len(used_ids)
+        ):
+            violations["audit_count_mismatch"] += 1
+        for claim in claims:
+            if not isinstance(claim, Mapping):
+                continue
+            mapped = claim.get("evidence_ids") if isinstance(claim.get("evidence_ids"), list) else []
+            if any(item not in evidence_by_id for item in mapped) or (
+                claim.get("retained") is True
+                and claim.get("material") is True
+                and claim.get("support_label") in {"supported", "partial", "conflict"}
+                and not mapped
+            ):
+                violations["claim_evidence_mapping"] += 1
+            if claim.get("retained") is True and missing_topics.intersection(claim.get("topic_ids") or ()):
+                violations["retained_claim_on_missing_topic"] += 1
+            if claim.get("retained") is True and claim.get("support_label") in {"unsupported", "unmapped"}:
+                violations["retained_unsupported_claim"] += 1
+            if (
+                (audit.get("dynamic") is True or audit.get("high_consequence") is True)
+                and claim.get("retained") is True
+                and claim.get("material") is True
+                and claim.get("support_label") != "supported"
+            ):
+                violations["dynamic_unsupported_conclusion"] += 1
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                continue
+            if not _valid_http_url(item.get("final_url")):
+                violations["invalid_evidence_url"] += 1
+            if item.get("citable") is True and item.get("relevance") in {
+                "irrelevant", "excluded", "fail", None,
+            }:
+                violations["citable_without_relevance"] += 1
+        if any(item not in evidence_by_id or evidence_by_id[item].get("citable") is not True for item in used_ids):
+            violations["used_evidence_mapping"] += 1
+        expected_urls = [evidence_by_id[item].get("final_url") for item in used_ids if item in evidence_by_id]
+        if shown_urls != expected_urls:
+            violations["shown_source_mapping"] += 1
+        if evidence_state == "partial" and (
+            not missing_topics or "partial_evidence" not in disclosures
+        ):
+            violations["partial_without_missing_topics_or_disclosure"] += 1
+        if evidence_state == "conflicting":
+            groups = audit.get("conflict_groups") if isinstance(audit.get("conflict_groups"), list) else []
+            valid_group = any(
+                isinstance(group, Mapping)
+                and len(group.get("member_evidence_ids") or ()) >= 2
+                and all(member in evidence_by_id for member in group.get("member_evidence_ids") or ())
+                for group in groups
+            )
+            if not valid_group or "source_conflict" not in disclosures:
+                violations["conflict_without_members_or_disclosure"] += 1
+        disclosure_for_failure = {
+            "partial_evidence": "partial_evidence",
+            "source_conflict": "source_conflict",
+            "validation_failed": "verification_failed",
+            "provider_not_configured": "provider_not_configured",
+            "provider_unavailable": "provider_unavailable",
+            "provider_timeout": "provider_timeout",
+            "no_results": "no_results",
+            "content_unreadable": "content_unreadable",
+            "insufficient_evidence": "insufficient_evidence",
+            "user_forbid_web": "user_forbid_web",
+        }
+        if degradation in disclosure_for_failure and disclosure_for_failure[degradation] not in disclosures:
+            violations["failure_without_disclosure"] += 1
+        final_tier = _enum_text(_field(trace, "final_tier")) or route
+        minimum_tier = audit.get("minimum_tier") or "skip"
+        if _TIER_RANK.get(final_tier, -1) < _TIER_RANK.get(minimum_tier, 0):
+            violations["final_tier_below_audit_floor"] += 1
+        acceptable_tiers = audit.get("acceptable_final_tiers")
+        if isinstance(acceptable_tiers, list) and acceptable_tiers and final_tier not in acceptable_tiers:
+            violations["final_tier_outside_reviewed_target"] += 1
     return violations
 
 
@@ -1031,19 +1671,36 @@ def structural_violations(traces: Iterable[Any]) -> int:
 def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     prefix = f"trace row {index}"
     errors: list[str] = []
-    case_id = trace.get("case_id")
-    if not _is_nonempty_string(case_id):
-        errors.append(f"{prefix} missing case_id")
+    missing = sorted(TRACE_FIELDS - set(trace))
+    unexpected = sorted(set(trace) - TRACE_FIELDS)
+    if missing:
+        errors.append(f"{prefix} missing fields: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"{prefix} unexpected fields: {', '.join(unexpected)}")
+    if not _normalized_identifier(trace.get("request_id")):
+        errors.append(f"{prefix} invalid request_id")
+    if trace.get("request_source") not in REQUEST_SOURCES:
+        errors.append(f"{prefix} invalid request_source")
     route = trace.get("route")
     if route not in ROUTES:
         errors.append(f"{prefix} invalid route")
     skip_reason = trace.get("skip_reason")
     if skip_reason is not None and skip_reason not in SKIP_REASONS:
         errors.append(f"{prefix} invalid skip_reason")
+    trigger_codes = trace.get("trigger_codes")
+    if not _is_string_list(trigger_codes) or any(value not in TRIGGER_CODES for value in trigger_codes or ()) or len(set(trigger_codes or ())) != len(trigger_codes or ()):
+        errors.append(f"{prefix} invalid trigger_codes")
+    if trace.get("factuality") is not None and trace.get("factuality") not in FACTUALITIES:
+        errors.append(f"{prefix} invalid factuality")
+    for name in ("program_minimum_tier", "final_tier"):
+        if trace.get(name) is not None and trace.get(name) not in ROUTES:
+            errors.append(f"{prefix} invalid {name}")
     for name in (
+        "external_fact_required",
         "orchestrator_started", "initial_round_started",
         "adaptive_repair_round_started", "provider_configured",
-        "provider_invocation_started", "knowledge_fallback_used",
+        "provider_invocation_started", "knowledge_fallback_used", "repair_used",
+        "provider_attempted", "sufficient_evidence",
     ):
         if type(trace.get(name)) is not bool:
             errors.append(f"{prefix} {name} must be boolean")
@@ -1054,6 +1711,49 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     ):
         if not _is_int(trace.get(name)):
             errors.append(f"{prefix} {name} must be a non-negative integer")
+    for name in ("initial_query_redaction_codes", "adaptive_repair_redaction_codes"):
+        values = trace.get(name)
+        if not _is_string_list(values) or any(value not in REDACTION_CODES for value in values or ()):
+            errors.append(f"{prefix} invalid {name}")
+    executed = trace.get("executed_queries")
+    query_purposes: dict[str, str] = {}
+    if not isinstance(executed, list):
+        errors.append(f"{prefix} executed_queries must be a list")
+    else:
+        for query_index, query in enumerate(executed, 1):
+            query_prefix = f"{prefix} executed query {query_index}"
+            if not isinstance(query, Mapping):
+                errors.append(f"{query_prefix} must be an object")
+                continue
+            query_missing = sorted(QUERY_FIELDS - set(query))
+            query_unexpected = sorted(set(query) - QUERY_FIELDS)
+            if query_missing:
+                errors.append(f"{query_prefix} missing fields: {', '.join(query_missing)}")
+            if query_unexpected:
+                errors.append(f"{query_prefix} unexpected fields: {', '.join(query_unexpected)}")
+            query_id = query.get("query_id")
+            purpose = query.get("purpose")
+            if not _normalized_identifier(query_id):
+                errors.append(f"{query_prefix} invalid query_id")
+            if purpose not in QUERY_PURPOSES:
+                errors.append(f"{query_prefix} invalid purpose")
+            if query_id in query_purposes and query_purposes[query_id] != purpose:
+                errors.append(f"{query_prefix} query_id has conflicting purposes")
+            if _is_nonempty_string(query_id) and isinstance(purpose, str):
+                query_purposes[query_id] = purpose
+    adaptive = trace.get("adaptive_repair_query")
+    if adaptive is not None:
+        if not isinstance(adaptive, Mapping):
+            errors.append(f"{prefix} adaptive_repair_query must be an object or null")
+        else:
+            missing_query = sorted(QUERY_FIELDS - set(adaptive))
+            unexpected_query = sorted(set(adaptive) - QUERY_FIELDS)
+            if missing_query:
+                errors.append(f"{prefix} adaptive_repair_query missing fields: {', '.join(missing_query)}")
+            if unexpected_query:
+                errors.append(f"{prefix} adaptive_repair_query unexpected fields: {', '.join(unexpected_query)}")
+            if not _normalized_identifier(adaptive.get("query_id")) or adaptive.get("purpose") != "repair":
+                errors.append(f"{prefix} invalid adaptive_repair_query")
     attempts = trace.get("provider_attempts")
     if not isinstance(attempts, list):
         errors.append(f"{prefix} provider_attempts must be a list")
@@ -1062,10 +1762,40 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
             if not isinstance(attempt, dict):
                 errors.append(f"{prefix} provider attempt {attempt_index} must be an object")
                 continue
+            attempt_prefix = f"{prefix} provider attempt {attempt_index}"
+            attempt_missing = sorted(PROVIDER_ATTEMPT_FIELDS - set(attempt))
+            attempt_unexpected = sorted(set(attempt) - PROVIDER_ATTEMPT_FIELDS)
+            if attempt_missing:
+                errors.append(f"{attempt_prefix} missing fields: {', '.join(attempt_missing)}")
+            if attempt_unexpected:
+                errors.append(f"{attempt_prefix} unexpected fields: {', '.join(attempt_unexpected)}")
+            if attempt.get("provider") not in PROVIDER_NAMES:
+                errors.append(f"{attempt_prefix} invalid provider")
             if attempt.get("status") not in PROVIDER_STATUSES:
                 errors.append(f"{prefix} provider attempt {attempt_index} invalid status")
+            if not _is_int(attempt.get("count")):
+                errors.append(f"{attempt_prefix} count must be a non-negative integer")
             if not _is_nonnegative_number(attempt.get("latency_ms")):
                 errors.append(f"{prefix} provider attempt {attempt_index} invalid latency_ms")
+            if not _normalized_identifier(attempt.get("query_id")):
+                errors.append(f"{attempt_prefix} invalid query_id")
+            for name in ("configured", "available", "invocation_started"):
+                if type(attempt.get(name)) is not bool:
+                    errors.append(f"{attempt_prefix} {name} must be boolean")
+            configured = attempt.get("configured")
+            available = attempt.get("available")
+            invoked = attempt.get("invocation_started")
+            status = attempt.get("status")
+            if configured is False and (available is not False or status != "not_configured"):
+                errors.append(f"{attempt_prefix} impossible unconfigured state")
+            if configured is True and available is False and status != "unavailable":
+                errors.append(f"{attempt_prefix} impossible unavailable state")
+            if available is True and status in {"not_configured", "unavailable"}:
+                errors.append(f"{attempt_prefix} impossible available status")
+            if invoked is True and attempt.get("count") == 0:
+                errors.append(f"{attempt_prefix} invoked attempt requires positive count")
+            if invoked is False and attempt.get("count") not in {0, None}:
+                errors.append(f"{attempt_prefix} non-invoked attempt must have zero count")
     failures = trace.get("provider_failures")
     if not isinstance(failures, list) or any(value not in FAILURE_CODES for value in failures):
         errors.append(f"{prefix} invalid provider_failures")
@@ -1076,6 +1806,197 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     for name in LATENCY_FIELDS:
         if not _is_nonnegative_number(trace.get(name)):
             errors.append(f"{prefix} {name} must be a finite non-negative number")
+    if isinstance(executed, list):
+        derived = {
+            "initial_query_count": _initial_query_count(trace),
+            "semantic_query_count": _semantic_query_count(trace),
+            "repair_query_count": _repair_query_count(trace),
+            "retrieval_round_count": _retrieval_round_count(trace),
+        }
+        for name, value in derived.items():
+            if trace.get(name) != value:
+                errors.append(f"{prefix} {name} disagrees with derived value {value}")
+    repair_started = trace.get("adaptive_repair_round_started") is True
+    if repair_started != (trace.get("repair_used") is True):
+        errors.append(f"{prefix} repair_used disagrees with adaptive repair round")
+    if repair_started != (trace.get("adaptive_repair_query") is not None):
+        errors.append(f"{prefix} adaptive_repair_query disagrees with adaptive repair round")
+    if trace.get("provider_attempted") != trace.get("provider_invocation_started"):
+        errors.append(f"{prefix} provider_attempted disagrees with provider_invocation_started")
+    if trace.get("sufficient_evidence") != (trace.get("evidence_state") == "sufficient"):
+        errors.append(f"{prefix} sufficient_evidence disagrees with evidence_state")
+    if isinstance(attempts, list) and trace.get("provider_invocation_started") != any(
+        isinstance(item, Mapping) and item.get("invocation_started") is True for item in attempts
+    ):
+        errors.append(f"{prefix} provider_invocation_started disagrees with provider attempts")
+    if isinstance(attempts, list) and isinstance(executed, list):
+        executed_ids = {
+            item.get("query_id") for item in executed
+            if isinstance(item, Mapping) and _is_nonempty_string(item.get("query_id"))
+        }
+        for attempt_index, attempt in enumerate(attempts, 1):
+            if isinstance(attempt, Mapping) and attempt.get("query_id") not in executed_ids:
+                errors.append(
+                    f"{prefix} provider attempt {attempt_index} query_id is not an executed query"
+                )
+    if isinstance(adaptive, Mapping) and isinstance(executed, list):
+        repair_ids = {
+            item.get("query_id") for item in executed
+            if isinstance(item, Mapping) and item.get("purpose") == "repair"
+        }
+        if adaptive.get("query_id") not in repair_ids:
+            errors.append(f"{prefix} adaptive_repair_query is not an executed repair query")
+    if route == "skip" and any(
+        bool(trace.get(name)) for name in (
+            "orchestrator_started", "initial_round_started", "adaptive_repair_round_started",
+            "provider_invocation_started", "provider_attempted", "sufficient_evidence",
+        )
+    ):
+        errors.append(f"{prefix} skip route has impossible execution state")
+    if route == "skip" and any(
+        _counter(trace, name) > 0 for name in (
+            "initial_query_count", "retrieval_round_count", "candidate_url_count",
+            "content_read_count", "semantic_query_count", "repair_query_count",
+            "citable_evidence_count", "claim_count", "supported_claim_count",
+            "citation_count",
+        )
+    ):
+        errors.append(f"{prefix} skip route has nonzero execution counters")
+    return errors
+
+
+def _validate_audit(audit: Mapping[str, Any], index: int) -> list[str]:
+    prefix = f"audit row {index}"
+    errors: list[str] = []
+    missing = sorted(AUDIT_FIELDS - set(audit))
+    unexpected = sorted(set(audit) - AUDIT_FIELDS)
+    if missing:
+        errors.append(f"{prefix} missing fields: {', '.join(missing)}")
+    if unexpected:
+        errors.append(f"{prefix} unexpected fields: {', '.join(unexpected)}")
+    for name in ("case_id", "request_id"):
+        if not _normalized_identifier(audit.get(name)):
+            errors.append(f"{prefix} invalid {name}")
+    if audit.get("category") not in CATEGORY_QUOTAS:
+        errors.append(f"{prefix} invalid category")
+    for name in ("allow_skip", "external_fact_required", "explicit_search", "dynamic", "high_consequence"):
+        if type(audit.get(name)) is not bool:
+            errors.append(f"{prefix} {name} must be boolean")
+    if audit.get("skip_reason") is not None and audit.get("skip_reason") not in SKIP_REASONS:
+        errors.append(f"{prefix} invalid skip_reason")
+    if audit.get("minimum_tier") is not None and audit.get("minimum_tier") not in TIERS:
+        errors.append(f"{prefix} invalid minimum_tier")
+    acceptable = audit.get("acceptable_final_tiers")
+    if not _is_string_list(acceptable, allow_empty=False) or any(value not in ROUTES for value in acceptable or ()) or len(set(acceptable or ())) != len(acceptable or ()):
+        errors.append(f"{prefix} invalid acceptable_final_tiers")
+    if audit.get("label_status") not in LABEL_STATUSES:
+        errors.append(f"{prefix} invalid label_status")
+    if not (
+        audit.get("label_status") == "reviewed"
+        and _normalized_identifier(audit.get("reviewed_by"))
+        and _valid_date(audit.get("reviewed_at"))
+    ):
+        errors.append(f"{prefix} owner review is incomplete")
+    if audit.get("allow_skip") is True:
+        if audit.get("skip_reason") is None or audit.get("minimum_tier") is not None:
+            errors.append(f"{prefix} invalid skip label state")
+    elif audit.get("skip_reason") is not None:
+        errors.append(f"{prefix} non-skippable row cannot set skip_reason")
+
+    claims = audit.get("claims")
+    claim_ids: list[Any] = []
+    if not isinstance(claims, list):
+        errors.append(f"{prefix} claims must be a list")
+    else:
+        for item_index, claim in enumerate(claims, 1):
+            item_prefix = f"{prefix} claim {item_index}"
+            if not isinstance(claim, Mapping):
+                errors.append(f"{item_prefix} must be an object")
+                continue
+            item_missing = sorted(CLAIM_AUDIT_FIELDS - set(claim))
+            item_unexpected = sorted(set(claim) - CLAIM_AUDIT_FIELDS)
+            if item_missing:
+                errors.append(f"{item_prefix} missing fields: {', '.join(item_missing)}")
+            if item_unexpected:
+                errors.append(f"{item_prefix} unexpected fields: {', '.join(item_unexpected)}")
+            if not _normalized_identifier(claim.get("claim_id")):
+                errors.append(f"{item_prefix} invalid claim_id")
+            claim_ids.append(claim.get("claim_id"))
+            for name in ("material", "retained"):
+                if type(claim.get(name)) is not bool:
+                    errors.append(f"{item_prefix} {name} must be boolean")
+            if claim.get("support_label") not in SUPPORT_LABELS:
+                errors.append(f"{item_prefix} invalid support_label")
+            for name in ("evidence_ids", "topic_ids"):
+                if not _is_string_list(claim.get(name)) or len(set(claim.get(name) or ())) != len(claim.get(name) or ()):
+                    errors.append(f"{item_prefix} invalid {name}")
+    if _duplicate_values(claim_ids):
+        errors.append(f"{prefix} duplicate claim_id")
+
+    evidence = audit.get("evidence")
+    evidence_ids: list[Any] = []
+    if not isinstance(evidence, list):
+        errors.append(f"{prefix} evidence must be a list")
+    else:
+        for item_index, item in enumerate(evidence, 1):
+            item_prefix = f"{prefix} evidence {item_index}"
+            if not isinstance(item, Mapping):
+                errors.append(f"{item_prefix} must be an object")
+                continue
+            item_missing = sorted(EVIDENCE_AUDIT_FIELDS - set(item))
+            item_unexpected = sorted(set(item) - EVIDENCE_AUDIT_FIELDS)
+            if item_missing:
+                errors.append(f"{item_prefix} missing fields: {', '.join(item_missing)}")
+            if item_unexpected:
+                errors.append(f"{item_prefix} unexpected fields: {', '.join(item_unexpected)}")
+            if not _normalized_identifier(item.get("evidence_id")):
+                errors.append(f"{item_prefix} invalid evidence_id")
+            evidence_ids.append(item.get("evidence_id"))
+            if not _valid_http_url(item.get("final_url")):
+                errors.append(f"{item_prefix} invalid final_url")
+            if item.get("relevance") not in RELEVANCE_LABELS:
+                errors.append(f"{item_prefix} invalid relevance")
+            if type(item.get("citable")) is not bool:
+                errors.append(f"{item_prefix} citable must be boolean")
+    if _duplicate_values(evidence_ids):
+        errors.append(f"{prefix} duplicate evidence_id")
+
+    for name in ("used_evidence_ids", "shown_source_urls", "missing_claim_topics"):
+        values = audit.get(name)
+        if not _is_string_list(values) or len(set(values or ())) != len(values or ()):
+            errors.append(f"{prefix} invalid {name}")
+    for url in audit.get("shown_source_urls") or ():
+        if not _valid_http_url(url):
+            errors.append(f"{prefix} invalid shown source URL")
+    groups = audit.get("conflict_groups")
+    group_ids: list[Any] = []
+    if not isinstance(groups, list):
+        errors.append(f"{prefix} conflict_groups must be a list")
+    else:
+        for item_index, group in enumerate(groups, 1):
+            item_prefix = f"{prefix} conflict group {item_index}"
+            if not isinstance(group, Mapping):
+                errors.append(f"{item_prefix} must be an object")
+                continue
+            item_missing = sorted(CONFLICT_AUDIT_FIELDS - set(group))
+            item_unexpected = sorted(set(group) - CONFLICT_AUDIT_FIELDS)
+            if item_missing:
+                errors.append(f"{item_prefix} missing fields: {', '.join(item_missing)}")
+            if item_unexpected:
+                errors.append(f"{item_prefix} unexpected fields: {', '.join(item_unexpected)}")
+            if not _normalized_identifier(group.get("group_id")):
+                errors.append(f"{item_prefix} invalid group_id")
+            group_ids.append(group.get("group_id"))
+            if not _is_string_list(group.get("member_evidence_ids"), allow_empty=False) or len(set(group.get("member_evidence_ids") or ())) != len(group.get("member_evidence_ids") or ()):
+                errors.append(f"{item_prefix} invalid member_evidence_ids")
+    if _duplicate_values(group_ids):
+        errors.append(f"{prefix} duplicate conflict group_id")
+    disclosures = audit.get("rendered_disclosures")
+    if not _is_string_list(disclosures) or any(value not in DISCLOSURE_CODES for value in disclosures or ()) or len(set(disclosures or ())) != len(disclosures or ()):
+        errors.append(f"{prefix} invalid rendered_disclosures")
+    stages = audit.get("stages_started")
+    if not _is_string_list(stages, allow_empty=False) or any(value not in STAGE_TO_LATENCY for value in stages or ()) or len(set(stages or ())) != len(stages or ()):
+        errors.append(f"{prefix} invalid stages_started")
     return errors
 
 
@@ -1095,60 +2016,57 @@ def _external_label_is_explicit(label: Mapping[str, Any]) -> bool:
 
 def evaluate_traces(
     trace_rows: Sequence[Mapping[str, Any]],
-    labels: Sequence[Mapping[str, Any]],
+    audits: Sequence[Mapping[str, Any]],
+    *,
+    sample_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    errors: list[str] = []
+    errors: list[str] = _validate_sample_manifest(sample_manifest, trace_rows, audits)
     for index, trace in enumerate(trace_rows, 1):
         errors.extend(_validate_trace(trace, index))
-    label_ids = [label.get("case_id") for label in labels]
-    trace_ids = [trace.get("case_id") for trace in trace_rows]
-    for case_id in _duplicate_values(label_ids):
-        errors.append(f"duplicate label case_id {case_id}")
-    for case_id in _duplicate_values(trace_ids):
-        errors.append(f"duplicate trace case_id {case_id}")
-    for index, label in enumerate(labels, 1):
-        if not _is_nonempty_string(label.get("case_id")):
-            errors.append(f"label row {index} missing case_id")
-        if "d_factual" in label and type(label.get("d_factual")) is not bool:
-            errors.append(f"label row {index} d_factual must be boolean")
-        reviewed = (
-            label.get("label_status") == "reviewed"
-            and _is_nonempty_string(label.get("reviewed_by"))
-            and label.get("reviewed_by") != "unreviewed"
-            and _valid_date(label.get("reviewed_at"))
-        )
-        if not reviewed:
-            errors.append(f"label row {index} owner review is incomplete")
+    for index, audit in enumerate(audits, 1):
+        errors.extend(_validate_audit(audit, index))
 
-    label_by_id = {
-        label["case_id"]: label for label in labels if _is_nonempty_string(label.get("case_id"))
+    audit_case_ids = [audit.get("case_id") for audit in audits]
+    audit_request_ids = [audit.get("request_id") for audit in audits]
+    trace_request_ids = [trace.get("request_id") for trace in trace_rows]
+    for case_id in _duplicate_values(audit_case_ids):
+        errors.append(f"duplicate audit case_id {case_id}")
+    for request_id in _duplicate_values(audit_request_ids):
+        errors.append(f"duplicate audit request_id {request_id}")
+    for request_id in _duplicate_values(trace_request_ids):
+        errors.append(f"duplicate trace request_id {request_id}")
+    audit_by_request_id = {
+        audit["request_id"]: audit for audit in audits if _normalized_identifier(audit.get("request_id"))
     }
-    trace_by_id: dict[str, Mapping[str, Any]] = {}
+    trace_by_request_id: dict[str, Mapping[str, Any]] = {}
     for trace in trace_rows:
-        case_id = trace.get("case_id")
-        if not _is_nonempty_string(case_id):
+        request_id = trace.get("request_id")
+        if not _normalized_identifier(request_id):
             continue
-        if case_id not in label_by_id:
-            errors.append(f"unknown trace case_id {case_id}")
+        if request_id not in audit_by_request_id:
+            errors.append(f"unknown trace request_id {request_id}")
             continue
-        trace_by_id.setdefault(case_id, trace)
-    for case_id in label_by_id:
-        if case_id not in trace_by_id:
-            errors.append(f"missing trace for case_id {case_id}")
+        trace_by_request_id.setdefault(request_id, trace)
+    for request_id, audit in audit_by_request_id.items():
+        if request_id not in trace_by_request_id:
+            errors.append(f"missing trace for case_id {audit.get('case_id')} request_id {request_id}")
 
     exclusions = {"explicit_no_web": 0, "legal_closed_context": 0}
     d_factual_rows: list[tuple[Mapping[str, Any], Mapping[str, Any] | None]] = []
     explicit_rows: list[tuple[Mapping[str, Any], Mapping[str, Any] | None]] = []
-    for case_id, label in label_by_id.items():
-        trace = trace_by_id.get(case_id)
-        if label.get("skip_reason") == "user_forbid_web":
+    no_web_rows: list[tuple[Mapping[str, Any], Mapping[str, Any] | None]] = []
+    for request_id, audit in audit_by_request_id.items():
+        trace = trace_by_request_id.get(request_id)
+        if audit.get("skip_reason") == "user_forbid_web":
             exclusions["explicit_no_web"] += 1
-        elif label.get("allow_skip") is True:
+            no_web_rows.append((audit, trace))
+            continue
+        if audit.get("allow_skip") is True:
             exclusions["legal_closed_context"] += 1
-        if in_d_factual(label):
-            d_factual_rows.append((label, trace))
-        if _external_label_is_explicit(label):
-            explicit_rows.append((label, trace))
+        if audit.get("external_fact_required") is True and audit.get("allow_skip") is not True:
+            d_factual_rows.append((audit, trace))
+        if audit.get("explicit_search") is True or audit.get("category") == "explicit_search":
+            explicit_rows.append((audit, trace))
 
     routed = lambda trace: _route(trace) in TIERS
     orchestrated = lambda trace: bool(_field(trace, "orchestrator_started"))
@@ -1171,10 +2089,41 @@ def evaluate_traces(
         "explicit_search_route_rate": _rate(explicit_rows, routed),
         "explicit_search_orchestrator_start_rate": _rate(explicit_rows, orchestrated),
         "explicit_search_provider_attempt_rate_configured": _rate(configured_explicit, attempted),
+        "explicit_no_web_zero_provider_rate": _rate(
+            no_web_rows,
+            lambda trace: not bool(trace.get("provider_invocation_started")) and not bool(trace.get("provider_attempts")),
+        ),
     }
 
+    conditional_rates = {
+        "orchestrated_per_routed": _rate(
+            [(audit, trace) for audit, trace in d_factual_rows if trace is not None and routed(trace)],
+            orchestrated,
+        ),
+        "attempted_per_orchestrated": _rate(
+            [(audit, trace) for audit, trace in d_factual_rows if trace is not None and orchestrated(trace)],
+            attempted,
+        ),
+        "sufficient_per_attempted": _rate(
+            [(audit, trace) for audit, trace in d_factual_rows if trace is not None and attempted(trace)],
+            sufficient,
+        ),
+    }
+
+    skip_reason_breakdown: dict[str, dict[str, Any]] = {}
+    for reason in sorted(SKIP_REASONS):
+        rows = [
+            (audit, trace) for request_id, audit in audit_by_request_id.items()
+            if audit.get("skip_reason") == reason
+            for trace in [trace_by_request_id.get(request_id)]
+        ]
+        zero = _rate(rows, lambda trace: not bool(trace.get("provider_invocation_started")) and not bool(trace.get("provider_attempts")))
+        skip_reason_breakdown[reason] = {"count": len(rows), "zero_provider": zero}
+
     execution_failures = {"provider_not_configured": 0, "provider_unavailable": 0}
-    joined_traces = list(trace_by_id.values())
+    joined_traces = list(trace_by_request_id.values())
+    outcome_counts = {code: 0 for code in sorted(FAILURE_CODES)}
+    outcome_counts.update({state: 0 for state in sorted(EVIDENCE_STATES)})
     for trace in joined_traces:
         codes = {
             _enum_text(_field(trace, "degradation_reason")),
@@ -1189,17 +2138,33 @@ def evaluate_traces(
             execution_failures["provider_not_configured"] += 1
         if "provider_unavailable" in codes or "unavailable" in statuses:
             execution_failures["provider_unavailable"] += 1
+        for code in codes - {""}:
+            if code in outcome_counts:
+                outcome_counts[code] += 1
+        state = trace.get("evidence_state")
+        if state in EVIDENCE_STATES:
+            outcome_counts[state] += 1
 
     budgets = budget_violations(joined_traces)
-    invariants = deterministic_invariant_violations(joined_traces)
-    latencies = latency_percentiles(joined_traces)
+    invariants = deterministic_invariant_violations(joined_traces, audit_by_request_id)
+    audit_schema_valid = not any(error.startswith("audit row") for error in errors)
+    trace_schema_valid = not any(error.startswith("trace row") for error in errors)
+    join_complete = len(trace_by_request_id) == len(audit_by_request_id) == len(trace_rows)
+    deterministic_evaluation = {
+        "evaluable": audit_schema_valid and trace_schema_valid and join_complete,
+        "joined_sample_count": len(trace_by_request_id),
+    }
+    latencies = latency_percentiles(joined_traces, audit_by_request_id)
     per_tier_retrieval: dict[str, dict[str, Any]] = {}
     for tier in TIERS:
         values = [
             trace["retrieval_pipeline_latency_ms"] for trace in joined_traces
-            if trace.get("route") == tier and _is_nonnegative_number(trace.get("retrieval_pipeline_latency_ms"))
+            if (trace.get("final_tier") or trace.get("route")) == tier
+            and "retrieval_pipeline" in audit_by_request_id.get(str(trace.get("request_id")), {}).get("stages_started", [])
+            and _is_nonnegative_number(trace.get("retrieval_pipeline_latency_ms"))
         ]
         per_tier_retrieval[tier] = {
+            "evaluable": bool(values),
             "sample_count": len(values),
             "p50": _nearest_rank(values, 0.50),
             "p95": _nearest_rank(values, 0.95),
@@ -1230,23 +2195,39 @@ def evaluate_traces(
     retrieval_p95_limits = {"light": 6_000, "standard": 15_000, "deep": 30_000}
     for tier, limit in retrieval_p95_limits.items():
         p95 = per_tier_retrieval[tier]["p95"]
-        if p95 is not None and p95 > limit:
+        if p95 is None:
+            failures.append(f"{tier} latency zero samples")
+        elif p95 > limit:
             failures.append(f"{tier} retrieval P95 above {limit} ms")
+    for field, summary in latencies.items():
+        if summary["sample_count"] == 0:
+            failures.append(f"{field} zero samples")
     if any(budgets.values()):
         failures.append("budget or hard-timeout violations")
+    if not deterministic_evaluation["evaluable"]:
+        failures.append("deterministic audit is non-evaluable")
     if any(invariants.values()):
         failures.append("deterministic citation/failure invariant violations")
+    if not isinstance(sample_manifest, Mapping):
+        failures.append("controlled sample manifest is required")
+    elif sample_manifest.get("provenance") != "controlled_production" or sample_manifest.get("fixture_derived") is not False:
+        failures.append("trace sample is fixture-derived or uncontrolled")
 
     return {
         "mode": "traces",
         "certifying": not failures,
-        "joined_case_count": len(trace_by_id),
+        "joined_case_count": len(trace_by_request_id),
+        "sample_provenance": dict(sample_manifest) if isinstance(sample_manifest, Mapping) else None,
         "errors": errors,
         "exclusions": exclusions,
         "rates": rates,
+        "conditional_rates": conditional_rates,
+        "skip_reason_breakdown": skip_reason_breakdown,
+        "outcome_counts": outcome_counts,
         "execution_failures": execution_failures,
         "budget_violations": budgets,
         "deterministic_invariant_violations": invariants,
+        "deterministic_evaluation": deterministic_evaluation,
         "initial_batch_count": initial_batch_round_count(joined_traces),
         "repair_round_count": repair_round_count(joined_traces),
         "latencies_ms": latencies,
@@ -1255,17 +2236,36 @@ def evaluate_traces(
     }
 
 
-def traces(traces_path: Path, labels_path: Path) -> int:
+def _load_json_object_checked(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    if not path.exists():
+        return None, [f"{path}: file does not exist"]
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return None, [f"{path}: could not read file ({type(exc).__name__})"]
+    except json.JSONDecodeError as exc:
+        return None, [f"{path}: invalid JSON ({exc.msg})"]
+    if not isinstance(value, dict):
+        return None, [f"{path}: JSON value must be an object"]
+    return value, []
+
+
+def traces(traces_path: Path, labels_path: Path, manifest_path: Path | None = None) -> int:
     trace_rows, trace_errors = _load_jsonl_checked(traces_path)
     labels, label_errors = _load_jsonl_checked(labels_path)
-    load_errors = [*trace_errors, *label_errors]
+    manifest, manifest_errors = (
+        _load_json_object_checked(manifest_path)
+        if manifest_path is not None
+        else (None, ["controlled sample manifest is required"])
+    )
+    load_errors = [*trace_errors, *label_errors, *manifest_errors]
     if load_errors:
         report = {
             "mode": "traces", "certifying": False, "errors": load_errors,
             "failures": ["input JSONL integrity errors"],
         }
     else:
-        report = evaluate_traces(trace_rows, labels)
+        report = evaluate_traces(trace_rows, labels, sample_manifest=manifest)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["certifying"] else 1
 
@@ -1289,6 +2289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     traces_parser = sub.add_parser("traces")
     traces_parser.add_argument("--traces", required=True, type=Path)
     traces_parser.add_argument("--labels", required=True, type=Path)
+    traces_parser.add_argument("--manifest", type=Path)
     online_parser = sub.add_parser("online")
     online_parser.add_argument("--limit", type=int, default=10)
     args = parser.parse_args(argv)
@@ -1298,7 +2299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "offline":
         return offline()
     if args.command == "traces":
-        return traces(args.traces, args.labels)
+        return traces(args.traces, args.labels, args.manifest)
     if args.command == "online":
         return online(args.limit)
     return 2
