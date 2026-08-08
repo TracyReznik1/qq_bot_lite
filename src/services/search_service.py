@@ -8,6 +8,7 @@ break; it flattens admitted Evidence into a bounded text format.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 
 from src.search import get_search_orchestrator, reset_search_orchestrator
@@ -53,37 +54,42 @@ def search(query: str) -> SearchResult:
     if not normalized:
         return SearchResult(ok=False, status="empty_query", text="没有可搜索的关键词。")
 
+    response_started = time.monotonic()
     request = RetrievalRequest(
         normalized,
         force_search=True,
         request_source=RequestSource.COMPATIBILITY,
     )
     result = get_search_orchestrator().run(request)
+    result.trace.response_started_at = response_started
+    try:
+        if result.decision.route is SearchTier.SKIP:
+            return SearchResult(
+                ok=False,
+                status="skip",
+                text="本次请求未执行在线检索。",
+            )
 
-    if result.decision.route is SearchTier.SKIP:
-        return SearchResult(
-            ok=False,
-            status="skip",
-            text="本次请求未执行在线检索。",
-        )
+        if result.evidence is None or result.failure_code is not None:
+            failure = result.failure_code or SearchFailureCode.PROVIDER_NOT_CONFIGURED
+            return SearchResult(
+                ok=False,
+                status=failure.value,
+                text="在线检索未完成。",
+            )
 
-    if result.evidence is None or result.failure_code is not None:
-        failure = result.failure_code or SearchFailureCode.PROVIDER_NOT_CONFIGURED
-        return SearchResult(
-            ok=False,
-            status=failure.value,
-            text="在线检索未完成。",
-        )
-
-    evidence = result.evidence
-    lines = ["搜索状态：success", f"搜索词：{normalized}", ""]
-    for index, item in enumerate(evidence.evidence_items, 1):
-        lines.append(
-            f"{index}. {item.title or item.url}\n"
-            f"{(item.excerpt or '')[:300]}\n"
-            f"{item.url}"
-        )
-    return SearchResult(ok=True, status="success", text="\n\n".join(lines))
+        evidence = result.evidence
+        lines = ["搜索状态：success", f"搜索词：{normalized}", ""]
+        for index, item in enumerate(evidence.evidence_items, 1):
+            lines.append(
+                f"{index}. {item.title or item.url}\n"
+                f"{(item.excerpt or '')[:300]}\n"
+                f"{item.url}"
+            )
+        return SearchResult(ok=True, status="success", text="\n\n".join(lines))
+    finally:
+        from src.search.orchestrator import finalize_search_trace
+        finalize_search_trace(result.trace, response_finished_at=time.monotonic())
 
 
 def web_search(query: str) -> str:

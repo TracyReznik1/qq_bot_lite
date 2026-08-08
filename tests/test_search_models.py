@@ -379,6 +379,45 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertNotIn("raw query text", payload)
         json.dumps(logged)
 
+    def test_trace_serialization_is_total_for_deeply_malformed_query_metadata(self):
+        m = models()
+        trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD)
+        trace.executed_queries = (
+            ("initial-1", m.QueryPurpose.DIRECT),
+            (("repair-1", m.QueryPurpose.REPAIR),),
+            {"query_id": "private query text"},
+        )
+        trace.adaptive_repair_query = (("repair-1", m.QueryPurpose.REPAIR),)
+
+        logged = trace.to_log_dict()
+
+        self.assertEqual(
+            [{"query_id": "initial-1", "purpose": "direct"}],
+            logged["executed_queries"],
+        )
+        self.assertIsNone(logged["adaptive_repair_query"])
+        self.assertEqual(1, logged["semantic_query_count"])
+        json.dumps(logged)
+
+    def test_validation_failed_is_legal_for_a_sufficient_bundle(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        evidence = fixtures.evidence_item()
+        sufficient = replace(
+            fixtures.bundle(),
+            initial_evidence_ids=(evidence.evidence_id,),
+            evidence_items=(evidence,),
+            evidence_state=m.EvidenceState.SUFFICIENT,
+        )
+        result = m.SearchPipelineResult(
+            fixtures.decision(),
+            fixtures.plan(),
+            sufficient,
+            m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT),
+            m.SearchFailureCode.VALIDATION_FAILED,
+        )
+        self.assertIs(result.failure_code, m.SearchFailureCode.VALIDATION_FAILED)
+
     def test_redaction_codes_are_closed_and_hostile_trace_mutation_stays_body_free(self):
         m = models()
         fixtures = SearchModelFixtures(m)
@@ -674,6 +713,19 @@ class SearchModelContractTests(unittest.TestCase):
             m.SearchPipelineResult(decision, object(), bundle, trace, code)
         for state, code in ((m.EvidenceState.SUFFICIENT, None), (m.EvidenceState.PARTIAL, m.SearchFailureCode.PARTIAL_EVIDENCE), (m.EvidenceState.CONFLICTING, m.SearchFailureCode.SOURCE_CONFLICT), (m.EvidenceState.INSUFFICIENT, m.SearchFailureCode.INSUFFICIENT_EVIDENCE)):
             m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": state})(), trace, code)
+        for state in (
+            m.EvidenceState.SUFFICIENT,
+            m.EvidenceState.PARTIAL,
+            m.EvidenceState.CONFLICTING,
+        ):
+            with self.subTest(state=state, code=m.SearchFailureCode.VALIDATION_FAILED):
+                m.SearchPipelineResult(
+                    decision,
+                    object(),
+                    type("Bundle", (), {"evidence_state": state})(),
+                    trace,
+                    m.SearchFailureCode.VALIDATION_FAILED,
+                )
         with self.assertRaises(ValueError):
             m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})(), trace, m.SearchFailureCode.VALIDATION_FAILED)
 

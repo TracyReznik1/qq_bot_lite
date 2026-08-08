@@ -120,11 +120,12 @@ class SearchOrchestrator:
         self._registry = ProviderRegistry(self._providers)
 
     def run(self, request: RetrievalRequest) -> SearchPipelineResult:
-        started = self._monotonic()
+        response_started = self._monotonic()
         trace = SearchTrace(
-            request_id=f"req-{int(started * 1000) % 1000000}",
+            request_id=f"req-{int(response_started * 1000) % 1000000}",
             request_source=request.request_source,
             route=SearchTier.LIGHT,
+            response_started_at=response_started,
         )
         decision = self._router.decide(request)
         trace.route = decision.route
@@ -134,7 +135,7 @@ class SearchOrchestrator:
         trace.external_fact_required = decision.external_fact_required
         trace.program_minimum_tier = decision.program_minimum_tier
         trace.final_tier = decision.route
-        trace.route_latency_ms = self._elapsed_ms(started)
+        trace.route_latency_ms = self._elapsed_ms(response_started)
 
         if decision.route is SearchTier.SKIP:
             if decision.requires_clarification:
@@ -158,7 +159,8 @@ class SearchOrchestrator:
         deadline = self._monotonic() + float(budget.hard_timeout_seconds)
 
         trace.orchestrator_started = True
-        plan_started = self._monotonic()
+        retrieval_started = self._monotonic()
+        plan_started = retrieval_started
         plan_completed, plan = self._call_until_deadline(
             self._invoke_planner,
             deadline,
@@ -173,7 +175,7 @@ class SearchOrchestrator:
         trace.initial_query_redaction_codes = plan.query_redaction_codes
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, started)
+            return self._timeout_result(decision, plan, trace, retrieval_started)
 
         trace.provider_configured = any(
             provider.readiness().configured for provider in self._providers
@@ -194,7 +196,7 @@ class SearchOrchestrator:
         trace.provider_search_total_latency_ms = trace.initial_provider_search_latency_ms
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, started)
+            return self._timeout_result(decision, plan, trace, retrieval_started)
 
         if not provider_results or all(
             result.status in {ProviderStatus.NOT_CONFIGURED, ProviderStatus.UNAVAILABLE, ProviderStatus.ERROR, ProviderStatus.TIMEOUT, ProviderStatus.EMPTY}
@@ -209,7 +211,7 @@ class SearchOrchestrator:
                 decision,
                 plan,
                 trace,
-                started,
+                retrieval_started,
                 failure=failure,
                 bundle=None,
                 limitation=_limitation_for_failure(failure),
@@ -224,7 +226,7 @@ class SearchOrchestrator:
         trace.candidate_url_count = len(candidate_keys)
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, started)
+            return self._timeout_result(decision, plan, trace, retrieval_started)
 
         evidence_started = self._monotonic()
         assembled, bundle = self._call_until_deadline(
@@ -242,7 +244,7 @@ class SearchOrchestrator:
         trace.evidence_state = bundle.evidence_state
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, started, bundle=bundle)
+            return self._timeout_result(decision, plan, trace, retrieval_started, bundle=bundle)
 
         if not bundle.evidence_items and any(
             result.status is ProviderStatus.SUCCESS and result.hits
@@ -252,7 +254,7 @@ class SearchOrchestrator:
                 decision,
                 plan,
                 trace,
-                started,
+                retrieval_started,
                 failure=SearchFailureCode.CONTENT_UNREADABLE,
                 bundle=None,
                 limitation="content_unreadable",
@@ -285,6 +287,7 @@ class SearchOrchestrator:
                 trace.adaptive_repair_query = repair.repair_query
                 trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
                 trace.retrieval_round_count = 2
+                repair_provider_started = self._monotonic()
                 repair_result = self._run_repair_query(
                     repair,
                     decision,
@@ -293,7 +296,9 @@ class SearchOrchestrator:
                     trace,
                 )
                 repair_provider_finished = self._monotonic()
-                trace.provider_search_total_latency_ms += self._elapsed_ms(repair_started)
+                trace.provider_search_total_latency_ms += self._elapsed_ms(
+                    repair_provider_started
+                )
                 repair_candidates, repair_keys, more_reads = self._extract_candidates(
                     plan,
                     repair_result,
@@ -330,7 +335,7 @@ class SearchOrchestrator:
                 decision,
                 plan,
                 trace,
-                started,
+                retrieval_started,
                 bundle=bundle,
                 gap=gap,
                 repair=repair,
@@ -341,7 +346,7 @@ class SearchOrchestrator:
         bundle = self._finalize_bundle(
             bundle,
             trace,
-            started,
+            retrieval_started,
             gap=final_gap,
             repair=repair,
             initial_canonical_urls=initial_canonical_urls,
@@ -881,15 +886,23 @@ def _empty_bundle(
 def finalize_search_trace(trace: SearchTrace, *, response_finished_at: float) -> None:
     """Fill the end-to-end total latency and log the body-free Trace exactly
     once. The caller invokes it only after validation/rendering complete."""
-    if getattr(trace, "_logged", False):
+    if trace.finalized:
         return
-    if trace.total_response_latency_ms == 0 and response_finished_at >= 0:
-        trace.total_response_latency_ms = int(response_finished_at * 1000)
+    trace.finalized = True
+    trace.response_finished_at = response_finished_at
+    started_at = trace.response_started_at
+    if (
+        isinstance(started_at, (int, float))
+        and isinstance(response_finished_at, (int, float))
+        and response_finished_at >= started_at
+    ):
+        trace.total_response_latency_ms = (
+            response_finished_at - started_at
+        ) * 1000.0
     try:
         logger.info("search trace final: %s", trace.to_log_dict())
     except Exception:
         logger.debug("failed to serialize search trace", exc_info=True)
-    trace._logged = True
 
 
 # ── lazy singleton graph ────────────────────────────────────────────────

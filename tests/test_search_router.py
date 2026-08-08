@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.search.models import (
+    Actionability,
+    PotentialHarm,
     RequestSource,
     RetrievalRequest,
+    RiskLevel,
     SearchTier,
     SkipReason,
     TriggerCode,
@@ -148,6 +151,16 @@ class RouterTableTests(unittest.TestCase):
         self.assertNotIn(TriggerCode.EXPLICIT_SEARCH, decision.trigger_codes)
         self.assertIsNone(decision.program_minimum_tier)
 
+    def test_no_web_high_consequence_keeps_deterministic_safety_signal(self):
+        decision = decide("不要联网，我发烧39度，该吃多少布洛芬？", {})
+        self.assertIs(decision.route, SearchTier.SKIP)
+        self.assertIs(decision.skip_reason, SkipReason.USER_FORBID_WEB)
+        self.assertIn(TriggerCode.EXPLICIT_NO_WEB, decision.trigger_codes)
+        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+        self.assertIs(decision.risk, RiskLevel.HIGH)
+        self.assertIs(decision.actionability, Actionability.PERSONALIZED)
+        self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+
     def test_conflicting_web_no_web_is_clarification(self):
         decision = decide("请联网查，但不要联网")
         self.assertIs(decision.route, SearchTier.SKIP)
@@ -210,6 +223,19 @@ class RouterConflictAndFloorTests(unittest.TestCase):
             with self.subTest(question=question):
                 decision = decide(question, {})
                 self.assertIs(decision.route, SearchTier.DEEP)
+
+    def test_empty_and_malformed_advisor_keep_high_consequence_and_uncertain_codes(self):
+        malformed_advisor = self.module.LLMRoutingAdvisor(_FakeRoutingLLM(content="not-json"))
+        routers = (
+            ("empty", self.module.RetrievalBenefitRouter(StaticRouterAdvisor({}))),
+            ("malformed", self.module.RetrievalBenefitRouter(malformed_advisor)),
+        )
+        for label, router in routers:
+            with self.subTest(advisor=label):
+                decision = router.decide(chat_request("我发烧39度，该吃多少布洛芬？"))
+                self.assertIs(decision.route, SearchTier.DEEP)
+                self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
+                self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
 
     def test_advisor_failure_keeps_stable_regulated_definitions_standard(self):
         # These are concepts, not personal or urgent action requests. A domain

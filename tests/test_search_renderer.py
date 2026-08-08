@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from dataclasses import replace
+from datetime import datetime, timezone
 
 from src.search.models import (
     AnswerBlock,
     Claim,
     EvidenceBundle,
+    EvidenceConflict,
+    EvidenceConflictMember,
     EvidenceGapAnalysis,
     EvidenceItem,
     EvidenceState,
@@ -28,6 +32,7 @@ from src.search.models import (
     SearchTrace,
     SourceRelation,
     SupportLabel,
+    TriggerCode,
     ValidationReport,
 )
 from src.search.validation import parse_grounded_draft, validate_and_filter
@@ -77,14 +82,23 @@ def item(eid="E1", url="https://example.com/page", title="Example Page"):
     )
 
 
-def bundle(evidence=(), state=EvidenceState.SUFFICIENT, conflicts=(), missing=()):
+def bundle(
+    evidence=(),
+    state=EvidenceState.SUFFICIENT,
+    conflicts=(),
+    missing=(),
+    *,
+    structured_conflicts=(),
+    limitations=(),
+):
     m = models()
     p = plan()
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
         m.EvidenceGapAnalysis(missing, (), False, None, ()),
         m.RepairPlan(False, (), None), 1, tuple(evidence), state,
-        tuple(missing), (), tuple(conflicts), (),
+        tuple(missing), (), tuple(conflicts), tuple(limitations),
+        tuple(structured_conflicts),
     )
 
 
@@ -100,6 +114,25 @@ def result(evidence=None, failure=None, route=SearchTier.STANDARD):
     return models().SearchPipelineResult(
         d, p, evidence, trace(route), failure,
     )
+
+
+def high_consequence_result(evidence=None, failure=None):
+    m = models()
+    d = replace(
+        decision(SearchTier.DEEP),
+        trigger_codes=(TriggerCode.HIGH_CONSEQUENCE_ACTION,),
+        risk=m.RiskLevel.HIGH,
+        actionability=m.Actionability.PERSONALIZED,
+        potential_harm=m.PotentialHarm.HIGH,
+        final_reason_codes=(TriggerCode.HIGH_CONSEQUENCE_ACTION,),
+    )
+    p = replace(plan(), decision=d, budget=m.DEFAULT_TIER_BUDGETS[SearchTier.DEEP])
+    if evidence is not None:
+        evidence = replace(evidence, decision=d, plan=p)
+    if evidence is None and failure not in {None, SearchFailureCode.PROVIDER_NOT_CONFIGURED}:
+        evidence = bundle((), state=EvidenceState.INSUFFICIENT)
+        evidence = replace(evidence, decision=d, plan=p)
+    return m.SearchPipelineResult(d, p, evidence, trace(SearchTier.DEEP), failure)
 
 
 class CitationRenderingTests(unittest.TestCase):
@@ -243,6 +276,100 @@ class ConflictRenderingTests(unittest.TestCase):
         rendered = self.module.render_search_reply(result(b, SearchFailureCode.SOURCE_CONFLICT), report, qq_limit=1700)
         self.assertIn("来源之间存在未解决差异", rendered.text)
 
+    def test_structured_conflict_renders_only_members_with_value_date_and_citation(self):
+        first_date = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        second_date = datetime(2026, 7, 2, tzinfo=timezone.utc)
+        conflict = EvidenceConflict(
+            "conflict-1",
+            "current_version",
+            (
+                EvidenceConflictMember("E1", "3.2", first_date, "contradicts"),
+                EvidenceConflictMember("E2", "3.3", second_date, "claims_supersession"),
+            ),
+        )
+        evidence = (
+            replace(item("E1", "https://a.example.com", title="Source A"), published_at=first_date),
+            replace(item("E2", "https://b.example.com", title="Source B"), published_at=second_date),
+            item("E3", "https://not-a-member.example.com", title="Unrelated Source"),
+        )
+        b = bundle(
+            evidence,
+            state=EvidenceState.CONFLICTING,
+            conflicts=("conflict-1",),
+            structured_conflicts=(conflict,),
+        )
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "non_factual", "现有来源说法不一。", ()),),
+            (), (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, (), (), {}, ())
+
+        rendered = self.module.render_search_reply(
+            result(b, SearchFailureCode.SOURCE_CONFLICT), report, qq_limit=1700,
+        )
+
+        self.assertIn("current_version", rendered.text)
+        self.assertIn("Source A：3.2", rendered.text)
+        self.assertIn("2026-07-01", rendered.text)
+        self.assertIn("[1]", rendered.text)
+        self.assertIn("Source B：3.3", rendered.text)
+        self.assertIn("2026-07-02", rendered.text)
+        self.assertIn("[2]", rendered.text)
+        self.assertNotIn("Unrelated Source", rendered.text)
+        self.assertNotIn("not-a-member.example.com", rendered.text)
+        self.assertEqual(1, rendered.text.count("来源之间存在未解决差异"))
+        self.assertEqual(("E1", "E2"), rendered.used_evidence_ids)
+
+    def test_validation_failed_still_renders_conflict_members_limitations_and_warning(self):
+        conflict = EvidenceConflict(
+            "conflict-1",
+            "版本",
+            (
+                EvidenceConflictMember("E1", "3.2", datetime(2026, 7, 1, tzinfo=timezone.utc), "contradicts"),
+                EvidenceConflictMember("E2", "3.3", datetime(2026, 7, 2, tzinfo=timezone.utc), "contradicts"),
+            ),
+        )
+        b = bundle(
+            (
+                item("E1", "https://a.example.com", title="Source A"),
+                item("E2", "https://b.example.com", title="Source B"),
+                item("E3", "https://unrelated.example.com", title="Unrelated"),
+            ),
+            state=EvidenceState.CONFLICTING,
+            structured_conflicts=(conflict,),
+            limitations=("weak_source_topics",),
+        )
+        rendered = self.module.render_search_reply(
+            high_consequence_result(b, SearchFailureCode.VALIDATION_FAILED),
+            None,
+            qq_limit=1700,
+        )
+
+        self.assertIn("回答未能通过证据核验", rendered.text)
+        self.assertEqual(1, rendered.text.count("来源之间存在未解决差异"))
+        self.assertIn("Source A：3.2", rendered.text)
+        self.assertIn("Source B：3.3", rendered.text)
+        self.assertIn("https://a.example.com", rendered.text)
+        self.assertIn("https://b.example.com", rendered.text)
+        self.assertNotIn("https://unrelated.example.com", rendered.text)
+        self.assertIn("部分主题仅有较弱来源支持", rendered.text)
+        self.assertEqual(1, rendered.text.count("搜索结果可能不完整或不准确"))
+
+    def test_bundle_limitations_render_once_in_deterministic_order(self):
+        b = bundle(
+            (item(),),
+            limitations=("single_source_authority", "single_source_authority", "weak_source_topics"),
+        )
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
+            (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=1700)
+        self.assertEqual(1, rendered.text.count("单一权威来源"))
+        self.assertEqual(1, rendered.text.count("较弱来源"))
+
 
 class PartialRenderingTests(unittest.TestCase):
     def test_partial_scope_disclosure(self):
@@ -295,8 +422,8 @@ class QQSplitTests(unittest.TestCase):
         )
         report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
         rendered = self.module.render_search_reply(result(b), report, qq_limit=1700)
-        self.assertIn("[12]", rendered.text)
-        self.assertNotIn("[[", rendered.text)
+        self.assertIn("版本是3.2[1][2]", rendered.text)
+        self.assertNotIn("[12]", rendered.text)
 
     def test_model_source_section_discarded_from_heading_onward(self):
         b = bundle((item("E1", "https://a.example.com"),), state=EvidenceState.SUFFICIENT)
@@ -324,13 +451,61 @@ class QQSplitTests(unittest.TestCase):
             (), (), False,
         )
         report = ValidationReport(draft, (draft.answer_blocks[0],), draft.claims, (), {}, ())
-        rendered = self.module.render_search_reply(result(b), report, qq_limit=30)
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=45)
         self.assertTrue(rendered.chunks)
         for chunk in rendered.chunks:
-            self.assertLessEqual(len(chunk), 30)
-        # Source blocks are atomic: URL never split.
-        joined = "".join(rendered.chunks)
-        self.assertIn("https://a.example.com", joined)
+            self.assertLessEqual(len(chunk), 45)
+        # A source entry is atomic: its number/title and URL share one chunk.
+        source_chunk = next(chunk for chunk in rendered.chunks if "https://a.example.com" in chunk)
+        self.assertIn("[1] Example Page", source_chunk)
+
+    def test_long_body_starts_atomic_source_entry_in_later_chunk(self):
+        b = bundle((item("E1", "https://a.example.com/x", title="Source A"),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "正文" * 30, ("C1",)),),
+            (Claim("C1", "B1", "事实", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=50)
+        source_chunk = next(chunk for chunk in rendered.chunks if "https://a.example.com/x" in chunk)
+        self.assertIn("[1] Source A", source_chunk)
+        self.assertLessEqual(len(source_chunk), 50)
+
+    def test_truncated_source_title_still_shares_its_url_chunk(self):
+        url = "https://a.example.com/path"
+        b = bundle((item("E1", url, title="A title that is much too long for this chunk"),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "事实", ("C1",)),),
+            (Claim("C1", "B1", "事实", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=45)
+        source_chunk = next(chunk for chunk in rendered.chunks if url in chunk)
+        self.assertIn("[1] ", source_chunk)
+        self.assertLessEqual(len(source_chunk), 45)
+
+    def test_public_splitter_truncates_normal_source_title_but_keeps_url_atomic(self):
+        url = "https://a.example/x"
+        text = f"正文\n\n来源：\n[1] {'很长标题' * 12}\n{url}"
+        chunks = self.module.split_qq_reply(text, 30)
+        source_chunk = next(chunk for chunk in chunks if url in chunk)
+        self.assertIn("[1] ", source_chunk)
+        self.assertLessEqual(len(source_chunk), 30)
+
+    def test_oversize_source_url_is_alone_and_does_not_absorb_title(self):
+        url = "https://example.com/" + "z" * 120
+        b = bundle((item("E1", url, title="Oversize Source"),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", "事实", ("C1",)),),
+            (Claim("C1", "B1", "事实", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+        rendered = self.module.render_search_reply(result(b), report, qq_limit=50)
+        self.assertIn(url, rendered.chunks)
+        self.assertFalse(any("Oversize Source" in chunk for chunk in rendered.chunks if url in chunk))
 
 
 class RenderPlainReplyTests(unittest.TestCase):
@@ -341,6 +516,76 @@ class RenderPlainReplyTests(unittest.TestCase):
         self.assertEqual(rendered.text, "普通回答")
         self.assertEqual(rendered.shown_source_urls, ())
         self.assertEqual(rendered.used_evidence_ids, ())
+
+
+class HighConsequenceWarningTests(unittest.TestCase):
+    def test_warning_is_additive_to_grounded_answer_and_not_duplicated(self):
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        b = bundle((item(),))
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", f"剂量信息见来源。\n{warning}", ("C1",)),),
+            (Claim("C1", "B1", "剂量信息见来源", True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+        rendered = module.render_search_reply(high_consequence_result(b), report, qq_limit=1700)
+        self.assertEqual(1, rendered.text.count(warning))
+        self.assertIn(warning, rendered.degradation_disclosures)
+        self.assertIn("剂量信息见来源", rendered.text)
+        self.assertIn("https://example.com/page", rendered.text)
+
+    def test_warning_is_additive_to_search_failure_without_citations(self):
+        module = renderer_module()
+        rendered = module.render_search_reply(
+            high_consequence_result(None, SearchFailureCode.PROVIDER_UNAVAILABLE),
+            None,
+            qq_limit=1700,
+        )
+        self.assertIn("搜索结果可能不完整或不准确", rendered.text)
+        self.assertIn("无法完成在线核验", rendered.text)
+        self.assertNotIn("来源：", rendered.text)
+        self.assertEqual(1, rendered.text.count("搜索结果可能不完整或不准确"))
+
+    def test_empty_and_malformed_advisor_warning_renders_on_success_and_failure(self):
+        from src.search.router import LLMRoutingAdvisor, RetrievalBenefitRouter
+        from src.services.llm_types import ChatResponse
+        from tests.search_fakes import StaticRouterAdvisor
+
+        class MalformedLLM:
+            def chat(self, *_args, **_kwargs):
+                return ChatResponse(content="not-json")
+
+        routers = (
+            ("empty", RetrievalBenefitRouter(StaticRouterAdvisor({}))),
+            ("malformed", RetrievalBenefitRouter(LLMRoutingAdvisor(MalformedLLM()))),
+        )
+        module = renderer_module()
+        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        for label, router in routers:
+            d = router.decide(models().RetrievalRequest("我发烧39度，该吃多少布洛芬？"))
+            p = replace(
+                plan(),
+                decision=d,
+                budget=models().DEFAULT_TIER_BUDGETS[SearchTier.DEEP],
+            )
+            b = replace(bundle((item(),)), decision=d, plan=p)
+            draft = GroundedDraft(
+                (AnswerBlock("B1", "factual", "请核对剂量", ("C1",)),),
+                (Claim("C1", "B1", "请核对剂量", True, ("E1",)),),
+                (), (), False,
+            )
+            report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+            success = models().SearchPipelineResult(d, p, b, trace(SearchTier.DEEP), None)
+            failure = models().SearchPipelineResult(
+                d, p, None, trace(SearchTier.DEEP), SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            )
+            with self.subTest(advisor=label, path="success"):
+                rendered = module.render_search_reply(success, report, qq_limit=1700)
+                self.assertEqual(1, rendered.text.count(warning))
+            with self.subTest(advisor=label, path="failure"):
+                rendered = module.render_search_reply(failure, None, qq_limit=1700)
+                self.assertEqual(1, rendered.text.count(warning))
 
 
 if __name__ == "__main__":

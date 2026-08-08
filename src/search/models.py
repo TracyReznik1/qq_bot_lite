@@ -735,6 +735,10 @@ class ValidationReport:
         if any(type(key) is not str or not isinstance(value, SupportLabel) for key, value in labels.items()):
             raise TypeError("claim_labels must map strings to SupportLabel")
         _normalize_fields(self, retained_blocks=_records(self.retained_blocks, AnswerBlock, "retained_blocks"), retained_claims=_records(self.retained_claims, Claim, "retained_claims"), removed_block_ids=_strings(self.removed_block_ids, "removed_block_ids"), claim_labels=MappingProxyType(labels), limitations=_strings(self.limitations, "limitations"))
+        retained_ids = {block.block_id for block in self.retained_blocks}
+        overlap = retained_ids.intersection(self.removed_block_ids)
+        if overlap:
+            raise ValueError("retained and removed block sets must be disjoint")
 
 
 @dataclass(frozen=True)
@@ -799,6 +803,9 @@ class SearchTrace:
     content_read_count: int = 0
     initial_query_redaction_codes: tuple[RedactionCode, ...] = ()
     adaptive_repair_redaction_codes: tuple[RedactionCode, ...] = ()
+    response_started_at: float | None = field(default=None, repr=False, compare=False)
+    response_finished_at: float | None = field(default=None, repr=False, compare=False)
+    finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.trigger_codes = _tuple(self.trigger_codes)
@@ -816,6 +823,12 @@ class SearchTrace:
                 raise TypeError("provider_attempts must contain ProviderAttempt values")
 
     def to_log_dict(self) -> dict[str, Any]:
+        adaptive_repair = _query_metadata(self.adaptive_repair_query)
+        executed_metadata = tuple(
+            metadata
+            for query in self.executed_queries
+            if (metadata := _query_metadata(query)) is not None
+        )
         values = {
             "request_id": _safe_log_identifier(self.request_id),
             "request_source": self.request_source,
@@ -830,11 +843,11 @@ class SearchTrace:
             "initial_query_count": self.initial_query_count,
             "initial_round_started": self.initial_round_started,
             "adaptive_repair_round_started": self.adaptive_repair_round_started,
-            "adaptive_repair_query": _query_metadata(self.adaptive_repair_query),
+            "adaptive_repair_query": adaptive_repair,
             "initial_query_redaction_codes": _safe_redaction_codes(self.initial_query_redaction_codes),
             "adaptive_repair_redaction_codes": _safe_redaction_codes(self.adaptive_repair_redaction_codes),
             "retrieval_round_count": self.retrieval_round_count,
-            "executed_queries": [_query_metadata(query) for query in self.executed_queries],
+            "executed_queries": executed_metadata,
             "provider_configured": self.provider_configured,
             "provider_attempts": [_attempt_metadata(attempt) for attempt in self.provider_attempts],
             "provider_invocation_started": self.provider_invocation_started,
@@ -864,7 +877,7 @@ class SearchTrace:
             "qq_render_latency_ms": self.qq_render_latency_ms,
             "retrieval_pipeline_latency_ms": self.retrieval_pipeline_latency_ms,
             "total_response_latency_ms": self.total_response_latency_ms,
-            "semantic_query_count": len({item["query_id"] for item in (_query_metadata(query) for query in self.executed_queries) if item is not None}),
+            "semantic_query_count": len({item["query_id"] for item in executed_metadata}),
             "repair_query_count": int(self.adaptive_repair_round_started),
             "content_read_count": self.content_read_count,
             "provider_attempted": self.provider_invocation_started,
@@ -905,22 +918,32 @@ class SearchPipelineResult:
             EvidenceState.CONFLICTING: SearchFailureCode.SOURCE_CONFLICT,
             EvidenceState.INSUFFICIENT: SearchFailureCode.INSUFFICIENT_EVIDENCE,
         }
-        allowed = {state_failures[self.evidence.evidence_state]}
+        evidence_state = self.evidence.evidence_state
+        allowed = {state_failures[evidence_state]}
+        if evidence_state in {
+            EvidenceState.SUFFICIENT,
+            EvidenceState.PARTIAL,
+            EvidenceState.CONFLICTING,
+        }:
+            allowed.add(SearchFailureCode.VALIDATION_FAILED)
         if "hard_deadline_exceeded" in getattr(self.evidence, "limitations", ()):
             allowed.add(SearchFailureCode.PROVIDER_TIMEOUT)
-        if self.evidence.evidence_state is EvidenceState.INSUFFICIENT:
+        if evidence_state is EvidenceState.INSUFFICIENT:
             allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}
         if self.failure_code not in allowed:
             raise ValueError("failure_code must match evidence state")
 
 
-def _query_metadata(query: SearchQuery | tuple[str, QueryPurpose] | None) -> dict[str, str] | None:
+def _query_metadata(query: Any) -> dict[str, str] | None:
     if query is None:
         return None
     if isinstance(query, SearchQuery):
         return {"query_id": _safe_log_identifier(query.query_id), "purpose": query.purpose.value}
+    if not isinstance(query, tuple) or len(query) != 2:
+        return None
     query_id, purpose = query
-    _require_enum(purpose, QueryPurpose, "query purpose")
+    if not isinstance(query_id, str) or not isinstance(purpose, QueryPurpose):
+        return None
     return {"query_id": _safe_log_identifier(query_id), "purpose": purpose.value}
 
 

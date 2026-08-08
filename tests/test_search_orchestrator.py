@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import threading
 import time
 import unittest
@@ -1071,6 +1072,134 @@ class OrchestratorTraceTests(unittest.TestCase):
         unrelated = orchestrator.run(request("什么是光合作用"))
         self.assertNotIn("callback_secret", unrelated.trace.initial_query_redaction_codes)
         self.assertNotIn("callback_secret", unrelated.trace.adaptive_repair_redaction_codes)
+
+    def test_repair_stage_timings_are_non_overlapping_and_queries_serialize_flat(self):
+        m = __import__("src.search.models", fromlist=["SearchPlan"])
+
+        class ManualClock:
+            def __init__(self):
+                self.now = 0.0
+                self.lock = threading.Lock()
+
+            def monotonic(self):
+                with self.lock:
+                    return self.now
+
+            def advance(self, seconds):
+                with self.lock:
+                    self.now += seconds
+
+        clock = ManualClock()
+        d = RetrievalDecision(
+            SearchTier.STANDARD, None, False, (TriggerCode.FACTUAL_DEFAULT,),
+            frozenset(), Factuality.FACTUAL, True, Freshness.NONE,
+            RiskLevel.LOW, m.Actionability.NONE, m.PotentialHarm.NONE,
+            SearchTier.STANDARD, None, (TriggerCode.FACTUAL_DEFAULT,),
+        )
+        initial_query = m.SearchQuery(
+            "initial-1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "topic",
+        )
+        repair_query = m.SearchQuery(
+            "repair-1", m.SearchRoundKind.REPAIR, m.QueryPurpose.REPAIR, "topic source",
+        )
+        search_plan = m.SearchPlan(
+            d, "topic", m.PlanningStatus.NORMAL, (), None, (initial_query,),
+            ("topic",), frozenset(), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        )
+
+        class Router:
+            def decide(self, _request):
+                clock.advance(0.007)
+                return d
+
+        class Planner:
+            def plan(self, *_args, **_kwargs):
+                clock.advance(0.011)
+                return search_plan
+
+            def plan_repair(self, *_args, **_kwargs):
+                clock.advance(0.013)
+                return m.RepairPlan(True, ("missing_topic",), repair_query)
+
+        class Provider:
+            name = "tavily"
+
+            def readiness(self):
+                return m.ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                clock.advance(0.017)
+                hit = m.ProviderHit(
+                    "tavily", search_query.query_id, search_query.query_id,
+                    f"https://example.com/{search_query.query_id}",
+                    "topic", None, None, "topic", (),
+                )
+                return m.ProviderResult("tavily", m.ProviderStatus.SUCCESS, (hit,), 1)
+
+        class Extractor:
+            def extract(self, hit, _query, **_kwargs):
+                clock.advance(0.019)
+                return m.EvidenceCandidate(
+                    hit, None, "topic", m.ExcerptOrigin.PAGE_EXTRACT,
+                    "page_extract", (), 1,
+                )
+
+        class Judge:
+            def __init__(self):
+                self.calls = 0
+
+            def judge(self, _question, candidates, **_kwargs):
+                clock.advance(0.023)
+                self.calls += 1
+                supported = ["topic"] if self.calls > 1 else []
+                return {
+                    f"C{index}": {
+                        "candidate_id": f"C{index}",
+                        "relevance": "direct",
+                        "source_relation": "independent",
+                        "publisher_entity_match": False,
+                        "ownership_basis": None,
+                        "publisher": "Example",
+                        "supported_topics": supported,
+                        "conflict_key": None,
+                        "conflict_value": None,
+                        "conflict_relation": None,
+                    }
+                    for index, _candidate in enumerate(candidates, 1)
+                }
+
+        orchestrator = self.module.SearchOrchestrator(
+            router=Router(), planner=Planner(), judge=Judge(),
+            providers=(Provider(),), extractor=Extractor(), clock=clock,
+        )
+        result = orchestrator.run(request("topic"))
+        trace = result.trace
+
+        self.assertAlmostEqual(17, trace.initial_provider_search_latency_ms, delta=1)
+        self.assertAlmostEqual(34, trace.provider_search_total_latency_ms, delta=1)
+        self.assertAlmostEqual(19, trace.initial_content_read_latency_ms, delta=1)
+        self.assertAlmostEqual(38, trace.content_read_total_latency_ms, delta=1)
+        self.assertAlmostEqual(23, trace.initial_evidence_assembly_latency_ms, delta=1)
+        self.assertAlmostEqual(46, trace.evidence_assembly_total_latency_ms, delta=1)
+        self.assertAlmostEqual(72, trace.adaptive_repair_latency_ms, delta=1)
+        self.assertAlmostEqual(142, trace.retrieval_pipeline_latency_ms, delta=1)
+        self.assertEqual(
+            ["initial-1", "repair-1"],
+            [row["query_id"] for row in trace.to_log_dict()["executed_queries"]],
+        )
+        json.dumps(trace.to_log_dict())
+
+    def test_finalizer_records_real_end_from_start_and_logs_exactly_once(self):
+        m = __import__("src.search.models", fromlist=["SearchTrace"])
+        trace = m.SearchTrace("req-1", RequestSource.CHAT, SearchTier.LIGHT)
+        trace.response_started_at = 10.0
+        with mock.patch.object(self.module.logger, "info") as log:
+            self.module.finalize_search_trace(trace, response_finished_at=12.5)
+            self.module.finalize_search_trace(trace, response_finished_at=99.0)
+        self.assertEqual(12.5, trace.response_finished_at)
+        self.assertEqual(2500, trace.total_response_latency_ms)
+        self.assertTrue(trace.finalized)
+        log.assert_called_once()
 
 
 class OrchestratorSingletonTests(unittest.TestCase):

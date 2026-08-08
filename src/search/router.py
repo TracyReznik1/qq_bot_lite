@@ -1190,6 +1190,7 @@ def _skip_decision(
     trigger_codes: tuple[TriggerCode, ...],
     *,
     forced_search: bool = False,
+    high_consequence: bool = False,
 ) -> RetrievalDecision:
     non_factual = reason in {
         SkipReason.SOCIAL_OR_EMOTIONAL,
@@ -1210,9 +1211,13 @@ def _skip_decision(
         factuality=factuality,
         external_fact_required=False,
         freshness=Freshness.NONE,
-        risk=RiskLevel.LOW,
-        actionability=Actionability.NONE,
-        potential_harm=PotentialHarm.NONE,
+        risk=RiskLevel.HIGH if high_consequence else RiskLevel.LOW,
+        actionability=(
+            Actionability.PERSONALIZED if high_consequence else Actionability.NONE
+        ),
+        potential_harm=(
+            PotentialHarm.HIGH if high_consequence else PotentialHarm.NONE
+        ),
         program_minimum_tier=None,
         model_recommended_tier=None,
         final_reason_codes=trigger_codes,
@@ -1242,14 +1247,21 @@ class RetrievalBenefitRouter:
         # into the deterministic clarification conflict, never a forced SKIP.
         if explicit_no_web:
             conflict = explicit_any or has_force_search
-            trigger_codes = (TriggerCode.EXPLICIT_NO_WEB,)
+            high_consequence = (
+                _detect_personalized_high_consequence(question)
+                is TriggerCode.HIGH_CONSEQUENCE_ACTION
+            )
+            trigger_codes = [TriggerCode.EXPLICIT_NO_WEB]
             if conflict:
-                trigger_codes = (TriggerCode.EXPLICIT_NO_WEB, TriggerCode.EXPLICIT_SEARCH)
+                trigger_codes.append(TriggerCode.EXPLICIT_SEARCH)
+            if high_consequence:
+                trigger_codes.append(TriggerCode.HIGH_CONSEQUENCE_ACTION)
             return _skip_decision(
                 request,
                 SkipReason.USER_FORBID_WEB,
-                trigger_codes,
+                tuple(trigger_codes),
                 forced_search=has_force_search,
+                high_consequence=high_consequence,
             )
 
         raw = self._advisor.advise(request)
@@ -1269,7 +1281,13 @@ class RetrievalBenefitRouter:
             # that carries high-consequence or current-state domain signals.
             conservative = _conservative_uncertain_floor(question)
             floors = _max_tier(floors, conservative) if conservative is not None else floors
-            floor_codes = (TriggerCode.CLASSIFIER_UNCERTAIN,)
+            uncertain_codes = [*floor_codes, TriggerCode.CLASSIFIER_UNCERTAIN]
+            if (
+                conservative is SearchTier.DEEP
+                and _classify_safety_intent(question) == _SAFETY_ACTIONABLE
+            ):
+                uncertain_codes.append(TriggerCode.HIGH_CONSEQUENCE_ACTION)
+            floor_codes = _dedupe_codes(tuple(uncertain_codes))
         floor = floors if floors is not None else SearchTier.LIGHT
         if not floor_codes:
             floor_codes = (TriggerCode.FACTUAL_DEFAULT,)

@@ -10,6 +10,7 @@ from src.commands import COMMANDS
 from src.config import Config
 from src.services.onebot_client import OneBotClient
 from src.services.search_service import SearchResult
+from src.search.models import RequestSource, SearchFailureCode, SearchTier, SearchTrace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,24 @@ class ProductScopeTests(unittest.TestCase):
         from src.search import get_search_orchestrator, reset_search_orchestrator
         reset_search_orchestrator()
         self.assertTrue(callable(get_search_orchestrator))
+
+    def test_compatibility_search_finalizes_trace_once_on_early_failure(self):
+        trace = SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchTier.LIGHT)
+        pipeline_result = SimpleNamespace(
+            decision=SimpleNamespace(route=SearchTier.LIGHT),
+            evidence=None,
+            failure_code=SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            trace=trace,
+        )
+        orchestrator = mock.Mock(run=mock.Mock(return_value=pipeline_result))
+        with (
+            mock.patch.object(search_service, "get_search_orchestrator", return_value=orchestrator),
+            mock.patch("src.search.orchestrator.finalize_search_trace") as finalize,
+        ):
+            result = search_service.search("什么是光合作用")
+        self.assertFalse(result.ok)
+        finalize.assert_called_once()
+        self.assertIsNotNone(trace.response_started_at)
 
     def test_gemini_runtime_uses_native_stateless_generate_content(self):
         source = (
