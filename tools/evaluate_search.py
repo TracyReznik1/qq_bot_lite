@@ -478,17 +478,20 @@ def _canonical_hostname(value: str) -> str | None:
     if not isinstance(host, str) or not host:
         return None
     normalized = unicodedata.normalize("NFKC", host).casefold()
-    if normalized.endswith("."):
-        normalized = normalized[:-1]
     if not normalized or any(
         unicodedata.category(character) in {"Cc", "Cf"}
         for character in normalized
     ):
         return None
     try:
-        return normalized.encode("idna").decode("ascii").casefold()
+        canonical = normalized.encode("idna").decode("ascii").casefold()
     except UnicodeError:
         return None
+    if canonical.endswith("."):
+        canonical = canonical[:-1]
+    if not canonical or canonical.endswith("."):
+        return None
+    return canonical
 
 
 def _canonical_identity(value: Any) -> str | None:

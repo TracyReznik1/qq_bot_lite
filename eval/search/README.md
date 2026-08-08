@@ -148,7 +148,8 @@ verified HMAC attestation contract. Only `provenance=controlled_production` with
 fixture/example/test hosts remain diagnostic regardless of manifest claims.
 Fixture identities containing Unicode control/format characters are rejected.
 Evidence hosts use Unicode normalization, IDNA/case folding, and DNS terminal
-root-dot removal before reserved-host classification.
+root-dot removal before reserved-host classification. Hosts with multiple
+terminal root dots are rejected as malformed.
 
 The current production transition is exact: `final_tier == route`. Tier budgets
 are always selected from `route`. For every joined row, the trace must also

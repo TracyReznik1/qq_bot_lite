@@ -1782,6 +1782,41 @@ class ReReviewRound3Tests(unittest.TestCase):
         self.assertFalse(report["certifying"])
         self.assertIn("fixture/example evidence URL", "\n".join(report["failures"]))
 
+    def test_c3_idna_separator_root_dot_variants_are_noncertifying(self):
+        tool = evaluate_tool()
+        for separator in ("\u3002", "\uff0e", "\uff61"):
+            for hostname in (
+                f"example{separator}com{separator}",
+                f"test{separator}example{separator}",
+                f"safe{separator}test{separator}",
+            ):
+                with self.subTest(hostname=hostname.encode("unicode_escape").decode()):
+                    traces, audits, _manifest = _certifying_trace_artifacts()
+                    url = f"https://{hostname}/source"
+                    audits[0]["evidence"][0]["final_url"] = url
+                    audits[0]["shown_source_urls"] = [url]
+                    manifest = _attest_manifest(_sample_manifest(traces, audits))
+                    report = tool.evaluate_traces(
+                        traces,
+                        audits,
+                        sample_manifest=manifest,
+                        trusted_verifier_key=TEST_VERIFIER_KEY,
+                    )
+                    self.assertFalse(report["certifying"], report)
+                    self.assertIn(
+                        "fixture/example evidence URL", "\n".join(report["failures"])
+                    )
+
+    def test_c3_multiple_terminal_root_dots_are_rejected(self):
+        tool = evaluate_tool()
+        for hostname in (
+            "example.com..",
+            "example.com\u3002\u3002",
+            "example.com\uff0e\uff61",
+        ):
+            with self.subTest(hostname=hostname.encode("unicode_escape").decode()):
+                self.assertIsNone(tool._canonical_hostname(f"https://{hostname}/source"))
+
     def test_c4_offline_requires_bound_recordings_and_full_integrity(self):
         tool = evaluate_tool()
         cases, recordings, predictions, manifest = (
