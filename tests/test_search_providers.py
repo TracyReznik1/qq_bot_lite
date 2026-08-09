@@ -956,7 +956,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(results[0].attempts, tuple)
         self.assertIsInstance(results[1].attempts, tuple)
 
-    def test_attempts_keep_each_adapter_latency_and_reduced_fallback_time(self):
+    def test_reserve_capped_primary_preserves_fallback_window(self):
         observed_timeouts = []
 
         def ddgs_search(_query, **kwargs):

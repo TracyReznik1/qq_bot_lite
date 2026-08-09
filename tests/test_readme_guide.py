@@ -196,6 +196,18 @@ class ReadmeGuideTests(unittest.TestCase):
             self.readme,
         )
 
+    def test_readme_documents_ddgs_primary_tavily_fallback(self):
+        self.assertIn("DDGS 是主搜索提供者", self.readme)
+        self.assertIn("Tavily", self.readme)
+        self.assertIn("回退", self.readme)
+        self.assertNotIn("Tavily 作为主搜索提供者", self.readme)
+        self.assertIn(
+            "返回明确的在线检索失败披露（不同路径会说明在线检索未完成或无法完成在线核验）",
+            self.readme,
+        )
+        self.assertIn("在线检索未完成", self.readme)
+        self.assertIn("无法完成在线核验", self.readme)
+
     def test_operator_docs_remove_old_model_variables(self):
         env_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
         combined = self.readme + "\n" + env_example

@@ -38,6 +38,16 @@ class UserFacingScopeTests(unittest.TestCase):
         self.assertIn("/search <关键词>", readme)
         self.assertIn("不提供独立 URL 直读", readme)
 
+    def test_user_facing_search_paths_do_not_show_success_status_banner(self):
+        for relative_path in (
+            "src/search/renderer.py",
+            "src/services/search_service.py",
+            "src/commands/search.py",
+        ):
+            with self.subTest(relative_path=relative_path):
+                content = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn("搜索状态：success", content)
+
     def test_help_uses_the_persona_identity(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         help_message = help_text()

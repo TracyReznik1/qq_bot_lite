@@ -1,4 +1,4 @@
-"""DDGS availability-fallback search adapter."""
+"""DDGS primary search adapter."""
 
 from __future__ import annotations
 
