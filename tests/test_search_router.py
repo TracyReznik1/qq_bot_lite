@@ -193,6 +193,41 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
         self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
+    def test_unilateral_sudden_no_strength_is_high_consequence(self):
+        for question in (
+            "一条腿突然没有力气，要去急诊吗？",
+            "左腿突然没有力气，要去急诊吗？",
+            "右腿突然没有力气，要去急诊吗？",
+        ):
+            for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+                with self.subTest(question=question, advisor=label):
+                    decision = decide(question, advisor)
+                    self.assertIs(decision.route, SearchTier.DEEP)
+                    self.assertIn(
+                        TriggerCode.HIGH_CONSEQUENCE_ACTION,
+                        decision.trigger_codes,
+                    )
+                    self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+
+    def test_no_strength_nonurgent_contexts_are_not_high_consequence(self):
+        questions = (
+            "左腿没有力气可能有哪些一般原因？",
+            "我并没有左腿突然没有力气，只是在引用这个句子。",
+            "“左腿突然没有力气，要去急诊吗？”这句话是什么意思？",
+            "左腿突然没有力气，要去急诊吗？这只是测试用例标题。",
+            "左腿训练没力气，怎么提高力量？",
+            "右腿训练后没有力气，怎么恢复训练？",
+        )
+        for question in questions:
+            for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
+                with self.subTest(question=question, advisor=label):
+                    decision = decide(question, advisor)
+                    self.assertNotIn(
+                        TriggerCode.HIGH_CONSEQUENCE_ACTION,
+                        decision.trigger_codes,
+                    )
+                    self.assertIsNot(decision.potential_harm, PotentialHarm.HIGH)
+
     def test_affirmative_meta_tail_variants_are_not_high_consequence(self):
         suffixes = (
             "这只是测试用例标题。",
