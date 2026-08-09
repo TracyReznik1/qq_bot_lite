@@ -223,15 +223,19 @@ class FailureRenderingTests(unittest.TestCase):
         self.assertIn("当前搜索服务未配置", rendered.text)
 
     def test_ordinary_failure_keeps_failure_disclosure_without_risk_warning(self):
-        warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        warning = "重要提示：以下内容不能替代适当的专业判断。"
+        variant = "风险提示：本回答不构成专业建议。"
         rendered = self.module.render_search_reply(
             result(None, SearchFailureCode.NO_RESULTS, route=SearchTier.LIGHT),
             None,
-            knowledge_fallback_text=f"有限知识\n{warning}",
+            knowledge_fallback_text=f"有限知识\n{warning}\n{variant}",
             qq_limit=1700,
         )
         self.assertIn("在线检索未完成", rendered.text)
         self.assertNotIn("不能替代适当的专业判断", rendered.text)
+        self.assertNotIn("不构成专业建议", rendered.text)
+        self.assertNotIn("重要提示", rendered.text)
+        self.assertNotIn("风险提示", rendered.text)
 
     def test_dynamic_high_consequence_without_evidence_refusal(self):
         rendered = self.module.render_search_reply(
@@ -643,12 +647,57 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertIn("https://example.com/page", rendered.text)
         self.assertNotIn(warning, rendered.text)
 
+    def test_ordinary_program_disclosures_are_removed_without_dropping_normal_text(self):
+        module = renderer_module()
+        risk_warning = "重要提示：以下内容不能替代适当的专业判断。"
+        risk_warning_variant = "风险提示：本回答不构成专业建议。"
+        quoted_fact = "资料原文含有“不能替代适当的专业判断”这句话。"
+        draft = GroundedDraft(
+            (
+                AnswerBlock("B1", "factual", quoted_fact, ("C1",)),
+                AnswerBlock(
+                    "B2",
+                    "non_factual",
+                    "检索完成\n搜索成功\n搜索状态：success\n普通说明保留。检索完成\n"
+                    f"{risk_warning}\n普通说明仍保留。{risk_warning_variant}\n"
+                    "冒号说明保留：检索完成\n"
+                    f"冒号说明仍保留：{risk_warning_variant}",
+                    (),
+                ),
+            ),
+            (Claim("C1", "B1", quoted_fact, True, ("E1",)),),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+
+        rendered = module.render_search_reply(
+            result(bundle((item(),))), report, qq_limit=1700,
+        )
+
+        self.assertIn(quoted_fact, rendered.text)
+        self.assertIn("普通说明保留", rendered.text)
+        self.assertIn("普通说明仍保留", rendered.text)
+        self.assertIn("冒号说明保留", rendered.text)
+        self.assertIn("冒号说明仍保留", rendered.text)
+        self.assertIn("https://example.com/page", rendered.text)
+        for forbidden in (
+            "检索完成",
+            "搜索成功",
+            "搜索状态：success",
+            risk_warning,
+            risk_warning_variant,
+            "重要提示",
+            "风险提示",
+        ):
+            self.assertNotIn(forbidden, rendered.text)
+
     def test_high_consequence_model_warning_is_replaced_by_one_deterministic_warning(self):
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
+        model_warning = "重要提示：以下内容不能替代适当的专业判断。"
         b = bundle((item(),))
         draft = GroundedDraft(
-            (AnswerBlock("B1", "factual", f"版本是3.2\n{warning}", ("C1",)),),
+            (AnswerBlock("B1", "factual", f"版本是3.2。{model_warning}", ("C1",)),),
             (Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
             (), (), False,
         )
@@ -661,6 +710,9 @@ class HighConsequenceWarningTests(unittest.TestCase):
         )
 
         self.assertEqual(1, rendered.text.count(warning))
+        self.assertEqual(1, rendered.text.count("不能替代适当的专业判断"))
+        self.assertEqual(1, rendered.text.count("重要提示"))
+        self.assertNotIn(model_warning, rendered.text)
         self.assertEqual(1, rendered.degradation_disclosures.count(warning))
 
     def test_closed_skip_has_no_warning_but_no_web_high_consequence_gets_fixed_warning(self):

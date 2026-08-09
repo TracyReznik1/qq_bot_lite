@@ -32,6 +32,7 @@ from src.search.models import (
     SearchTrace,
     SkipReason,
     SourceRelation,
+    TriggerCode,
 )
 from src.services.llm_types import ChatResponse
 
@@ -102,6 +103,33 @@ def search_result(route=SearchTier.LIGHT, evidence=None, failure=None, skip_reas
     return m.SearchPipelineResult(d, p, evidence, SearchTrace("req-1", RequestSource.CHAT, route), failure)
 
 
+def no_web_result(*, potential_harm, trigger_codes=()):
+    m = models()
+    d = m.RetrievalDecision(
+        SearchTier.SKIP,
+        SkipReason.USER_FORBID_WEB,
+        False,
+        tuple(trigger_codes),
+        frozenset(),
+        Factuality.FACTUAL,
+        True,
+        Freshness.NONE,
+        RiskLevel.LOW,
+        m.Actionability.NONE,
+        potential_harm,
+        None,
+        None,
+        tuple(trigger_codes),
+    )
+    return m.SearchPipelineResult(
+        d,
+        None,
+        None,
+        SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP),
+        SearchFailureCode.USER_FORBID_WEB,
+    )
+
+
 def _patch_memory():
     return mock.patch(
         "src.chat.prompt.MemoryRetriever",
@@ -170,6 +198,34 @@ class SkipFlowTests(unittest.TestCase):
         self.assertNotIn("搜索结果可能不完整或不准确", reply)
         self.assertNotIn("99毫克", reply)
 
+    def test_no_web_high_consequence_predicate_suppresses_answer_model(self):
+        m = models()
+        cases = (
+            ("potential_harm", m.PotentialHarm.HIGH, ()),
+            ("trigger_code", m.PotentialHarm.NONE, (TriggerCode.HIGH_CONSEQUENCE_ACTION,)),
+        )
+        for label, potential_harm, trigger_codes in cases:
+            with self.subTest(case=label):
+                reply, llm_chat = self._run(
+                    no_web_result(
+                        potential_harm=potential_harm,
+                        trigger_codes=trigger_codes,
+                    ),
+                    "不要联网，给我一个高风险建议",
+                )
+                llm_chat.assert_not_called()
+                self.assertEqual(1, reply.count("本次未联网核验"))
+
+    def test_no_web_low_risk_still_uses_answer_model(self):
+        reply, llm_chat = self._run(
+            no_web_result(potential_harm=models().PotentialHarm.NONE),
+            "不要联网，简单解释一下",
+        )
+        llm_chat.assert_called_once()
+        self.assertIn("你好呀", reply)
+        self.assertIn("本次没有联网核验", reply)
+        self.assertNotIn("不能替代适当的专业判断", reply)
+
 
 class SearchFlowTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -178,17 +234,27 @@ class SearchFlowTests(unittest.TestCase):
     def tearDown(self) -> None:
         chat_service._search_orchestrator = self._old
 
-    def _run(self, result, text="什么是光合作用", force_search=False):
+    def _run(
+        self,
+        result,
+        text="什么是光合作用",
+        force_search=False,
+        draft_payload=None,
+    ):
         fake_orchestrator = mock.Mock()
         fake_orchestrator.run.return_value = result
         chat_service._search_orchestrator = fake_orchestrator
-        draft_json_payload = json.dumps({
+        default_draft_payload = {
             "answer_blocks": [{"block_id": "B1", "kind": "factual", "text": "版本是3.2", "claim_ids": ["C1"]}],
             "claims": [{"claim_id": "C1", "block_id": "B1", "text": "版本是3.2", "material": True, "evidence_ids": ["E1"]}],
             "limitations": [],
             "conflict_summary": [],
             "used_knowledge_fallback": False,
-        })
+        }
+        draft_json_payload = json.dumps(
+            default_draft_payload if draft_payload is None else draft_payload,
+            ensure_ascii=False,
+        )
 
         def _sequenced(*args, **kwargs):
             if not hasattr(_sequenced, "count"):
@@ -247,6 +313,55 @@ class SearchFlowTests(unittest.TestCase):
                 for forbidden in ("检索完成", "搜索成功", "搜索状态：success"):
                     self.assertNotIn(forbidden, reply)
                 self.assertNotIn("不能替代适当的专业判断", reply)
+
+    def test_normal_and_force_search_remove_model_success_statuses(self):
+        draft_payload = {
+            "answer_blocks": [
+                {"block_id": "B1", "kind": "factual", "text": "版本是3.2", "claim_ids": ["C1"]},
+                {
+                    "block_id": "B2",
+                    "kind": "non_factual",
+                    "text": (
+                        "检索完成\n搜索成功\n搜索状态：success\n普通说明保留。\n"
+                        "冒号说明保留：检索完成\n"
+                        "冒号说明仍保留：风险提示：本回答不构成专业建议。"
+                    ),
+                    "claim_ids": [],
+                },
+            ],
+            "claims": [
+                {
+                    "claim_id": "C1",
+                    "block_id": "B1",
+                    "text": "版本是3.2",
+                    "material": True,
+                    "evidence_ids": ["E1"],
+                },
+            ],
+            "limitations": [],
+            "conflict_summary": [],
+            "used_knowledge_fallback": False,
+        }
+        for force_search in (False, True):
+            with self.subTest(force_search=force_search):
+                reply, _llm, _orch = self._run(
+                    search_result(SearchTier.LIGHT, bundle((item(),))),
+                    force_search=force_search,
+                    draft_payload=draft_payload,
+                )
+                self.assertIn("版本是3.2", reply)
+                self.assertIn("普通说明保留", reply)
+                self.assertIn("冒号说明保留", reply)
+                self.assertIn("冒号说明仍保留", reply)
+                self.assertIn("来源：", reply)
+                for forbidden in (
+                    "检索完成",
+                    "搜索成功",
+                    "搜索状态：success",
+                    "不构成专业建议",
+                    "风险提示",
+                ):
+                    self.assertNotIn(forbidden, reply)
 
     def test_skipped_no_web_dynamic_emits_limitation(self):
         result = search_result(skip_reason=SkipReason.USER_FORBID_WEB)

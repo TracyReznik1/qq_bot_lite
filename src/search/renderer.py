@@ -53,6 +53,54 @@ _FIXED_DISCLOSURES = {
 
 _SOURCE_MARKER = re.compile(r"来源[：:]\s*https?://\S+")
 _SOURCE_HEADING = re.compile(r"^来源[：:]", re.MULTILINE)
+_SEARCH_SUCCESS_STATUS = (
+    r"(?:搜索|检索)(?:状态)?\s*(?:[：:]\s*)?"
+    r"(?:success|successful|succeeded|completed|成功|已成功|完成|已完成)"
+)
+_SEARCH_SUCCESS_STATUS_LINE = re.compile(
+    r"^\s*" + _SEARCH_SUCCESS_STATUS + r"\s*[。！？!?]*\s*$",
+    re.IGNORECASE,
+)
+_PROFESSIONAL_WARNING_CUE_START = (
+    r"(?:(?:重要|风险)?提示|注意|警告|免责声明)\s*[：:]"
+)
+_PROFESSIONAL_WARNING_SUBJECT_START = (
+    r"(?:(?:搜索|检索)结果|(?:以下|上述|此|该)(?:内容|信息|回答|建议)|"
+    r"本(?:次)?(?:内容|信息|回答|答复|未联网核验))"
+)
+_PROFESSIONAL_WARNING_CORE_PATTERN = (
+    r"(?:"
+    r"(?:不能|不可|不应|请勿|勿)[^。\n！？!?]{0,32}?"
+    r"(?:替代|取代|当作|视为)[^。\n！？!?]{0,24}?专业(?:判断|建议|意见)"
+    r"|不构成[^。\n！？!?]{0,24}?专业(?:判断|建议|意见)"
+    r")"
+)
+_PROFESSIONAL_WARNING_CUE = re.compile(
+    r"^\s*" + _PROFESSIONAL_WARNING_CUE_START
+)
+_PROFESSIONAL_WARNING_SUBJECT = re.compile(
+    r"^\s*" + _PROFESSIONAL_WARNING_SUBJECT_START
+)
+_PROFESSIONAL_WARNING_CORE = re.compile(_PROFESSIONAL_WARNING_CORE_PATTERN)
+_BARE_PROFESSIONAL_WARNING = re.compile(
+    r"^\s*" + _PROFESSIONAL_WARNING_CORE_PATTERN + r"[。！？!?]*\s*$"
+)
+_PROFESSIONAL_WARNING_SEGMENT = re.compile(
+    r"(?:^|(?<=[。！？!?；;，,：:]))\s*(?:"
+    r"(?:"
+    + _PROFESSIONAL_WARNING_CUE_START
+    + r"|"
+    + _PROFESSIONAL_WARNING_SUBJECT_START
+    + r")[^。\n！？!?]{0,160}?"
+    + _PROFESSIONAL_WARNING_CORE_PATTERN
+    + r"|"
+    + _PROFESSIONAL_WARNING_CORE_PATTERN
+    + r")[。！？!?]*"
+)
+_SEARCH_STATUS_SEGMENT_BOUNDARY = re.compile(
+    r"(?<=[。！？!?；;，,：:])\s*(?=" + _SEARCH_SUCCESS_STATUS + r")",
+    re.IGNORECASE,
+)
 _URGENT_DYNAMIC_CODES = {
     SearchFailureCode.PROVIDER_UNAVAILABLE,
     SearchFailureCode.PROVIDER_TIMEOUT,
@@ -213,7 +261,7 @@ def render_search_reply(
         disclosures = _dedupe_strings(disclosures)
         body = _strip_markers(
             knowledge_fallback_text,
-            strip_search_warnings=True,
+            strip_search_disclosures=True,
         )
         if is_no_web and is_high_consequence:
             body = body.replace(_NO_WEB_DYNAMIC_LIMIT, "").strip()
@@ -255,7 +303,7 @@ def render_search_reply(
             disclosures.append(_STABLE_FALLBACK_PREFIX)
             text = _strip_markers(
                 knowledge_fallback_text,
-                strip_search_warnings=True,
+                strip_search_disclosures=True,
             )
         else:
             disclosures.append(base)
@@ -306,7 +354,7 @@ def render_search_reply(
             text = _compose_disclosures(
                 _strip_markers(
                     knowledge_fallback_text or "",
-                    strip_search_warnings=True,
+                    strip_search_disclosures=True,
                 ),
                 disclosures,
             )
@@ -437,7 +485,7 @@ def _render_validated(
                     if eid in numbered and numbered[eid] not in used_here:
                         used_here.append(numbered[eid])
         citations = used_here
-        text = _strip_markers(block.text, strip_search_warnings=True)
+        text = _strip_markers(block.text, strip_search_disclosures=True)
         if citations:
             text = f"{text}{''.join(f'[{number}]' for number in citations)}"
         body_parts.append(text)
@@ -650,7 +698,7 @@ def _bounded_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
-def _strip_markers(text: str, *, strip_search_warnings: bool = False) -> str:
+def _strip_markers(text: str, *, strip_search_disclosures: bool = False) -> str:
     text = str(text or "")
     # Discard everything from a model-written source heading onward; the
     # deterministic renderer owns the source list.
@@ -658,7 +706,54 @@ def _strip_markers(text: str, *, strip_search_warnings: bool = False) -> str:
     text = text.split("@@SOURCE_BOUNDARY@@", 1)[0]
     text = _SOURCE_MARKER.sub("", text)
     text = re.sub(r"\[(?:SRCH|MEM|CHAT):[^\]]*\]", "", text)
-    if strip_search_warnings:
-        text = text.replace(_HIGH_CONSEQUENCE_WARNING, "")
-        text = text.replace(_NO_WEB_HIGH_CONSEQUENCE_WARNING, "")
+    if strip_search_disclosures:
+        text = _strip_program_owned_search_disclosures(text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _strip_program_owned_search_disclosures(text: str) -> str:
+    """Remove standalone model echoes of renderer-owned search disclosures.
+
+    Professional disclaimers are recognized as complete atomic spans before
+    status segmentation, so a cue such as ``风险提示：`` cannot be left behind.
+    The surrounding ordinary prose remains intact.
+    """
+    retained_lines: list[str] = []
+    for line in text.splitlines():
+        line, warning_count = _PROFESSIONAL_WARNING_SEGMENT.subn("", line)
+        retained_segments: list[str] = []
+        dropped_disclosure = bool(warning_count)
+        for segment in _SEARCH_STATUS_SEGMENT_BOUNDARY.split(line):
+            if (
+                _SEARCH_SUCCESS_STATUS_LINE.fullmatch(segment)
+                or _is_program_owned_professional_warning(segment)
+            ):
+                dropped_disclosure = True
+                continue
+            retained_segments.append(segment)
+        retained = "".join(retained_segments)
+        if dropped_disclosure:
+            retained = retained.rstrip("，,；;：: ")
+        if retained:
+            retained_lines.append(retained)
+    return "\n".join(retained_lines)
+
+
+def _is_program_owned_professional_warning(line: str) -> bool:
+    """Recognize bounded standalone disclaimers without censoring facts.
+
+    A model must use a disclosure cue/subject plus a professional-judgment
+    disclaimer, or emit the disclaimer by itself.  Longer prose and ordinary
+    facts therefore stay untouched even when they quote the same words.
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 180:
+        return False
+    if _BARE_PROFESSIONAL_WARNING.fullmatch(stripped):
+        return True
+    if not _PROFESSIONAL_WARNING_CORE.search(stripped):
+        return False
+    return bool(
+        _PROFESSIONAL_WARNING_CUE.match(stripped)
+        or _PROFESSIONAL_WARNING_SUBJECT.match(stripped)
+    )

@@ -20,9 +20,8 @@ from src.search.models import (
     SearchPipelineResult,
     SearchTier,
     SkipReason,
-    TriggerCode,
 )
-from src.search.renderer import render_search_reply, render_plain_reply
+from src.search.renderer import _is_high_consequence, render_search_reply, render_plain_reply
 from src.services.llm_client import get_llm_client
 from src.services.llm_types import ChatResponse
 from src.utils.storage import read_json, safe_id, write_json
@@ -388,12 +387,11 @@ def generate_reply(
 
 def _handle_skip(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
     reason = result.decision.skip_reason
-    from src.search.renderer import render_search_reply
     if reason is SkipReason.USER_FORBID_WEB:
         # Stable knowledge may answer with a fixed no-web disclosure.
         if (
             result.decision.requires_clarification
-            or TriggerCode.HIGH_CONSEQUENCE_ACTION in result.decision.trigger_codes
+            or _is_high_consequence(result)
         ):
             rendered = render_search_reply(result, None, qq_limit=_qq_limit())
             return rendered.text, result
@@ -418,7 +416,6 @@ def _handle_skip(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResu
 
 
 def _handle_failure(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
-    from src.search.renderer import render_search_reply
     decision = result.decision
     if decision.route is SearchTier.DEEP:
         rendered = render_search_reply(result, None, qq_limit=_qq_limit())
