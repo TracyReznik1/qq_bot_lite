@@ -223,18 +223,19 @@ class FailureRenderingTests(unittest.TestCase):
         self.assertIn("当前搜索服务未配置", rendered.text)
 
     def test_ordinary_failure_keeps_failure_disclosure_without_risk_warning(self):
-        warning = "重要提示：以下内容不能替代适当的专业判断。"
-        variant = "风险提示：本回答不构成专业建议。"
+        warning = "温馨提示：以下内容不构成专业建议。"
+        variant = "风险提示：本回答不能作为专业建议。"
         rendered = self.module.render_search_reply(
             result(None, SearchFailureCode.NO_RESULTS, route=SearchTier.LIGHT),
             None,
-            knowledge_fallback_text=f"有限知识\n{warning}\n{variant}",
+            knowledge_fallback_text=f"有限知识仍保留。{warning}\n{variant}",
             qq_limit=1700,
         )
         self.assertIn("在线检索未完成", rendered.text)
-        self.assertNotIn("不能替代适当的专业判断", rendered.text)
+        self.assertIn("有限知识仍保留", rendered.text)
         self.assertNotIn("不构成专业建议", rendered.text)
-        self.assertNotIn("重要提示", rendered.text)
+        self.assertNotIn("不能作为专业建议", rendered.text)
+        self.assertNotIn("温馨提示", rendered.text)
         self.assertNotIn("风险提示", rendered.text)
 
     def test_dynamic_high_consequence_without_evidence_refusal(self):
@@ -691,10 +692,73 @@ class HighConsequenceWarningTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rendered.text)
 
+    def test_status_prefix_atom_is_removed_without_dropping_following_text(self):
+        module = renderer_module()
+        draft = GroundedDraft(
+            (
+                AnswerBlock(
+                    "B1",
+                    "non_factual",
+                    "检索完成：中文正文保留。\n搜索成功: ASCII 正文保留。\n"
+                    "本次检索完成\n在线检索完成\n"
+                    "本次检索完成后整理结果。完成某任务需要三步。检索完成率是九成。",
+                    (),
+                ),
+            ),
+            (), (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, (), (), {}, ())
+
+        rendered = module.render_search_reply(
+            result(bundle((item(),))), report, qq_limit=1700,
+        )
+
+        self.assertIn("中文正文保留", rendered.text)
+        self.assertIn("ASCII 正文保留", rendered.text)
+        self.assertIn("本次检索完成后整理结果", rendered.text)
+        self.assertIn("完成某任务需要三步", rendered.text)
+        self.assertIn("检索完成率是九成", rendered.text)
+        self.assertNotIn("检索完成：", rendered.text)
+        self.assertNotIn("搜索成功:", rendered.text)
+        self.assertNotIn("在线检索完成", rendered.text)
+        self.assertNotIn("本次检索完成", rendered.text.splitlines())
+
+    def test_warning_atoms_are_removed_without_truncating_supported_facts(self):
+        module = renderer_module()
+        quoted_fact = "不能替代适当的专业判断是这份文件的免责声明内容。"
+        embedded_fact = "版本是3.2"
+        advice_fact = "专业建议栏目位于第二页。"
+        block_text = (
+            f"{quoted_fact}{advice_fact}"
+            f"请注意：{embedded_fact}，不能代替专业建议。"
+            "风险提示：本回答不能代替专业建议。"
+        )
+        draft = GroundedDraft(
+            (AnswerBlock("B1", "factual", block_text, ("C1", "C2", "C3")),),
+            (
+                Claim("C1", "B1", quoted_fact, True, ("E1",)),
+                Claim("C2", "B1", embedded_fact, True, ("E1",)),
+                Claim("C3", "B1", advice_fact, True, ("E1",)),
+            ),
+            (), (), False,
+        )
+        report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
+
+        rendered = module.render_search_reply(
+            result(bundle((item(),))), report, qq_limit=1700,
+        )
+
+        self.assertIn(quoted_fact, rendered.text)
+        self.assertIn(embedded_fact, rendered.text)
+        self.assertIn(advice_fact, rendered.text)
+        self.assertNotIn("请注意", rendered.text)
+        self.assertNotIn("风险提示", rendered.text)
+        self.assertNotIn("不能代替专业建议", rendered.text)
+
     def test_high_consequence_model_warning_is_replaced_by_one_deterministic_warning(self):
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-        model_warning = "重要提示：以下内容不能替代适当的专业判断。"
+        model_warning = "温馨提示：以下内容不构成专业建议。风险提示：本回答不能作为专业建议。"
         b = bundle((item(),))
         draft = GroundedDraft(
             (AnswerBlock("B1", "factual", f"版本是3.2。{model_warning}", ("C1",)),),
@@ -713,6 +777,9 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertEqual(1, rendered.text.count("不能替代适当的专业判断"))
         self.assertEqual(1, rendered.text.count("重要提示"))
         self.assertNotIn(model_warning, rendered.text)
+        self.assertNotIn("温馨提示", rendered.text)
+        self.assertNotIn("风险提示", rendered.text)
+        self.assertNotIn("不能作为专业建议", rendered.text)
         self.assertEqual(1, rendered.degradation_disclosures.count(warning))
 
     def test_closed_skip_has_no_warning_but_no_web_high_consequence_gets_fixed_warning(self):

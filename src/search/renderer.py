@@ -54,15 +54,11 @@ _FIXED_DISCLOSURES = {
 _SOURCE_MARKER = re.compile(r"来源[：:]\s*https?://\S+")
 _SOURCE_HEADING = re.compile(r"^来源[：:]", re.MULTILINE)
 _SEARCH_SUCCESS_STATUS = (
-    r"(?:搜索|检索)(?:状态)?\s*(?:[：:]\s*)?"
+    r"(?:(?:本次|在线)\s*)?(?:搜索|检索)(?:状态)?\s*(?:[：:]\s*)?"
     r"(?:success|successful|succeeded|completed|成功|已成功|完成|已完成)"
 )
-_SEARCH_SUCCESS_STATUS_LINE = re.compile(
-    r"^\s*" + _SEARCH_SUCCESS_STATUS + r"\s*[。！？!?]*\s*$",
-    re.IGNORECASE,
-)
 _PROFESSIONAL_WARNING_CUE_START = (
-    r"(?:(?:重要|风险)?提示|注意|警告|免责声明)\s*[：:]"
+    r"(?:[\u4e00-\u9fff]{0,4}提示|请注意|注意|警告|免责声明)\s*[：:,，]?"
 )
 _PROFESSIONAL_WARNING_SUBJECT_START = (
     r"(?:(?:搜索|检索)结果|(?:以下|上述|此|该)(?:内容|信息|回答|建议)|"
@@ -71,35 +67,22 @@ _PROFESSIONAL_WARNING_SUBJECT_START = (
 _PROFESSIONAL_WARNING_CORE_PATTERN = (
     r"(?:"
     r"(?:不能|不可|不应|请勿|勿)[^。\n！？!?]{0,32}?"
-    r"(?:替代|取代|当作|视为)[^。\n！？!?]{0,24}?专业(?:判断|建议|意见)"
+    r"(?:替代|代替|取代|当作|视为|作为)[^。\n！？!?]{0,24}?专业(?:判断|建议|意见)"
     r"|不构成[^。\n！？!?]{0,24}?专业(?:判断|建议|意见)"
     r")"
 )
-_PROFESSIONAL_WARNING_CUE = re.compile(
-    r"^\s*" + _PROFESSIONAL_WARNING_CUE_START
-)
-_PROFESSIONAL_WARNING_SUBJECT = re.compile(
-    r"^\s*" + _PROFESSIONAL_WARNING_SUBJECT_START
-)
+_PROFESSIONAL_WARNING_CUE = re.compile(r"^" + _PROFESSIONAL_WARNING_CUE_START)
+_PROFESSIONAL_WARNING_SUBJECT = re.compile(r"^" + _PROFESSIONAL_WARNING_SUBJECT_START)
 _PROFESSIONAL_WARNING_CORE = re.compile(_PROFESSIONAL_WARNING_CORE_PATTERN)
-_BARE_PROFESSIONAL_WARNING = re.compile(
-    r"^\s*" + _PROFESSIONAL_WARNING_CORE_PATTERN + r"[。！？!?]*\s*$"
+_DISCLOSURE_ATOM_START = re.compile(
+    r"(?:^|(?<=[。！？!?；;，,：:\n]))[ \t]*", re.MULTILINE
 )
-_PROFESSIONAL_WARNING_SEGMENT = re.compile(
-    r"(?:^|(?<=[。！？!?；;，,：:]))\s*(?:"
-    r"(?:"
-    + _PROFESSIONAL_WARNING_CUE_START
-    + r"|"
-    + _PROFESSIONAL_WARNING_SUBJECT_START
-    + r")[^。\n！？!?]{0,160}?"
-    + _PROFESSIONAL_WARNING_CORE_PATTERN
-    + r"|"
-    + _PROFESSIONAL_WARNING_CORE_PATTERN
-    + r")[。！？!?]*"
-)
-_SEARCH_STATUS_SEGMENT_BOUNDARY = re.compile(
-    r"(?<=[。！？!?；;，,：:])\s*(?=" + _SEARCH_SUCCESS_STATUS + r")",
-    re.IGNORECASE,
+_DISCLOSURE_ATOM_END = re.compile(r"[。！？!?；;\n]")
+_SEARCH_SUCCESS_STATUS_ATOM = re.compile(
+    r"(?:^|(?<=[。！？!?；;，,：:\n]))[ \t]*"
+    + _SEARCH_SUCCESS_STATUS
+    + r"(?:[ \t]*[：:][ \t]*|[ \t]*(?:[。！？!?；;]+|(?=$|\n)))",
+    re.IGNORECASE | re.MULTILINE,
 )
 _URGENT_DYNAMIC_CODES = {
     SearchFailureCode.PROVIDER_UNAVAILABLE,
@@ -485,7 +468,16 @@ def _render_validated(
                     if eid in numbered and numbered[eid] not in used_here:
                         used_here.append(numbered[eid])
         citations = used_here
-        text = _strip_markers(block.text, strip_search_disclosures=True)
+        protected_texts = tuple(
+            claim.text
+            for claim in validation.retained_claims
+            if claim.block_id == block.block_id
+        )
+        text = _strip_markers(
+            block.text,
+            strip_search_disclosures=True,
+            protected_texts=protected_texts,
+        )
         if citations:
             text = f"{text}{''.join(f'[{number}]' for number in citations)}"
         body_parts.append(text)
@@ -698,7 +690,12 @@ def _bounded_title(title: str, limit: int = 80) -> str:
     return title[: limit - 1].rstrip() + "…"
 
 
-def _strip_markers(text: str, *, strip_search_disclosures: bool = False) -> str:
+def _strip_markers(
+    text: str,
+    *,
+    strip_search_disclosures: bool = False,
+    protected_texts: Sequence[str] = (),
+) -> str:
     text = str(text or "")
     # Discard everything from a model-written source heading onward; the
     # deterministic renderer owns the source list.
@@ -707,53 +704,84 @@ def _strip_markers(text: str, *, strip_search_disclosures: bool = False) -> str:
     text = _SOURCE_MARKER.sub("", text)
     text = re.sub(r"\[(?:SRCH|MEM|CHAT):[^\]]*\]", "", text)
     if strip_search_disclosures:
-        text = _strip_program_owned_search_disclosures(text)
+        text = _strip_program_owned_search_disclosures(
+            text, protected_texts=protected_texts,
+        )
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _strip_program_owned_search_disclosures(text: str) -> str:
-    """Remove standalone model echoes of renderer-owned search disclosures.
+def _strip_program_owned_search_disclosures(
+    text: str, *, protected_texts: Sequence[str] = (),
+) -> str:
+    """Remove renderer-owned status and warning atoms from model prose.
 
-    Professional disclaimers are recognized as complete atomic spans before
-    status segmentation, so a cue such as ``风险提示：`` cannot be left behind.
-    The surrounding ordinary prose remains intact.
+    Status atoms remove only the status prefix and its delimiter.  Warning
+    atoms are bounded clauses; exact retained-claim spans inside them are
+    protected so filtering cannot silently truncate grounded facts.
     """
-    retained_lines: list[str] = []
-    for line in text.splitlines():
-        line, warning_count = _PROFESSIONAL_WARNING_SEGMENT.subn("", line)
-        retained_segments: list[str] = []
-        dropped_disclosure = bool(warning_count)
-        for segment in _SEARCH_STATUS_SEGMENT_BOUNDARY.split(line):
-            if (
-                _SEARCH_SUCCESS_STATUS_LINE.fullmatch(segment)
-                or _is_program_owned_professional_warning(segment)
-            ):
-                dropped_disclosure = True
-                continue
-            retained_segments.append(segment)
-        retained = "".join(retained_segments)
-        if dropped_disclosure:
-            retained = retained.rstrip("，,；;：: ")
-        if retained:
-            retained_lines.append(retained)
-    return "\n".join(retained_lines)
+    text, status_count = _SEARCH_SUCCESS_STATUS_ATOM.subn("", text)
+    warning_spans = _professional_warning_spans(text)
+    if warning_spans:
+        protected_spans = _exact_text_spans(text, protected_texts)
+        delete = [False] * len(text)
+        for start, end in warning_spans:
+            for index in range(start, end):
+                delete[index] = True
+        for start, end in protected_spans:
+            for index in range(start, end):
+                delete[index] = False
+        text = "".join(char for index, char in enumerate(text) if not delete[index])
+
+    if status_count or warning_spans:
+        text = "\n".join(
+            line.rstrip("，,；;：: ") for line in text.splitlines() if line.strip()
+        )
+    return text
 
 
-def _is_program_owned_professional_warning(line: str) -> bool:
-    """Recognize bounded standalone disclaimers without censoring facts.
+def _professional_warning_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return complete, bounded model-owned professional-warning clauses."""
+    spans: list[tuple[int, int]] = []
+    for boundary in _DISCLOSURE_ATOM_START.finditer(text):
+        start = boundary.end()
+        end_match = _DISCLOSURE_ATOM_END.search(text, start)
+        end = end_match.end() if end_match else len(text)
+        body = text[start:end].rstrip("。！？!?；;\n \t")
+        if not body or len(body) > 180:
+            continue
+        core = _PROFESSIONAL_WARNING_CORE.search(body)
+        if core is None or body[core.end():].strip():
+            continue
+        if not (
+            _PROFESSIONAL_WARNING_CUE.match(body)
+            or _PROFESSIONAL_WARNING_SUBJECT.match(body)
+            or core.start() == 0
+        ):
+            continue
+        spans.append((start, end))
+    return tuple(_merge_spans(spans))
 
-    A model must use a disclosure cue/subject plus a professional-judgment
-    disclaimer, or emit the disclaimer by itself.  Longer prose and ordinary
-    facts therefore stay untouched even when they quote the same words.
-    """
-    stripped = line.strip()
-    if not stripped or len(stripped) > 180:
-        return False
-    if _BARE_PROFESSIONAL_WARNING.fullmatch(stripped):
-        return True
-    if not _PROFESSIONAL_WARNING_CORE.search(stripped):
-        return False
-    return bool(
-        _PROFESSIONAL_WARNING_CUE.match(stripped)
-        or _PROFESSIONAL_WARNING_SUBJECT.match(stripped)
-    )
+
+def _exact_text_spans(
+    text: str, protected_texts: Sequence[str],
+) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for protected in protected_texts:
+        protected = str(protected or "")
+        if not protected:
+            continue
+        offset = 0
+        while (start := text.find(protected, offset)) >= 0:
+            spans.append((start, start + len(protected)))
+            offset = start + len(protected)
+    return tuple(_merge_spans(spans))
+
+
+def _merge_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged

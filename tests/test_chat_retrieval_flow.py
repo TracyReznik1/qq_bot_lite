@@ -323,8 +323,11 @@ class SearchFlowTests(unittest.TestCase):
                     "kind": "non_factual",
                     "text": (
                         "检索完成\n搜索成功\n搜索状态：success\n普通说明保留。\n"
+                        "检索完成：中文正文保留。\n搜索成功: ASCII 正文保留。\n"
+                        "本次检索完成\n在线检索完成\n"
                         "冒号说明保留：检索完成\n"
-                        "冒号说明仍保留：风险提示：本回答不构成专业建议。"
+                        "冒号说明仍保留：温馨提示：以下内容不构成专业建议。\n"
+                        "风险提示：本回答不能作为专业建议。"
                     ),
                     "claim_ids": [],
                 },
@@ -353,12 +356,18 @@ class SearchFlowTests(unittest.TestCase):
                 self.assertIn("普通说明保留", reply)
                 self.assertIn("冒号说明保留", reply)
                 self.assertIn("冒号说明仍保留", reply)
+                self.assertIn("中文正文保留", reply)
+                self.assertIn("ASCII 正文保留", reply)
                 self.assertIn("来源：", reply)
                 for forbidden in (
                     "检索完成",
                     "搜索成功",
                     "搜索状态：success",
+                    "本次检索完成",
+                    "在线检索完成",
                     "不构成专业建议",
+                    "不能作为专业建议",
+                    "温馨提示",
                     "风险提示",
                 ):
                     self.assertNotIn(forbidden, reply)
