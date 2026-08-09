@@ -270,7 +270,7 @@ standard
 
 - medical / legal / financial / safety 等领域标签
 - high_stakes / high_consequence
-- `Freshness.HIGH`
+- 迁移期间现有的 `Freshness.HIGH` 或任何“当前/高时效”信号
 - `/search`
 - “请搜索”“联网查一下”
 - “请提供来源/出处”
@@ -321,6 +321,8 @@ elapsed_retrieval_time       <= 20s
 repair_count                 <= 1
 ```
 
+由用户原问题形成的 direct query 本身就是一个 semantic query，计入首轮最多3个 Query 的预算。Planner 最多只能在该 direct query 之外再生成2个补充 Query，不能实现成“原始 Query + 3个 Planner Query”。Planner 可以少生成；Evidence 预期简单时，standard 也可以只执行 direct query。Repair 仍最多1个，因此整个 standard 请求最多4个 semantic Query。
+
 ### 7.3 共享和计数规则
 
 - 首轮与 Repair 共享全部 URL、读取和时间预算。
@@ -347,7 +349,7 @@ repair_count                 <= 1
 
 在现有 Planner 调用内同时生成：
 
-- 首轮 Query
+- 首轮 direct query 之外最多2个补充 Query；direct query 已占用首轮 Query 预算中的1个名额
 - 最多3个有限、可验证的 `required_topics`
 - 必要来源关系或时间约束
 
@@ -389,6 +391,24 @@ repair_count                 <= 1
 - `satisfied`：Evidence 满足指定日期、版本或当前性要求。
 - `stale`：存在资料，但对当前材料性主题过旧。
 - `unknown`：无法可靠确定资料时间或有效期。
+
+Freshness eligibility 至少落实到每个 material required_topic，而不是只维护一个模糊的请求级结论。每个重要 topic 分别得到 `not_required / satisfied / stale / unknown`；只有 freshness 合格的 topic 才能进入 supported_topics。过旧或时间未知的 topic 进入 missing_topics，并记录 `stale_evidence`。
+
+例如：
+
+```text
+A → satisfied
+B → satisfied
+C → stale
+
+supported_topics = [A, B]
+missing_topics   = [C]
+evidence_state   = PARTIAL
+repair_reason    = stale_evidence
+repair_target    = C
+```
+
+这不要求新增 Freshness Engine；现有 Planner/Evidence 数据流只需能够表达 topic 与 freshness eligibility 的关系。
 
 Freshness 不生成第五种 Evidence state。过旧或时间未知的 Evidence 不能支持对应当前主题，并形成 `missing_topics + stale_evidence`。
 
@@ -747,7 +767,7 @@ light、standard 无 Repair、standard 有 Repair 三条路径的最大 LLM 调�
 - 显式搜索只保证非 skip。
 - 单一明确事实和单一来源请求可为 light。
 - 多事实、多实体、比较、推荐、交叉核验为 standard。
-- Freshness.HIGH 不改变 tier。
+- 迁移期间现有 `Freshness.HIGH` 或任何“当前/高时效”信号均不得提升 tier；最终实现应删除已经失去行为作用的 HIGH tier-control 字段。
 - warning_required 不改变 tier。
 - 同一 retrieval_context 在不同 Risk/Freshness 下得到相同 tier。
 
@@ -776,6 +796,8 @@ round_count                  <= 2
 elapsed_retrieval_time       <= 20s
 repair_count                 <= 1
 ```
+
+首轮计数必须包含由用户原问题形成的 direct query，因此首轮最多是1个 direct query 加2个补充 Query；Repair 最多再增加1个不同 Query。
 
 另需验证提前停止、预算共享、单 URL 单次读取计数、fallback 非新 Query/round、deadline 后无晚调用。
 
