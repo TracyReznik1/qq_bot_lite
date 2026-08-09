@@ -1,7 +1,7 @@
 # QQ Bot WebSearch 精简设计：有限自适应证据搜索
 
 **日期：** 2026-08-09  
-**状态：** 已完成四部分设计讨论，等待项目所有者复核正式规格  
+**状态：** 项目所有者已批准；可据此编写逐文件实施计划
 **调查基线：** `codex/ddgs-first-search@8abaa8f`  
 **适用范围：** 普通聊天、显式 `/search`、检索路由、查询规划、Provider、正文读取、Evidence、一次 Repair、回答策略、Validator、引用与 QQ 渲染
 
