@@ -995,6 +995,7 @@ class RequestAnalysisRouterTests(unittest.TestCase):
             ("Python 3.13 有哪些变化？", "3.13"),
             ("请查 v3.13 的发行说明", "3.13"),
             ("版本3.13 有什么新功能？", "3.13"),
+            ("微信 8.0 有哪些变化？", "8.0"),
         ):
             with self.subTest(question=question):
                 analysis, decision = self._route(question)
@@ -1007,6 +1008,10 @@ class RequestAnalysisRouterTests(unittest.TestCase):
             "2026-08-11 是星期几？",
             "192.168.0.1 是什么地址？",
             "0.2g 的样品如何换算？",
+            "Dose 0.2 mg 怎么服用？",
+            "剂量 0.2 mg 怎么服用？",
+            "体温 39.0 度正常吗？",
+            "价格 8.0 元合理吗？",
         ):
             with self.subTest(question=question):
                 analysis, _ = self._route(question)

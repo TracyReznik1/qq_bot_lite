@@ -1443,8 +1443,21 @@ _MULTI_FACT_MARKERS = ("分别", "逐一", "一一", "同时说明")
 _VERSION_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9.])(?P<prefix>[vV]\s*)?(?P<token>\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?![A-Za-z0-9.])"
 )
-_PRODUCT_OR_LANGUAGE_TOKEN_BEFORE_VERSION = re.compile(
+_ASCII_ENTITY_BEFORE_VERSION = re.compile(
     r"(?:[A-Z][A-Za-z0-9_-]{1,30}|[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)\s*$"
+)
+_CJK_ENTITY_BEFORE_VERSION = re.compile(r"(?P<entity>[\u4e00-\u9fff]{1,16})\s*$")
+_MEASUREMENT_OR_CURRENCY_AFTER_NUMBER = re.compile(
+    r"^\s*(?:mg|kg|g|ml|l|mm|cm|km|m|℃|°c|度|元|%)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_GENERIC_CJK_VERSION_PREFIXES = (
+    "今天",
+    "价格",
+    "剂量",
+    "体温",
+    "利率",
+    "汇率",
 )
 
 
@@ -1512,12 +1525,25 @@ def _extract_explicit_version_constraint(question: str) -> str | None:
         after = normalized[match.end():match.end() + 16]
         has_version_label = bool(
             re.search(r"(?:版本|version)\s*$", before, re.IGNORECASE)
-            or re.match(r"\s*(?:版本|version)\b", after, re.IGNORECASE)
+            or re.match(r"\s*版本", after)
+            or re.match(r"\s*version\b", after, re.IGNORECASE)
         )
+        if prefix or has_version_label:
+            return token
+        if _MEASUREMENT_OR_CURRENCY_AFTER_NUMBER.match(after):
+            continue
+        cjk_entity = _CJK_ENTITY_BEFORE_VERSION.search(before)
         has_adjacent_entity = bool(
-            _PRODUCT_OR_LANGUAGE_TOKEN_BEFORE_VERSION.search(before)
+            _ASCII_ENTITY_BEFORE_VERSION.search(before)
+            or (
+                cjk_entity is not None
+                and not any(
+                    cjk_entity.group("entity").endswith(generic_prefix)
+                    for generic_prefix in _GENERIC_CJK_VERSION_PREFIXES
+                )
+            )
         )
-        if prefix or has_version_label or has_adjacent_entity:
+        if has_adjacent_entity:
             return token
     return None
 
