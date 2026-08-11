@@ -1018,6 +1018,18 @@ class EvidenceBundle:
         evidence_by_id = {item.evidence_id: item for item in self.evidence_items}
         if len(evidence_by_id) != len(self.evidence_items):
             raise ValueError("bundle evidence ids must be unique")
+        conflict_ids = tuple(conflict.conflict_id for conflict in self.conflicts)
+        if len(set(conflict_ids)) != len(conflict_ids):
+            raise ValueError("bundle conflict ids must be unique")
+        if self.conflict_groups != conflict_ids:
+            raise ValueError("conflict groups must match conflicts in order")
+        for conflict in self.conflicts:
+            for member in conflict.members:
+                item = evidence_by_id.get(member.evidence_id)
+                if item is None:
+                    raise ValueError("conflict members must reference bundle evidence")
+                if not item.citable or not item.relevance_gate_passed:
+                    raise ValueError("conflict members require citable relevant evidence")
         for topic in material_topics:
             assessment = assessment_by_id[topic.topic_id]
             for evidence_id in assessment.supporting_evidence_ids:
@@ -1028,15 +1040,16 @@ class EvidenceBundle:
                     raise ValueError("topic support requires citable relevant evidence")
                 if topic.label not in item.supported_topics:
                     raise ValueError("topic support must match the legacy label projection")
-        if self.evidence_state is EvidenceState.SUFFICIENT:
-            if self.missing_topic_ids or any(
-                assessment.freshness in {
-                    FreshnessEligibility.STALE,
-                    FreshnessEligibility.UNKNOWN,
-                }
-                for assessment in self.topic_assessments
-            ):
-                raise ValueError("sufficient evidence cannot have stale or unknown material topics")
+        if self.conflicts:
+            expected_state = EvidenceState.CONFLICTING
+        elif not self.missing_topic_ids:
+            expected_state = EvidenceState.SUFFICIENT
+        elif self.supported_topic_ids:
+            expected_state = EvidenceState.PARTIAL
+        else:
+            expected_state = EvidenceState.INSUFFICIENT
+        if self.evidence_state is not expected_state:
+            raise ValueError("evidence state must match deterministic topic priority")
 
 
 @dataclass(frozen=True)

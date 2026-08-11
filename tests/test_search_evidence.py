@@ -906,6 +906,79 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
         self.assertIs(edge_bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertEqual((), edge_bundle.conflict_groups)
 
+    def test_same_conflict_key_on_disjoint_material_topics_does_not_conflict(self):
+        search_plan = topic_plan(
+            topic("topic-1", "A"),
+            topic("topic-2", "B"),
+        )
+        judge = StaticEvidenceJudge(
+            {
+                "C1": topic_judge_ok(
+                    "C1",
+                    supported_topic_ids=("topic-1",),
+                    conflict_key="status",
+                    conflict_value="alpha",
+                ),
+                "C2": topic_judge_ok(
+                    "C2",
+                    supported_topic_ids=("topic-2",),
+                    conflict_key="status",
+                    conflict_value="beta",
+                ),
+            }
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            search_plan,
+            (
+                candidate(url="https://a.example/status"),
+                candidate(url="https://b.example/status"),
+            ),
+        )
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual(("topic-1", "topic-2"), bundle.supported_topic_ids)
+        self.assertEqual((), bundle.conflicts)
+
+    def test_conflict_removes_only_the_material_topic_that_actually_conflicts(self):
+        search_plan = topic_plan(
+            topic("topic-1", "A"),
+            topic("topic-2", "B"),
+        )
+        judge = StaticEvidenceJudge(
+            {
+                "C1": topic_judge_ok(
+                    "C1",
+                    supported_topic_ids=("topic-1", "topic-2"),
+                    conflict_key="version",
+                    conflict_value="1",
+                ),
+                "C2": topic_judge_ok(
+                    "C2",
+                    supported_topic_ids=("topic-1",),
+                    conflict_key="version",
+                    conflict_value="2",
+                ),
+            }
+        )
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            search_plan,
+            (
+                candidate(url="https://a.example/version"),
+                candidate(url="https://b.example/version"),
+            ),
+        )
+
+        self.assertIs(bundle.evidence_state, EvidenceState.CONFLICTING)
+        self.assertEqual(("topic-2",), bundle.supported_topic_ids)
+        self.assertEqual(("topic-1",), bundle.missing_topic_ids)
+        self.assertEqual(("E1",), bundle.topic_assessments[1].supporting_evidence_ids)
+        self.assertEqual(
+            ("E1", "E2"),
+            tuple(member.evidence_id for member in bundle.conflicts[0].members),
+        )
+
     def test_version_literal_has_matching_mismatching_and_absent_outcomes(self):
         search_plan = topic_plan(
             topic(

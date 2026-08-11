@@ -145,12 +145,38 @@ def bundle(
         for topic in p.required_topics
         if topic.material and topic.topic_id in missing_topic_ids
     )
+    actual_structured_conflicts = tuple(structured_conflicts)
+    if conflicts and not actual_structured_conflicts:
+        actual_structured_conflicts = tuple(
+            m.EvidenceConflict(
+                conflict_id,
+                conflict_id,
+                (
+                    m.EvidenceConflictMember(
+                        evidence[0].evidence_id,
+                        "position-1",
+                        None,
+                        "contradicts",
+                    ),
+                    m.EvidenceConflictMember(
+                        evidence[1].evidence_id,
+                        "position-2",
+                        None,
+                        "contradicts",
+                    ),
+                ),
+            )
+            for conflict_id in conflicts
+        )
+    actual_conflict_groups = tuple(
+        conflict.conflict_id for conflict in actual_structured_conflicts
+    )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
         m.EvidenceGapAnalysis(actual_missing, (), False, None, ()),
         m.RepairPlan(False, (), None), 1, tuple(evidence), state,
-        actual_missing, (), tuple(conflicts), tuple(limitations),
-        tuple(structured_conflicts),
+        actual_missing, (), actual_conflict_groups, tuple(limitations),
+        actual_structured_conflicts,
         topic_assessments=assessments,
         supported_topic_ids=supported_topic_ids,
         missing_topic_ids=missing_topic_ids,

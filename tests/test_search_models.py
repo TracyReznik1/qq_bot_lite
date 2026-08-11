@@ -952,9 +952,34 @@ class RequestAnalysisContextContractTests(unittest.TestCase):
             self._freshness(m),
             self._risk(m),
         )
+        partial_plan = replace(
+            fixtures.plan(),
+            required_topics=("question", "detail"),
+        )
+        supported_topic, missing_topic = partial_plan.required_topics
+        evidence_item = fixtures.evidence_item()
         evidence = replace(
             fixtures.bundle(),
+            decision=partial_plan.decision,
+            plan=partial_plan,
+            initial_evidence_ids=(evidence_item.evidence_id,),
+            evidence_items=(evidence_item,),
             evidence_state=m.EvidenceState.PARTIAL,
+            missing_claim_topics=(missing_topic.label,),
+            topic_assessments=(
+                m.TopicAssessment(
+                    supported_topic.topic_id,
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (evidence_item.evidence_id,),
+                ),
+                m.TopicAssessment(
+                    missing_topic.topic_id,
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (),
+                ),
+            ),
+            supported_topic_ids=(supported_topic.topic_id,),
+            missing_topic_ids=(missing_topic.topic_id,),
         )
         result = m.SearchPipelineResult(
             fixtures.decision(),
@@ -1400,6 +1425,130 @@ class TopicAssessmentContractTests(unittest.TestCase):
                 fixtures.bundle(),
                 missing_claim_topics=("unrelated legacy label",),
             )
+
+    def test_bundle_rejects_state_that_disagrees_with_evidence_priority(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        first = fixtures.evidence_item()
+        second = replace(first, evidence_id="E2")
+        conflict = m.EvidenceConflict(
+            "conflict:version",
+            "version",
+            (
+                m.EvidenceConflictMember("e1", "1", None, "contradicts"),
+                m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+            ),
+        )
+        supported = {
+            "initial_evidence_ids": ("e1", "E2"),
+            "evidence_items": (first, second),
+            "missing_claim_topics": (),
+            "topic_assessments": (
+                m.TopicAssessment(
+                    "topic-1",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    ("e1",),
+                ),
+            ),
+            "supported_topic_ids": ("topic-1",),
+            "missing_topic_ids": (),
+        }
+        cases = (
+            (
+                "sufficient_with_conflict",
+                supported
+                | {
+                    "evidence_state": m.EvidenceState.SUFFICIENT,
+                    "conflict_groups": ("conflict:version",),
+                    "conflicts": (conflict,),
+                },
+            ),
+            (
+                "partial_with_all_topics_supported",
+                supported | {"evidence_state": m.EvidenceState.PARTIAL},
+            ),
+            (
+                "insufficient_with_supported_topic",
+                supported | {"evidence_state": m.EvidenceState.INSUFFICIENT},
+            ),
+            (
+                "conflicting_without_conflict",
+                {"evidence_state": m.EvidenceState.CONFLICTING},
+            ),
+        )
+        for name, overrides in cases:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                replace(fixtures.bundle(), **overrides)
+
+    def test_bundle_conflict_groups_match_unique_conflict_ids_in_order(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        first = fixtures.evidence_item()
+        second = replace(first, evidence_id="E2")
+        members = (
+            m.EvidenceConflictMember("e1", "1", None, "contradicts"),
+            m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+        )
+        first_conflict = m.EvidenceConflict("conflict-1", "version", members)
+        second_conflict = m.EvidenceConflict("conflict-2", "status", members)
+        duplicate_id = m.EvidenceConflict("conflict-1", "status", members)
+        cases = (
+            (("wrong-id",), (first_conflict,)),
+            (("conflict-2", "conflict-1"), (first_conflict, second_conflict)),
+            (("conflict-1", "conflict-1"), (first_conflict, duplicate_id)),
+        )
+        for conflict_groups, conflicts in cases:
+            with self.subTest(conflict_groups=conflict_groups), self.assertRaises(ValueError):
+                replace(
+                    fixtures.bundle(),
+                    initial_evidence_ids=("e1", "E2"),
+                    evidence_items=(first, second),
+                    evidence_state=m.EvidenceState.CONFLICTING,
+                    conflict_groups=conflict_groups,
+                    conflicts=conflicts,
+                )
+
+    def test_bundle_conflict_members_reference_citable_relevant_evidence(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        first = fixtures.evidence_item()
+        second = replace(first, evidence_id="E2")
+        cases = (
+            (
+                (first, second),
+                (
+                    m.EvidenceConflictMember("missing", "1", None, "contradicts"),
+                    m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+                ),
+            ),
+            (
+                (replace(first, citable=False), second),
+                (
+                    m.EvidenceConflictMember("e1", "1", None, "contradicts"),
+                    m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+                ),
+            ),
+            (
+                (replace(first, relevance_gate_passed=False), second),
+                (
+                    m.EvidenceConflictMember("e1", "1", None, "contradicts"),
+                    m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+                ),
+            ),
+        )
+        for evidence_items, members in cases:
+            conflict = m.EvidenceConflict("conflict-1", "version", members)
+            with self.subTest(evidence_items=evidence_items), self.assertRaises(ValueError):
+                replace(
+                    fixtures.bundle(),
+                    initial_evidence_ids=tuple(
+                        item.evidence_id for item in evidence_items
+                    ),
+                    evidence_items=evidence_items,
+                    evidence_state=m.EvidenceState.CONFLICTING,
+                    conflict_groups=("conflict-1",),
+                    conflicts=(conflict,),
+                )
 
     def test_sufficient_bundle_rejects_stale_or_unknown_material_assessment(self):
         m = models()

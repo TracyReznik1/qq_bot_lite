@@ -581,7 +581,7 @@ class FailureFlowTests(unittest.TestCase):
             ("weak_source_topics",),
             (
                 m.EvidenceConflict(
-                    "conflict-1", "版本",
+                    "conflict:版本", "版本",
                     (
                         m.EvidenceConflictMember("E1", "3.2", None, "contradicts"),
                         m.EvidenceConflictMember("E2", "3.3", None, "contradicts"),
@@ -886,7 +886,7 @@ class PartialConflictFlowTests(unittest.TestCase):
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",), (),
             (
                 m.EvidenceConflict(
-                    "conflict-1",
+                    "conflict:版本",
                     "版本",
                     (
                         m.EvidenceConflictMember("E1", "3.2", None, "contradicts"),

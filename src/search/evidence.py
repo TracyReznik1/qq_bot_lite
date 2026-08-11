@@ -524,28 +524,24 @@ class EvidenceAssembler:
             str, Mapping[str, FreshnessEligibility]
         ],
     ) -> EvidenceBundle:
-        assessments, material_eligible_evidence_ids = _assess_material_topics(
+        assessments, eligible_evidence_ids_by_topic = _assess_material_topics(
             plan,
             items,
             judged_freshness_by_canonical,
         )
-        conflicts = _detect_conflicts(items, material_eligible_evidence_ids)
+        conflicts, conflicting_topic_ids = _detect_conflicts(
+            items,
+            eligible_evidence_ids_by_topic,
+        )
         # An unresolved material conflict cannot be counted as topic support.
         # Keep only the independently uncontested subset so a CONFLICTING
         # bundle can still report useful, noncontroversial material coverage.
-        conflicting_evidence_ids = frozenset(
-            member.evidence_id
-            for conflict in conflicts
-            for member in conflict.members
-        )
-        if conflicting_evidence_ids:
+        if conflicting_topic_ids:
             assessments = tuple(
                 replace(
                     assessment,
                     supporting_evidence_ids=()
-                    if conflicting_evidence_ids.intersection(
-                        assessment.supporting_evidence_ids
-                    )
+                    if assessment.topic_id in conflicting_topic_ids
                     else assessment.supporting_evidence_ids,
                 )
                 for assessment in assessments
@@ -851,19 +847,34 @@ def _assign_evidence_ids(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
 
 def _detect_conflicts(
     items: Sequence[EvidenceItem],
-    material_eligible_evidence_ids: frozenset[str],
-) -> tuple[EvidenceConflict, ...]:
+    eligible_evidence_ids_by_topic: Mapping[str, frozenset[str]],
+) -> tuple[tuple[EvidenceConflict, ...], frozenset[str]]:
     conflicts: list[EvidenceConflict] = []
-    seen: dict[str, list[EvidenceItem]] = {}
-    for item in items:
-        if item.evidence_id not in material_eligible_evidence_ids:
-            continue
-        if item.conflict_key and item.conflict_value and item.conflict_relation:
-            seen.setdefault(item.conflict_key, []).append(item)
-    for key, members in seen.items():
-        values = {member.conflict_value for member in members if member.conflict_value}
-        if len(members) < 2 or len(values) < 2:
-            continue
+    conflicting_topic_ids: set[str] = set()
+    participating_ids_by_key: dict[str, set[str]] = {}
+    for topic_id, eligible_evidence_ids in eligible_evidence_ids_by_topic.items():
+        members_by_key: dict[str, list[EvidenceItem]] = {}
+        for item in items:
+            if item.evidence_id not in eligible_evidence_ids:
+                continue
+            if item.conflict_key and item.conflict_value and item.conflict_relation:
+                members_by_key.setdefault(item.conflict_key, []).append(item)
+        for key, members in members_by_key.items():
+            values = {
+                member.conflict_value
+                for member in members
+                if member.conflict_value
+            }
+            if len(members) < 2 or len(values) < 2:
+                continue
+            conflicting_topic_ids.add(topic_id)
+            participating_ids_by_key.setdefault(key, set()).update(
+                member.evidence_id for member in members
+            )
+    for key, participating_ids in participating_ids_by_key.items():
+        members = tuple(
+            item for item in items if item.evidence_id in participating_ids
+        )
         conflicts.append(
             EvidenceConflict(
                 conflict_id=f"conflict:{key}",
@@ -879,7 +890,10 @@ def _detect_conflicts(
                 ),
             )
         )
-    return tuple(sorted(conflicts, key=lambda conflict: conflict.conflict_id))
+    return (
+        tuple(sorted(conflicts, key=lambda conflict: conflict.conflict_id)),
+        frozenset(conflicting_topic_ids),
+    )
 
 
 def _judge_topics(plan: SearchPlan) -> tuple[dict[str, str], ...]:
@@ -911,9 +925,9 @@ def _assess_material_topics(
     judged_freshness_by_canonical: Mapping[
         str, Mapping[str, FreshnessEligibility]
     ],
-) -> tuple[tuple[TopicAssessment, ...], frozenset[str]]:
+) -> tuple[tuple[TopicAssessment, ...], dict[str, frozenset[str]]]:
     assessments: list[TopicAssessment] = []
-    material_eligible_evidence_ids: set[str] = set()
+    eligible_evidence_ids_by_topic: dict[str, frozenset[str]] = {}
     for topic in _material_topics(plan):
         statuses: list[FreshnessEligibility] = []
         eligible_items: list[EvidenceItem] = []
@@ -931,7 +945,9 @@ def _assess_material_topics(
                 FreshnessEligibility.SATISFIED,
             }:
                 eligible_items.append(item)
-                material_eligible_evidence_ids.add(item.evidence_id)
+        eligible_evidence_ids_by_topic[topic.topic_id] = frozenset(
+            item.evidence_id for item in eligible_items
+        )
         assessments.append(
             TopicAssessment(
                 topic_id=topic.topic_id,
@@ -942,7 +958,7 @@ def _assess_material_topics(
                 ),
             )
         )
-    return tuple(assessments), frozenset(material_eligible_evidence_ids)
+    return tuple(assessments), eligible_evidence_ids_by_topic
 
 
 def _topic_freshness(
