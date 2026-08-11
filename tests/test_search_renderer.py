@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.search.models import (
     AnswerBlock,
@@ -932,6 +933,60 @@ class HighConsequenceWarningTests(unittest.TestCase):
             with self.subTest(advisor=label, path="failure"):
                 rendered = module.render_search_reply(failure, None, qq_limit=1700)
                 self.assertEqual(1, rendered.text.count(warning))
+
+
+class RequestAnalysisPropagationTests(unittest.TestCase):
+    """Renderer fallback copies must preserve Task 3 analysis identity."""
+
+    def test_partial_and_conflict_fallbacks_keep_supplied_analysis(self):
+        module = renderer_module()
+        m = models()
+        analysis = m.RequestAnalysis(
+            m.RetrievalContext(
+                False,
+                None,
+                m.Factuality.FACTUAL,
+                True,
+                (),
+                m.SourceRequirement.ANY_RELEVANT,
+            ),
+            m.FreshnessContext(
+                m.FreshnessRequirement.NOT_REQUIRED,
+                None,
+                None,
+                None,
+                None,
+            ),
+            m.RiskContext(False, False, False),
+        )
+        source = m.SearchPipelineResult(
+            decision(),
+            plan(),
+            None,
+            trace(),
+            m.SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            analysis,
+        )
+        copied_results = []
+
+        def build_copied(*args):
+            copied = SimpleNamespace(analysis=args[5] if len(args) > 5 else None)
+            copied_results.append(copied)
+            return copied
+
+        def capture(copied, validation, *, qq_limit, **_kwargs):
+            return m.RenderedReply("captured", (), (), (), ())
+
+        with patch.object(module, "SearchPipelineResult", side_effect=build_copied):
+            with patch.object(module, "render_search_reply", side_effect=capture):
+                partial = module._render_partial(source, None, 1700)
+                conflict = module._render_conflict(source, None, 1700)
+
+        self.assertEqual("captured", partial.text)
+        self.assertEqual("captured", conflict.text)
+        self.assertEqual(2, len(copied_results))
+        for copied in copied_results:
+            self.assertIs(analysis, copied.analysis)
 
 
 if __name__ == "__main__":

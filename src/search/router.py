@@ -1130,6 +1130,8 @@ def _parse_optional_date(value: Any, field_name: str) -> date | None:
         return None
     if type(value) is not str:
         raise ValueError(f"{field_name} must be an ISO date or null")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise ValueError(f"{field_name} must be an ISO date or null")
     try:
         return date.fromisoformat(value)
     except ValueError as exc:

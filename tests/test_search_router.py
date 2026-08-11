@@ -8,6 +8,7 @@ import inspect
 import json
 import unittest
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from src.search.models import (
@@ -839,6 +840,16 @@ class LLMRoutingAdvisorTests(unittest.TestCase):
     def test_parses_fenced_json(self):
         result = self._parse(f"```json\n{json.dumps(NEUTRAL)}\n```")
         self.assertEqual(result["complexity_codes"], ())
+
+    def test_dates_require_basic_iso_hyphenated_format(self):
+        for field_name in ("as_of", "date_from", "date_to"):
+            for invalid_date in ("20260811", "2026-02-30"):
+                with self.subTest(field_name=field_name, invalid_date=invalid_date):
+                    payload = {**NEUTRAL, field_name: invalid_date}
+                    self.assertEqual(self._parse(json.dumps(payload)), {})
+
+        parsed = self._parse(json.dumps({**NEUTRAL, "as_of": "2026-08-11"}))
+        self.assertEqual(parsed["as_of"], date(2026, 8, 11))
 
     def test_invalid_json_is_empty(self):
         result = self._parse("I think the answer is 42")

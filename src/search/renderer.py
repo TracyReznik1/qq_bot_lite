@@ -523,7 +523,14 @@ def _render_partial(
 ) -> RenderedReply:
     if validation is None:
         return render_search_reply(
-            SearchPipelineResult(result.decision, result.plan, None, result.trace, SearchFailureCode.PROVIDER_UNAVAILABLE),
+            SearchPipelineResult(
+                result.decision,
+                result.plan,
+                None,
+                result.trace,
+                SearchFailureCode.PROVIDER_UNAVAILABLE,
+                result.analysis,
+            ),
             None,
             qq_limit=qq_limit,
         )
@@ -537,7 +544,14 @@ def _render_conflict(
 ) -> RenderedReply:
     if validation is None:
         return render_search_reply(
-            SearchPipelineResult(result.decision, result.plan, None, result.trace, SearchFailureCode.PROVIDER_UNAVAILABLE),
+            SearchPipelineResult(
+                result.decision,
+                result.plan,
+                None,
+                result.trace,
+                SearchFailureCode.PROVIDER_UNAVAILABLE,
+                result.analysis,
+            ),
             None,
             qq_limit=qq_limit,
         )
