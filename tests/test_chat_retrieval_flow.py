@@ -57,12 +57,12 @@ def query():
     return SearchQuery("q1", SearchRoundKind.INITIAL, models().QueryPurpose.DIRECT, "q")
 
 
-def plan(route=SearchTier.LIGHT):
+def plan(route=SearchTier.LIGHT, required=("定义",)):
     m = models()
     d = decision(route)
     return SearchPlan(
         d, "什么是光合作用", m.PlanningStatus.NORMAL, (), None, (query(),),
-        (), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[route],
+        tuple(required), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[route],
     )
 
 
@@ -79,11 +79,42 @@ def item(eid="E1", url="https://example.com/page", title="Title"):
 def bundle(evidence=(), state=EvidenceState.SUFFICIENT):
     m = models()
     p = plan()
+    supports_evidence = bool(evidence) and state not in {
+        EvidenceState.CONFLICTING,
+        EvidenceState.INSUFFICIENT,
+    }
+    assessments = tuple(
+        m.TopicAssessment(
+            topic.topic_id,
+            m.FreshnessEligibility.NOT_REQUIRED,
+            tuple(item.evidence_id for item in evidence) if supports_evidence else (),
+        )
+        for topic in p.required_topics
+        if topic.material
+    )
+    supported_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if assessment.supporting_evidence_ids
+    )
+    missing_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if not assessment.supporting_evidence_ids
+    )
+    missing = tuple(
+        topic.label
+        for topic in p.required_topics
+        if topic.material and topic.topic_id in missing_topic_ids
+    )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis((), (), False, None, ()),
+        m.EvidenceGapAnalysis(missing, (), False, None, ()),
         m.RepairPlan(False, (), None), 1, tuple(evidence), state,
-        (), (), (), (),
+        missing, (), (), (),
+        topic_assessments=assessments,
+        supported_topic_ids=supported_topic_ids,
+        missing_topic_ids=missing_topic_ids,
     )
 
 
@@ -537,7 +568,7 @@ class FailureFlowTests(unittest.TestCase):
 
     def test_malformed_draft_keeps_structured_conflict_and_limitation_disclosures(self):
         m = models()
-        p = plan(SearchTier.STANDARD)
+        p = plan(SearchTier.STANDARD, required=("版本",))
         conflict_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1", "E2"),
             m.EvidenceGapAnalysis((), (), False, None, ()),
@@ -546,7 +577,7 @@ class FailureFlowTests(unittest.TestCase):
                 item("E1", "https://a.example.com", title="Source A"),
                 item("E2", "https://b.example.com", title="Source B"),
             ),
-            m.EvidenceState.CONFLICTING, (), (), ("conflict:版本",),
+            m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",),
             ("weak_source_topics",),
             (
                 m.EvidenceConflict(
@@ -557,6 +588,15 @@ class FailureFlowTests(unittest.TestCase):
                     ),
                 ),
             ),
+            topic_assessments=(
+                m.TopicAssessment(
+                    "topic-1",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (),
+                ),
+            ),
+            supported_topic_ids=(),
+            missing_topic_ids=("topic-1",),
         )
         result = search_result(
             SearchTier.STANDARD,
@@ -807,12 +847,26 @@ class PartialConflictFlowTests(unittest.TestCase):
 
     def test_partial_bundle_answers_supported_only(self):
         m = models()
-        p = plan(SearchTier.STANDARD)
+        p = plan(SearchTier.STANDARD, required=("定义", "历史"))
         partial_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1",),
             m.EvidenceGapAnalysis(("历史",), (), False, None, ()),
             m.RepairPlan(False, (), None), 1, (item("E1", "https://a.example.com"),),
             m.EvidenceState.PARTIAL, ("历史",), (), (), (),
+            topic_assessments=(
+                m.TopicAssessment(
+                    "topic-1",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    ("E1",),
+                ),
+                m.TopicAssessment(
+                    "topic-2",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (),
+                ),
+            ),
+            supported_topic_ids=("topic-1",),
+            missing_topic_ids=("topic-2",),
         )
         result = search_result(SearchTier.STANDARD, partial_bundle, failure=m.SearchFailureCode.PARTIAL_EVIDENCE)
         reply = self._run_grounded(result)
@@ -823,13 +877,13 @@ class PartialConflictFlowTests(unittest.TestCase):
 
     def test_conflict_bundle_shows_sources(self):
         m = models()
-        p = plan(SearchTier.STANDARD)
+        p = plan(SearchTier.STANDARD, required=("版本",))
         conflict_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1", "E2"),
             m.EvidenceGapAnalysis((), (), False, None, ()),
             m.RepairPlan(False, (), None), 1,
             (item("E1", "https://a.example.com", title="Source A"), item("E2", "https://b.example.com", title="Source B")),
-            m.EvidenceState.CONFLICTING, (), (), ("conflict:版本",), (),
+            m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",), (),
             (
                 m.EvidenceConflict(
                     "conflict-1",
@@ -840,6 +894,15 @@ class PartialConflictFlowTests(unittest.TestCase):
                     ),
                 ),
             ),
+            topic_assessments=(
+                m.TopicAssessment(
+                    "topic-1",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (),
+                ),
+            ),
+            supported_topic_ids=(),
+            missing_topic_ids=("topic-1",),
         )
         result = search_result(SearchTier.STANDARD, conflict_bundle, failure=m.SearchFailureCode.SOURCE_CONFLICT)
         reply = self._run_grounded(result)

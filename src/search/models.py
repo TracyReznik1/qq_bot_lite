@@ -105,6 +105,13 @@ class FreshnessRequirement(StrEnum):
     VERSION = "version"
 
 
+class FreshnessEligibility(StrEnum):
+    NOT_REQUIRED = "not_required"
+    SATISFIED = "satisfied"
+    STALE = "stale"
+    UNKNOWN = "unknown"
+
+
 class Freshness(StrEnum):
     NONE = "none"
     LOW = "low"
@@ -907,6 +914,31 @@ class EvidenceGapAnalysis:
 
 
 @dataclass(frozen=True)
+class TopicAssessment:
+    topic_id: str
+    freshness: FreshnessEligibility
+    supporting_evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.topic_id, str) or not self.topic_id.strip():
+            raise ValueError("topic_id must be a non-blank string")
+        _require_enum(self.freshness, FreshnessEligibility, "freshness")
+        supporting_evidence_ids = _strings(
+            self.supporting_evidence_ids,
+            "supporting_evidence_ids",
+        )
+        if any(not evidence_id.strip() for evidence_id in supporting_evidence_ids):
+            raise ValueError("supporting_evidence_ids must be non-blank")
+        if len(set(supporting_evidence_ids)) != len(supporting_evidence_ids):
+            raise ValueError("supporting_evidence_ids must be unique")
+        _normalize_fields(
+            self,
+            topic_id=self.topic_id.strip(),
+            supporting_evidence_ids=supporting_evidence_ids,
+        )
+
+
+@dataclass(frozen=True)
 class EvidenceBundle:
     request_id: str
     decision: RetrievalDecision
@@ -923,14 +955,88 @@ class EvidenceBundle:
     conflict_groups: tuple[str, ...]
     limitations: tuple[str, ...]
     conflicts: tuple[EvidenceConflict, ...] = ()
+    topic_assessments: tuple[TopicAssessment, ...] = field(kw_only=True)
+    supported_topic_ids: tuple[str, ...] = field(kw_only=True)
+    missing_topic_ids: tuple[str, ...] = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _require_record(self.decision, RetrievalDecision, "decision")
         _require_record(self.plan, SearchPlan, "plan")
         _require_record(self.gap_analysis, EvidenceGapAnalysis, "gap_analysis")
         _require_record(self.repair_plan, RepairPlan, "repair_plan")
-        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"))
+        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"), topic_assessments=_records(self.topic_assessments, TopicAssessment, "topic_assessments"), supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"), missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
+        material_topic_ids = tuple(
+            topic.topic_id for topic in self.plan.required_topics if topic.material
+        )
+        material_topics = tuple(
+            topic for topic in self.plan.required_topics if topic.material
+        )
+        assessment_ids = tuple(
+            assessment.topic_id for assessment in self.topic_assessments
+        )
+        if assessment_ids != material_topic_ids:
+            raise ValueError("topic assessments must cover material topics in plan order")
+        assessment_by_id = {
+            assessment.topic_id: assessment for assessment in self.topic_assessments
+        }
+        expected_supported = tuple(
+            topic_id
+            for topic_id in material_topic_ids
+            if assessment_by_id[topic_id].supporting_evidence_ids
+        )
+        expected_missing = tuple(
+            topic_id for topic_id in material_topic_ids if topic_id not in expected_supported
+        )
+        if self.supported_topic_ids != expected_supported:
+            raise ValueError("supported topic ids must match topic assessments")
+        if self.missing_topic_ids != expected_missing:
+            raise ValueError("missing topic ids must match topic assessments")
+        expected_missing_claim_topics = tuple(
+            topic.label
+            for topic in material_topics
+            if topic.topic_id in expected_missing
+        )
+        if self.missing_claim_topics != expected_missing_claim_topics:
+            raise ValueError("missing claim topics must project missing topic ids")
+        for topic in material_topics:
+            assessment = assessment_by_id[topic.topic_id]
+            if topic.freshness_requirement is FreshnessRequirement.NOT_REQUIRED:
+                if assessment.freshness is not FreshnessEligibility.NOT_REQUIRED:
+                    raise ValueError("not-required topics require not-required freshness")
+            elif assessment.freshness is FreshnessEligibility.NOT_REQUIRED:
+                raise ValueError("freshness-constrained topics cannot be not-required")
+        if any(
+            assessment.freshness in {
+                FreshnessEligibility.STALE,
+                FreshnessEligibility.UNKNOWN,
+            }
+            and assessment.supporting_evidence_ids
+            for assessment in self.topic_assessments
+        ):
+            raise ValueError("stale or unknown topics cannot have supporting evidence")
+        evidence_by_id = {item.evidence_id: item for item in self.evidence_items}
+        if len(evidence_by_id) != len(self.evidence_items):
+            raise ValueError("bundle evidence ids must be unique")
+        for topic in material_topics:
+            assessment = assessment_by_id[topic.topic_id]
+            for evidence_id in assessment.supporting_evidence_ids:
+                item = evidence_by_id.get(evidence_id)
+                if item is None:
+                    raise ValueError("topic assessments must reference bundle evidence")
+                if not item.citable or not item.relevance_gate_passed:
+                    raise ValueError("topic support requires citable relevant evidence")
+                if topic.label not in item.supported_topics:
+                    raise ValueError("topic support must match the legacy label projection")
+        if self.evidence_state is EvidenceState.SUFFICIENT:
+            if self.missing_topic_ids or any(
+                assessment.freshness in {
+                    FreshnessEligibility.STALE,
+                    FreshnessEligibility.UNKNOWN,
+                }
+                for assessment in self.topic_assessments
+            ):
+                raise ValueError("sufficient evidence cannot have stale or unknown material topics")
 
 
 @dataclass(frozen=True)

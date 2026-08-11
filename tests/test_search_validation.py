@@ -67,14 +67,48 @@ def plan(required=("版本",)):
 
 def bundle(evidence=(), state=None, missing=()):
     m = models()
-    p = plan()
+    requested_missing = tuple(missing)
+    required = tuple(dict.fromkeys(("版本", *requested_missing)))
+    p = plan(required=required)
     if state is None:
-        state = EvidenceState.SUFFICIENT
+        state = EvidenceState.SUFFICIENT if evidence else EvidenceState.INSUFFICIENT
+    missing_labels = {
+        topic.label for topic in p.required_topics if topic.label in requested_missing
+    }
+    assessments = tuple(
+        m.TopicAssessment(
+            topic.topic_id,
+            m.FreshnessEligibility.NOT_REQUIRED,
+            tuple(e.evidence_id for e in evidence)
+            if evidence and topic.label not in missing_labels
+            else (),
+        )
+        for topic in p.required_topics
+        if topic.material
+    )
+    supported_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if assessment.supporting_evidence_ids
+    )
+    missing_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if not assessment.supporting_evidence_ids
+    )
+    actual_missing = tuple(
+        topic.label
+        for topic in p.required_topics
+        if topic.material and topic.topic_id in missing_topic_ids
+    )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(missing, (), False, None, ()),
+        m.EvidenceGapAnalysis(actual_missing, (), False, None, ()),
         m.RepairPlan(False, (), None), 1, tuple(evidence), state,
-        tuple(missing), (), (), (),
+        actual_missing, (), (), (),
+        topic_assessments=assessments,
+        supported_topic_ids=supported_topic_ids,
+        missing_topic_ids=missing_topic_ids,
     )
 
 

@@ -972,10 +972,26 @@ def _empty_bundle(
     retrieval_round_count: int = 1,
     limitation: str = "provider_failure",
 ) -> EvidenceBundle:
-    from src.search.models import EvidenceGapAnalysis, RepairPlan
-    missing = tuple(
-        topic.label for topic in plan.required_topics if topic.material
-    ) or ("material_claim",)
+    from src.search.models import (
+        EvidenceGapAnalysis,
+        FreshnessEligibility,
+        FreshnessRequirement,
+        RepairPlan,
+        TopicAssessment,
+    )
+    material_topics = tuple(topic for topic in plan.required_topics if topic.material)
+    missing = tuple(topic.label for topic in material_topics)
+    missing_topic_ids = tuple(topic.topic_id for topic in material_topics)
+    assessments = tuple(
+        TopicAssessment(
+            topic.topic_id,
+            FreshnessEligibility.NOT_REQUIRED
+            if topic.freshness_requirement is FreshnessRequirement.NOT_REQUIRED
+            else FreshnessEligibility.UNKNOWN,
+            (),
+        )
+        for topic in material_topics
+    )
     return EvidenceBundle(
         request_id="req-empty",
         decision=plan.decision,
@@ -991,6 +1007,9 @@ def _empty_bundle(
         weak_source_topics=(),
         conflict_groups=(),
         limitations=(limitation,),
+        topic_assessments=assessments,
+        supported_topic_ids=(),
+        missing_topic_ids=missing_topic_ids,
     )
 
 

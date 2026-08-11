@@ -81,12 +81,12 @@ def query():
     return SearchQuery("q1", SearchRoundKind.INITIAL, __import__("src.search.models", fromlist=["QueryPurpose"]).QueryPurpose.DIRECT, "q")
 
 
-def plan():
+def plan(required=("版本",)):
     m = models()
     d = decision()
     return SearchPlan(
         d, "当前版本是什么", m.PlanningStatus.NORMAL, (), None, (query(),),
-        (), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        tuple(required), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
     )
 
 
@@ -110,13 +110,50 @@ def bundle(
     limitations=(),
 ):
     m = models()
-    p = plan()
+    requested_missing = tuple(missing)
+    p = plan(tuple(dict.fromkeys(("版本", *requested_missing))))
+    supports_evidence = bool(evidence) and state not in {
+        EvidenceState.CONFLICTING,
+        EvidenceState.INSUFFICIENT,
+    }
+    missing_labels = {
+        topic.label for topic in p.required_topics if topic.label in requested_missing
+    }
+    assessments = tuple(
+        m.TopicAssessment(
+            topic.topic_id,
+            m.FreshnessEligibility.NOT_REQUIRED,
+            tuple(item.evidence_id for item in evidence)
+            if supports_evidence and topic.label not in missing_labels
+            else (),
+        )
+        for topic in p.required_topics
+        if topic.material
+    )
+    supported_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if assessment.supporting_evidence_ids
+    )
+    missing_topic_ids = tuple(
+        assessment.topic_id
+        for assessment in assessments
+        if not assessment.supporting_evidence_ids
+    )
+    actual_missing = tuple(
+        topic.label
+        for topic in p.required_topics
+        if topic.material and topic.topic_id in missing_topic_ids
+    )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(missing, (), False, None, ()),
+        m.EvidenceGapAnalysis(actual_missing, (), False, None, ()),
         m.RepairPlan(False, (), None), 1, tuple(evidence), state,
-        tuple(missing), (), tuple(conflicts), tuple(limitations),
+        actual_missing, (), tuple(conflicts), tuple(limitations),
         tuple(structured_conflicts),
+        topic_assessments=assessments,
+        supported_topic_ids=supported_topic_ids,
+        missing_topic_ids=missing_topic_ids,
     )
 
 
@@ -162,7 +199,12 @@ def high_consequence_result(evidence=None, failure=None):
         potential_harm=m.PotentialHarm.HIGH,
         final_reason_codes=(TriggerCode.HIGH_CONSEQUENCE_ACTION,),
     )
-    p = replace(plan(), decision=d, budget=m.DEFAULT_TIER_BUDGETS[SearchTier.DEEP])
+    source_plan = evidence.plan if evidence is not None else plan()
+    p = replace(
+        source_plan,
+        decision=d,
+        budget=m.DEFAULT_TIER_BUDGETS[SearchTier.DEEP],
+    )
     if evidence is not None:
         evidence = replace(evidence, decision=d, plan=p)
     if evidence is None and failure not in {None, SearchFailureCode.PROVIDER_NOT_CONFIGURED}:

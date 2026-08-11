@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import unittest
+from unittest import mock
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from itertools import permutations
@@ -17,6 +19,7 @@ from src.search.models import (
     Factuality,
     FetchedDocument,
     Freshness,
+    FreshnessEligibility,
     FreshnessRequirement,
     PlanningStatus,
     ProviderHit,
@@ -105,6 +108,105 @@ def material_topic_plan():
     )
 
 
+def topic(
+    topic_id,
+    label,
+    freshness_requirement=FreshnessRequirement.NOT_REQUIRED,
+    *,
+    material=True,
+    date_from=None,
+    date_to=None,
+    version_constraint=None,
+    source_requirement=SourceRequirement.ANY_RELEVANT,
+):
+    return RequiredTopic(
+        topic_id,
+        label,
+        material,
+        freshness_requirement,
+        date_from=date_from,
+        date_to=date_to,
+        version_constraint=version_constraint,
+        source_requirement=source_requirement,
+    )
+
+
+def topic_plan(*topics):
+    d = decision(SearchTier.STANDARD)
+    material_ids = tuple(item.topic_id for item in topics if item.material)
+    direct = SearchQuery(
+        "initial-1",
+        SearchRoundKind.INITIAL,
+        QueryPurpose.DIRECT,
+        "比较当前主题",
+        query_index=1,
+        target_topic_ids=material_ids,
+    )
+    return SearchPlan(
+        d,
+        "比较当前主题",
+        PlanningStatus.NORMAL,
+        (),
+        None,
+        (direct,),
+        tuple(topics),
+        frozenset(),
+        (),
+        _budget(SearchTier.STANDARD),
+    )
+
+
+def corroborated_topic_plan(label="dynamic"):
+    return topic_plan(
+        topic(
+            "topic-1",
+            label,
+            source_requirement=SourceRequirement.INDEPENDENT_CORROBORATION,
+        )
+    )
+
+
+def current_topic_plan(label="current status"):
+    return topic_plan(
+        topic(
+            "topic-1",
+            label,
+            FreshnessRequirement.CURRENT,
+        )
+    )
+
+
+def topic_judge_ok(
+    candidate_id="C1",
+    *,
+    supported_topic_ids=("topic-1",),
+    freshness_by_topic=None,
+    relation="primary",
+    conflict_key=None,
+    conflict_value=None,
+    conflict_relation=None,
+):
+    if freshness_by_topic is None:
+        freshness_by_topic = {
+            topic_id: "not_required" for topic_id in supported_topic_ids
+        }
+    if conflict_key is not None and conflict_relation is None:
+        conflict_relation = "contradicts"
+    return {
+        "candidate_id": candidate_id,
+        "relevance": "direct",
+        "source_relation": relation,
+        "publisher_entity_match": relation == "primary",
+        "ownership_basis": "publisher matches query entity" if relation == "primary" else None,
+        "publisher": None,
+        "supported_topic_ids": list(supported_topic_ids),
+        "freshness_by_topic": dict(freshness_by_topic),
+        "conflict_key": conflict_key,
+        "conflict_value": conflict_value,
+        "conflict_relation": conflict_relation,
+    }
+
+
 def _budget(route):
     m = __import__("src.search.models", fromlist=["DEFAULT_TIER_BUDGETS"])
     return m.DEFAULT_TIER_BUDGETS[route]
@@ -147,12 +249,29 @@ def judge_ok(
     candidate_id="C1",
     relevance="direct",
     relation="primary",
-    supported=("定义",),
+    supported=("topic-1",),
+    freshness_by_topic=None,
     conflict_key=None,
     conflict_value=None,
     conflict_relation=None,
     publisher=None,
 ):
+    # Existing test call sites name legacy topic labels.  This fixture emits
+    # only closed topic IDs; the two explicit material-topic fixtures retain
+    # their stable IDs while all single-topic legacy plans use topic-1.
+    topic_ids = tuple(
+        dict.fromkeys(
+            {"background": "topic-1", "core": "topic-2"}.get(
+                supported_topic,
+                "topic-1",
+            )
+            for supported_topic in supported
+        )
+    )
+    if freshness_by_topic is None:
+        freshness_by_topic = {
+            topic_id: "not_required" for topic_id in topic_ids
+        }
     if conflict_key is not None and conflict_relation is None:
         conflict_relation = "contradicts"
     return {
@@ -162,7 +281,8 @@ def judge_ok(
         "publisher_entity_match": relation == "primary",
         "ownership_basis": "publisher matches query entity" if relation == "primary" else None,
         "publisher": publisher,
-        "supported_topics": list(supported),
+        "supported_topic_ids": list(topic_ids),
+        "freshness_by_topic": dict(freshness_by_topic),
         "conflict_key": conflict_key,
         "conflict_value": conflict_value,
         "conflict_relation": conflict_relation,
@@ -212,7 +332,8 @@ class EvidenceAdmissionTests(unittest.TestCase):
                     "publisher_entity_match": False,
                     "ownership_basis": None,
                     "publisher": None,
-                    "supported_topics": ["定义"],
+                    "supported_topic_ids": ["topic-1"],
+                    "freshness_by_topic": {"topic-1": "not_required"},
                     "conflict_key": None,
                     "conflict_value": None,
                     "conflict_relation": None,
@@ -256,12 +377,30 @@ class EvidenceAdmissionTests(unittest.TestCase):
         assembler = self.module.EvidenceAssembler(RecordingJudge())
         assembler.assemble(plan(required_topics=("定义", "历史")), (candidate(),), timeout_seconds=0.4)
 
-        self.assertEqual(calls, [("什么是光合作用", ("定义", "历史"), 0.4, 1)])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "什么是光合作用",
+                    (
+                        {"topic_id": "topic-1", "label": "定义"},
+                        {"topic_id": "topic-2", "label": "历史"},
+                    ),
+                    0.4,
+                    1,
+                )
+            ],
+        )
 
     def test_partial_direct_judge_row_is_rejected_as_a_whole(self):
         class PartialJudge:
             def judge(self, *_args, **_kwargs):
-                return {"C1": {"relevance": "direct", "supported_topics": ["定义"]}}
+                return {
+                    "C1": {
+                        "relevance": "direct",
+                        "supported_topic_ids": ["topic-1"],
+                    }
+                }
 
         bundle = self.module.EvidenceAssembler(PartialJudge()).assemble(
             plan(required_topics=("定义",)), (candidate(),)
@@ -304,6 +443,99 @@ class EvidenceAdmissionTests(unittest.TestCase):
 
         self.assertEqual(bundle.evidence_items, ())
         self.assertEqual(bundle.conflicts, ())
+
+
+class EvidenceJudgeSchemaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = evidence_module()
+
+    def test_llm_judge_accepts_only_closed_outer_topic_id_schema(self):
+        row = topic_judge_ok(
+            "C1",
+            freshness_by_topic={"topic-1": "satisfied"},
+        )
+        calls = []
+
+        class StaticLLM:
+            def chat(self, messages, **kwargs):
+                calls.append((messages, kwargs))
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "content": json.dumps(
+                            {"candidates": {"C1": row}, "gap_hints": []}
+                        )
+                    },
+                )()
+
+        result = self.module.LLMEvidenceJudge(StaticLLM()).judge(
+            "question",
+            (candidate(),),
+            required_topics=({"topic_id": "topic-1", "label": "release"},),
+        )
+
+        self.assertEqual({"C1": row}, result)
+        payload = json.loads(calls[0][0][1]["content"])
+        self.assertEqual(
+            [{"topic_id": "topic-1", "label": "release"}],
+            payload["required_topics"],
+        )
+
+    def test_llm_judge_rejects_extra_or_partial_closed_schema_rows(self):
+        valid = topic_judge_ok("C1")
+        invalid_payloads = (
+            {"candidates": {"C1": valid}, "gap_hints": [], "extra": True},
+            {
+                "candidates": {"C1": valid | {"unreviewed_field": True}},
+                "gap_hints": [],
+            },
+            {"candidates": {"C1": {key: value for key, value in valid.items() if key != "candidate_id"}}, "gap_hints": []},
+            {"candidates": {"C1": {"candidate_id": "C1", "relevance": "direct"}}, "gap_hints": []},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                class StaticLLM:
+                    def chat(self, *_args, **_kwargs):
+                        return type(
+                            "Response",
+                            (),
+                            {"content": json.dumps(payload)},
+                        )()
+
+                result = self.module.LLMEvidenceJudge(StaticLLM()).judge(
+                    "question",
+                    (candidate(),),
+                    required_topics=({"topic_id": "topic-1", "label": "release"},),
+                )
+                self.assertEqual({}, result)
+
+    def test_llm_judge_keeps_valid_rows_when_another_row_fails_closed(self):
+        valid = topic_judge_ok("C1")
+        invalid = topic_judge_ok("C2") | {"relevance": "contextual"}
+
+        class StaticLLM:
+            def chat(self, *_args, **_kwargs):
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "content": json.dumps(
+                            {
+                                "candidates": {"C1": valid, "C2": invalid},
+                                "gap_hints": [],
+                            }
+                        )
+                    },
+                )()
+
+        result = self.module.LLMEvidenceJudge(StaticLLM()).judge(
+            "question",
+            (candidate(), candidate(url="https://two.example/release")),
+            required_topics=({"topic_id": "topic-1", "label": "release"},),
+        )
+
+        self.assertEqual({"C1": valid}, result)
 
 
 class MaterialTopicEvidenceTests(unittest.TestCase):
@@ -410,6 +642,350 @@ class MaterialTopicEvidenceTests(unittest.TestCase):
         self.assertIn("shared", repair.repair_query.text)
 
 
+class TopicFreshnessSufficiencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = evidence_module()
+
+    def test_two_fresh_topics_and_one_stale_topic_are_partial(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "A",
+                FreshnessRequirement.CURRENT,
+                date_from=date(2026, 8, 1),
+            ),
+            topic(
+                "topic-2",
+                "B",
+                FreshnessRequirement.CURRENT,
+                date_from=date(2026, 8, 1),
+            ),
+            topic(
+                "topic-3",
+                "C",
+                FreshnessRequirement.CURRENT,
+                date_from=date(2026, 8, 1),
+            ),
+        )
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {
+                    "C1": topic_judge_ok(
+                        "C1",
+                        supported_topic_ids=("topic-1",),
+                        freshness_by_topic={"topic-1": "satisfied"},
+                    ),
+                    "C2": topic_judge_ok(
+                        "C2",
+                        supported_topic_ids=("topic-2",),
+                        freshness_by_topic={"topic-2": "satisfied"},
+                    ),
+                    "C3": topic_judge_ok(
+                        "C3",
+                        supported_topic_ids=("topic-3",),
+                        freshness_by_topic={"topic-3": "satisfied"},
+                    ),
+                }
+            )
+        ).assemble(
+            search_plan,
+            (
+                candidate(url="https://a.example/fresh", published=datetime(2026, 8, 9, tzinfo=timezone.utc)),
+                candidate(url="https://b.example/fresh", published=datetime(2026, 8, 9, tzinfo=timezone.utc)),
+                candidate(url="https://c.example/stale", published=datetime(2025, 1, 1, tzinfo=timezone.utc)),
+            ),
+        )
+
+        eligibility = getattr(importlib.import_module("src.search.models"), "FreshnessEligibility")
+        self.assertIs(bundle.evidence_state, EvidenceState.PARTIAL)
+        self.assertEqual(("topic-1", "topic-2"), bundle.supported_topic_ids)
+        self.assertEqual(("topic-3",), bundle.missing_topic_ids)
+        self.assertIs(eligibility.STALE, bundle.topic_assessments[2].freshness)
+
+    def test_unknown_timestamp_is_missing_even_when_judge_claims_current(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "current release",
+                FreshnessRequirement.CURRENT,
+                date_from=date(2026, 8, 1),
+            )
+        )
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {
+                    "C1": topic_judge_ok(
+                        "C1",
+                        freshness_by_topic={"topic-1": "satisfied"},
+                    )
+                }
+            )
+        ).assemble(search_plan, (candidate(published=None),))
+
+        eligibility = getattr(importlib.import_module("src.search.models"), "FreshnessEligibility")
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(("topic-1",), bundle.missing_topic_ids)
+        self.assertIs(eligibility.UNKNOWN, bundle.topic_assessments[0].freshness)
+
+    def test_date_after_topic_upper_bound_is_unknown(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "as-of release",
+                FreshnessRequirement.AS_OF,
+                date_to=date(2026, 8, 8),
+            )
+        )
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {
+                    "C1": topic_judge_ok(
+                        "C1",
+                        freshness_by_topic={"topic-1": "satisfied"},
+                    )
+                }
+            )
+        ).assemble(
+            search_plan,
+            (candidate(published=datetime(2026, 8, 9, tzinfo=timezone.utc)),),
+        )
+
+        eligibility = getattr(importlib.import_module("src.search.models"), "FreshnessEligibility")
+        self.assertIs(eligibility.UNKNOWN, bundle.topic_assessments[0].freshness)
+        self.assertEqual(("topic-1",), bundle.missing_topic_ids)
+
+    def test_one_relevant_source_can_satisfy_any_relevant_topic(self):
+        search_plan = topic_plan(topic("topic-1", "release"))
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": topic_judge_ok("C1")})
+        ).assemble(search_plan, (candidate(),))
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual(("topic-1",), bundle.supported_topic_ids)
+
+    def test_one_source_cannot_satisfy_independent_corroboration(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "release",
+                source_requirement=SourceRequirement.INDEPENDENT_CORROBORATION,
+            )
+        )
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": topic_judge_ok("C1")})
+        ).assemble(search_plan, (candidate(),))
+
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(("topic-1",), bundle.missing_topic_ids)
+
+    def test_two_independence_groups_satisfy_independent_corroboration(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "release",
+                source_requirement=SourceRequirement.INDEPENDENT_CORROBORATION,
+            )
+        )
+        bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {"C1": topic_judge_ok("C1"), "C2": topic_judge_ok("C2")}
+            )
+        ).assemble(
+            search_plan,
+            (
+                candidate(url="https://one.example/release", content="one direct release report"),
+                candidate(url="https://two.example/release", content="two independent release report"),
+            ),
+        )
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual(("topic-1",), bundle.supported_topic_ids)
+
+    def test_same_or_empty_independence_groups_cannot_corroborate(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "release",
+                source_requirement=SourceRequirement.INDEPENDENT_CORROBORATION,
+            )
+        )
+        judged = StaticEvidenceJudge(
+            {"C1": topic_judge_ok("C1"), "C2": topic_judge_ok("C2")}
+        )
+        same_group = self.module.EvidenceAssembler(judged).assemble(
+            search_plan,
+            (
+                candidate(url="https://same.example/one", content="one direct release report"),
+                candidate(url="https://same.example/two", content="two direct release report"),
+            ),
+        )
+        self.assertIs(same_group.evidence_state, EvidenceState.INSUFFICIENT)
+
+        def empty_groups(items, _provenance):
+            return [replace(item, independence_group=None) for item in items]
+
+        with mock.patch.object(
+            self.module,
+            "_assign_independence_groups",
+            side_effect=empty_groups,
+        ):
+            empty_group = self.module.EvidenceAssembler(judged).assemble(
+                search_plan,
+                (
+                    candidate(url="https://one.example/release", content="one direct release report"),
+                    candidate(url="https://two.example/release", content="two independent release report"),
+                ),
+            )
+        self.assertIs(empty_group.evidence_state, EvidenceState.INSUFFICIENT)
+
+    def test_material_conflict_precedes_partial_and_edge_conflict_does_not(self):
+        material = topic_plan(
+            topic("topic-1", "release"),
+            topic("topic-2", "history"),
+        )
+        material_bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {
+                    "C1": topic_judge_ok(
+                        "C1",
+                        conflict_key="version",
+                        conflict_value="1.0",
+                    ),
+                    "C2": topic_judge_ok(
+                        "C2",
+                        conflict_key="version",
+                        conflict_value="2.0",
+                    ),
+                    "C3": topic_judge_ok(
+                        "C3",
+                        supported_topic_ids=("topic-2",),
+                    ),
+                }
+            )
+        ).assemble(
+            material,
+            (
+                candidate(url="https://one.example/release"),
+                candidate(url="https://two.example/release"),
+                candidate(url="https://three.example/history"),
+            ),
+        )
+        self.assertIs(material_bundle.evidence_state, EvidenceState.CONFLICTING)
+        self.assertEqual(("topic-2",), material_bundle.supported_topic_ids)
+
+        edge = topic_plan(
+            topic("topic-1", "release"),
+            topic("topic-2", "background", material=False),
+        )
+        edge_bundle = self.module.EvidenceAssembler(
+            StaticEvidenceJudge(
+                {
+                    "C1": topic_judge_ok(
+                        "C1",
+                        supported_topic_ids=("topic-2",),
+                        conflict_key="background-version",
+                        conflict_value="1.0",
+                    ),
+                    "C2": topic_judge_ok(
+                        "C2",
+                        supported_topic_ids=("topic-2",),
+                        conflict_key="background-version",
+                        conflict_value="2.0",
+                    ),
+                    "C3": topic_judge_ok("C3"),
+                }
+            )
+        ).assemble(
+            edge,
+            (
+                candidate(url="https://one.example/background"),
+                candidate(url="https://two.example/background"),
+                candidate(url="https://three.example/release"),
+            ),
+        )
+        self.assertIs(edge_bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual((), edge_bundle.conflict_groups)
+
+    def test_version_literal_has_matching_mismatching_and_absent_outcomes(self):
+        search_plan = topic_plan(
+            topic(
+                "topic-1",
+                "Python version",
+                FreshnessRequirement.VERSION,
+                version_constraint="3.13",
+            )
+        )
+        eligibility = getattr(importlib.import_module("src.search.models"), "FreshnessEligibility")
+        cases = (
+            ("Python 3.13 release", "supports 3.13", eligibility.SATISFIED),
+            ("Python 3.12 release", "supports 3.12", eligibility.STALE),
+            ("Python 13.13 release", "supports 13.13", eligibility.STALE),
+            ("Python 3.130 release", "supports 3.130", eligibility.STALE),
+            ("Python3.13 release", "product name may precede the exact version", eligibility.SATISFIED),
+            ("Python release", "release notes", eligibility.UNKNOWN),
+        )
+        for title, content, expected in cases:
+            with self.subTest(title=title):
+                bundle = self.module.EvidenceAssembler(
+                    StaticEvidenceJudge(
+                        {
+                            "C1": topic_judge_ok(
+                                "C1",
+                                freshness_by_topic={"topic-1": "satisfied"},
+                            )
+                        }
+                    )
+                ).assemble(search_plan, (candidate(title=title, content=content),))
+                self.assertIs(expected, bundle.topic_assessments[0].freshness)
+
+    def test_legacy_tier_risk_and_freshness_do_not_change_admission_or_state(self):
+        search_plan = topic_plan(topic("topic-1", "release"))
+        legacy_variant = replace(
+            search_plan,
+            decision=replace(
+                search_plan.decision,
+                route=SearchTier.DEEP,
+                program_minimum_tier=SearchTier.DEEP,
+                risk=RiskLevel.HIGH,
+                freshness=Freshness.HIGH,
+            ),
+        )
+        weak = replace(
+            candidate(content="release snippet"),
+            extraction_status="search_result_snippet_after_fetch_failure",
+            content_reads_consumed=1,
+        )
+        judge = StaticEvidenceJudge({"C1": topic_judge_ok("C1")})
+        baseline = self.module.EvidenceAssembler(judge).assemble(search_plan, (weak,))
+        variant = self.module.EvidenceAssembler(judge).assemble(legacy_variant, (weak,))
+
+        self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertIs(variant.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(baseline.supported_topic_ids, variant.supported_topic_ids)
+        self.assertFalse(baseline.evidence_items[0].citable)
+        self.assertFalse(variant.evidence_items[0].citable)
+
+    def test_judge_rejects_unknown_topic_or_freshness_values_fail_closed(self):
+        search_plan = topic_plan(topic("topic-1", "release"))
+        invalid_rows = (
+            topic_judge_ok("C1", supported_topic_ids=("topic-99",)),
+            topic_judge_ok("C1", freshness_by_topic={"topic-1": "future"}),
+            {
+                "candidate_id": "C1",
+                "relevance": "direct",
+                "supported_topic_ids": ["topic-1"],
+            },
+            topic_judge_ok("C1") | {"relevance": "contextual"},
+        )
+        for row in invalid_rows:
+            with self.subTest(row=row):
+                bundle = self.module.EvidenceAssembler(
+                    StaticEvidenceJudge({"C1": row})
+                ).assemble(search_plan, (candidate(),))
+                self.assertEqual((), bundle.evidence_items)
+                self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+
+
 class EvidenceDedupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = evidence_module()
@@ -469,14 +1045,14 @@ class EvidenceDedupTests(unittest.TestCase):
             )
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("定义",), route=SearchTier.DEEP),
+            corroborated_topic_plan("定义"),
             deep_candidates,
         )
         self.assertEqual(
             bundle.evidence_items[0].independence_group,
             bundle.evidence_items[1].independence_group,
         )
-        self.assertIn("single_source_authority", bundle.limitations)
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
     def test_same_registrable_parent_subdomains_cannot_corroborate(self):
         judge = StaticEvidenceJudge(
@@ -499,14 +1075,14 @@ class EvidenceDedupTests(unittest.TestCase):
         )
 
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+            corroborated_topic_plan("动态"), candidates
         )
 
         self.assertEqual(
             bundle.evidence_items[0].independence_group,
             bundle.evidence_items[1].independence_group,
         )
-        self.assertIn("single_source_authority", bundle.limitations)
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
     def test_same_publisher_across_domains_cannot_corroborate(self):
         judge = StaticEvidenceJudge(
@@ -533,7 +1109,7 @@ class EvidenceDedupTests(unittest.TestCase):
         )
 
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+            corroborated_topic_plan("动态"), candidates
         )
 
         self.assertEqual(
@@ -544,7 +1120,7 @@ class EvidenceDedupTests(unittest.TestCase):
             bundle.evidence_items[0].independence_group,
             bundle.evidence_items[1].independence_group,
         )
-        self.assertIn("single_source_authority", bundle.limitations)
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
     def test_domain_to_publisher_bridge_is_transitive_in_every_order(self):
         specs = (
@@ -561,7 +1137,7 @@ class EvidenceDedupTests(unittest.TestCase):
                     len({item.independence_group for item in bundle.evidence_items}),
                     1,
                 )
-                self.assertIn("single_source_authority", bundle.limitations)
+                self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
     def test_publisher_to_canonical_marker_bridge_is_transitive_in_every_order(self):
         specs = (
@@ -641,7 +1217,7 @@ class EvidenceDedupTests(unittest.TestCase):
                     len({item.independence_group for item in bundle.evidence_items}),
                     1,
                 )
-                self.assertIn("single_source_authority", bundle.limitations)
+                self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
     def test_publisher_nfc_normalization_preserves_meaningful_distinctions(self):
         distinct_publishers = (
@@ -672,7 +1248,7 @@ class EvidenceDedupTests(unittest.TestCase):
                     len({item.independence_group for item in bundle.evidence_items}),
                     2,
                 )
-                self.assertNotIn("single_source_authority", bundle.limitations)
+                self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
 
     def test_provenance_markers_use_nfc_without_nfkc_compatibility_folding(self):
         nfc = "ガイド社"
@@ -747,7 +1323,7 @@ class EvidenceDedupTests(unittest.TestCase):
             for url, _publisher, flags, text in specs
         )
         return self.module.EvidenceAssembler(StaticEvidenceJudge(judged)).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP),
+            corroborated_topic_plan("动态"),
             candidates,
         )
 
@@ -838,7 +1414,7 @@ class EvidenceStateTests(unittest.TestCase):
         self.assertEqual(item.published_at, published)
         self.assertIsNotNone(item.retrieved_at)
 
-    def test_single_source_authority_limitation_recorded(self):
+    def test_single_source_does_not_meet_independent_corroboration(self):
         judge = StaticEvidenceJudge(
             {"C1": judge_ok("C1", supported=("动态",), relation="primary")}
         )
@@ -850,13 +1426,13 @@ class EvidenceStateTests(unittest.TestCase):
             content_reads_consumed=1,
         )
         bundle = assembler.assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP),
+            corroborated_topic_plan("动态"),
             (authoritative,),
         )
-        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
-        self.assertTrue(any("single_source" in limitation for limitation in bundle.limitations))
+        self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(("topic-1",), bundle.missing_topic_ids)
 
-    def test_deep_requires_primary_plus_genuinely_independent_corroboration(self):
+    def test_independent_corroboration_accepts_distinct_groups(self):
         judge = StaticEvidenceJudge(
             {
                 "C1": judge_ok("C1", supported=("动态",), relation="primary"),
@@ -876,12 +1452,15 @@ class EvidenceStateTests(unittest.TestCase):
             )
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+            corroborated_topic_plan("动态"), candidates
         )
         self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
-        self.assertNotIn("single_source_authority", bundle.limitations)
+        self.assertNotEqual(
+            bundle.evidence_items[0].independence_group,
+            bundle.evidence_items[1].independence_group,
+        )
 
-    def test_deep_two_independent_secondary_sources_do_not_replace_primary(self):
+    def test_independent_secondary_sources_meet_corroboration(self):
         judge = StaticEvidenceJudge(
             {
                 "C1": judge_ok("C1", supported=("动态",), relation="independent"),
@@ -898,17 +1477,22 @@ class EvidenceStateTests(unittest.TestCase):
             for url in ("https://a.example/status", "https://b.example/report")
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP), candidates
+            corroborated_topic_plan("动态"), candidates
         )
-        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
 
-    def test_ddgs_fallback_snippet_alone_cannot_meet_dynamic_topic(self):
+    def test_current_topic_requires_judged_current_freshness(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("动态",))}
+            {
+                "C1": topic_judge_ok(
+                    "C1",
+                    freshness_by_topic={"topic-1": "unknown"},
+                )
+            }
         )
         assembler = self.module.EvidenceAssembler(judge)
         bundle = assembler.assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP),
+            current_topic_plan("动态"),
             (
                 candidate(
                     provider="ddgs",
@@ -918,8 +1502,9 @@ class EvidenceStateTests(unittest.TestCase):
             ),
         )
         self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertIs(bundle.topic_assessments[0].freshness, FreshnessEligibility.UNKNOWN)
 
-    def test_tavily_snippet_after_failed_fetch_is_not_strong_dynamic_support(self):
+    def test_failed_fetch_snippet_is_not_citable_even_when_current_is_satisfied(self):
         failed_document = FetchedDocument(
             "https://tavily.example/status",
             "https://tavily.example/status",
@@ -936,18 +1521,25 @@ class EvidenceStateTests(unittest.TestCase):
             content_reads_consumed=1,
         )
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("动态",), relation="primary")}
+            {
+                "C1": topic_judge_ok(
+                    "C1",
+                    freshness_by_topic={"topic-1": "satisfied"},
+                )
+            }
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("动态",), route=SearchTier.DEEP), (weak,)
+            current_topic_plan("动态"), (weak,)
         )
         self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertFalse(bundle.evidence_items[0].citable)
+        self.assertIs(bundle.topic_assessments[0].freshness, FreshnessEligibility.SATISFIED)
 
-    def test_standard_high_risk_failed_fetch_snippet_cannot_satisfy_topic(self):
-        risky_plan = plan(required_topics=("剂量",), route=SearchTier.STANDARD)
+    def test_risk_does_not_change_failed_fetch_snippet_admission(self):
+        baseline_plan = topic_plan(topic("topic-1", "剂量"))
         risky_plan = replace(
-            risky_plan,
-            decision=replace(risky_plan.decision, risk=RiskLevel.HIGH),
+            baseline_plan,
+            decision=replace(baseline_plan.decision, risk=RiskLevel.HIGH),
         )
         weak = replace(
             candidate(content="药物剂量搜索片段"),
@@ -955,19 +1547,23 @@ class EvidenceStateTests(unittest.TestCase):
             content_reads_consumed=1,
         )
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("剂量",), relation="primary")}
+            {"C1": topic_judge_ok("C1")}
         )
 
-        bundle = self.module.EvidenceAssembler(judge).assemble(risky_plan, (weak,))
+        baseline = self.module.EvidenceAssembler(judge).assemble(baseline_plan, (weak,))
+        high_risk = self.module.EvidenceAssembler(judge).assemble(risky_plan, (weak,))
 
-        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
-        self.assertIn("剂量", bundle.missing_claim_topics)
+        self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertIs(high_risk.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(baseline.supported_topic_ids, high_risk.supported_topic_ids)
+        self.assertFalse(baseline.evidence_items[0].citable)
+        self.assertFalse(high_risk.evidence_items[0].citable)
 
-    def test_standard_high_freshness_failed_fetch_snippet_cannot_satisfy_topic(self):
-        dynamic_plan = plan(required_topics=("当前版本",), route=SearchTier.STANDARD)
-        dynamic_plan = replace(
-            dynamic_plan,
-            decision=replace(dynamic_plan.decision, freshness=Freshness.HIGH),
+    def test_legacy_freshness_metadata_does_not_change_current_topic_admission(self):
+        current_plan = current_topic_plan("当前版本")
+        legacy_variant = replace(
+            current_plan,
+            decision=replace(current_plan.decision, freshness=Freshness.HIGH),
         )
         weak = replace(
             candidate(content="当前版本是 2.0 的搜索片段"),
@@ -975,13 +1571,20 @@ class EvidenceStateTests(unittest.TestCase):
             content_reads_consumed=1,
         )
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("当前版本",), relation="primary")}
+            {
+                "C1": topic_judge_ok(
+                    "C1",
+                    freshness_by_topic={"topic-1": "satisfied"},
+                )
+            }
         )
 
-        bundle = self.module.EvidenceAssembler(judge).assemble(dynamic_plan, (weak,))
+        baseline = self.module.EvidenceAssembler(judge).assemble(current_plan, (weak,))
+        variant = self.module.EvidenceAssembler(judge).assemble(legacy_variant, (weak,))
 
-        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
-        self.assertIn("当前版本", bundle.missing_claim_topics)
+        self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertIs(variant.evidence_state, EvidenceState.INSUFFICIENT)
+        self.assertEqual(baseline.supported_topic_ids, variant.supported_topic_ids)
 
     def test_two_weak_dynamic_snippets_cannot_form_material_conflict(self):
         weak_candidates = tuple(
@@ -997,17 +1600,31 @@ class EvidenceStateTests(unittest.TestCase):
         )
         judge = StaticEvidenceJudge(
             {
-                "C1": judge_ok(
-                    "C1", supported=("当前版本",), conflict_key="version", conflict_value="1.0"
+                "C1": topic_judge_ok(
+                    "C1",
+                    freshness_by_topic={"topic-1": "satisfied"},
+                    conflict_key="version",
+                    conflict_value="1.0",
                 ),
-                "C2": judge_ok(
-                    "C2", supported=("当前版本",), conflict_key="version", conflict_value="2.0"
+                "C2": topic_judge_ok(
+                    "C2",
+                    freshness_by_topic={"topic-1": "satisfied"},
+                    conflict_key="version",
+                    conflict_value="2.0",
                 ),
             }
         )
 
+        version_plan = topic_plan(
+            topic(
+                "topic-1",
+                "当前版本",
+                FreshnessRequirement.VERSION,
+                version_constraint="2.0",
+            )
+        )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            plan(required_topics=("当前版本",), route=SearchTier.DEEP), weak_candidates
+            version_plan, weak_candidates
         )
 
         self.assertNotEqual(bundle.evidence_state, EvidenceState.CONFLICTING)
@@ -1032,7 +1649,7 @@ class EvidenceStateTests(unittest.TestCase):
 
     def test_broad_subtopic_cannot_satisfy_composite_required_topic(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("Go",), relation="primary")}
+            {"C1": topic_judge_ok("C1", supported_topic_ids=())}
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("Rust 和 Go 的并发模型差异",)),
@@ -1044,7 +1661,7 @@ class EvidenceStateTests(unittest.TestCase):
 
     def test_overlapping_product_name_is_not_a_topic_alias(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("JavaScript",), relation="primary")}
+            {"C1": topic_judge_ok("C1", supported_topic_ids=())}
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("Java",)),
@@ -1056,7 +1673,7 @@ class EvidenceStateTests(unittest.TestCase):
 
     def test_cjk_narrow_label_cannot_satisfy_full_required_topic(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("苹果",), relation="primary")}
+            {"C1": topic_judge_ok("C1", supported_topic_ids=())}
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("苹果公司的季度营收",)),
@@ -1068,7 +1685,7 @@ class EvidenceStateTests(unittest.TestCase):
 
     def test_japanese_narrow_label_cannot_satisfy_full_required_topic(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", supported=("東京大学",), relation="primary")}
+            {"C1": topic_judge_ok("C1", supported_topic_ids=())}
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
             plan(required_topics=("東京大学の入学要件",)),
@@ -1091,7 +1708,7 @@ class EvidenceStateTests(unittest.TestCase):
         for required, supported in unequal_labels:
             with self.subTest(required=required, supported=supported):
                 judge = StaticEvidenceJudge(
-                    {"C1": judge_ok("C1", supported=(supported,), relation="primary")}
+                    {"C1": topic_judge_ok("C1", supported_topic_ids=())}
                 )
                 bundle = self.module.EvidenceAssembler(judge).assemble(
                     plan(required_topics=(required,)),

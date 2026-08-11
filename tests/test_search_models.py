@@ -67,7 +67,7 @@ class SearchModelFixtures:
             "e1", "q1", "tavily", "title", "https://example.invalid",
             None, "example.invalid", "Example", m.SourceRelation.PRIMARY,
             None, None, None, "excerpt", m.ExcerptOrigin.PROVIDER_SNIPPET,
-            "ok", 1.0, 1.0, True, m.Freshness.NONE, True, (), (), "source-1",
+            "ok", 1.0, 1.0, True, m.Freshness.NONE, True, (), ("question",), "source-1",
         )
 
     def gap_analysis(self):
@@ -75,10 +75,22 @@ class SearchModelFixtures:
 
     def bundle(self):
         m = self.m
+        plan = self.plan()
+        topic = plan.required_topics[0]
         return m.EvidenceBundle(
-            "req-1", self.decision(), self.plan(), (), (), self.gap_analysis(),
+            "req-1", self.decision(), plan, (), (),
+            m.EvidenceGapAnalysis((topic.label,), (), False, None, ()),
             self.repair_plan(), 1, (), m.EvidenceState.INSUFFICIENT,
-            (), (), (), (),
+            (topic.label,), (), (), (),
+            topic_assessments=(
+                m.TopicAssessment(
+                    topic.topic_id,
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (),
+                ),
+            ),
+            supported_topic_ids=(),
+            missing_topic_ids=(topic.topic_id,),
         )
 
     def document(self):
@@ -170,6 +182,7 @@ class SearchModelContractTests(unittest.TestCase):
             },
             "Factuality": {"non_factual", "factual", "mixed", "ambiguous"},
             "Freshness": {"none", "low", "high"},
+            "FreshnessEligibility": {"not_required", "satisfied", "stale", "unknown"},
             "RiskLevel": {"low", "medium", "high"},
             "Actionability": {"none", "general", "personalized"},
             "PotentialHarm": {"none", "low", "high"},
@@ -430,6 +443,16 @@ class SearchModelContractTests(unittest.TestCase):
             initial_evidence_ids=(evidence.evidence_id,),
             evidence_items=(evidence,),
             evidence_state=m.EvidenceState.SUFFICIENT,
+            missing_claim_topics=(),
+            topic_assessments=(
+                m.TopicAssessment(
+                    "topic-1",
+                    m.FreshnessEligibility.NOT_REQUIRED,
+                    (evidence.evidence_id,),
+                ),
+            ),
+            supported_topic_ids=("topic-1",),
+            missing_topic_ids=(),
         )
         result = m.SearchPipelineResult(
             fixtures.decision(),
@@ -1222,6 +1245,178 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
             self._plan(m, topics=(self._topic(m),), queries=(legacy_query,))
         with self.assertRaises((TypeError, ValueError)):
             self._plan(m, topics=("legacy label", self._topic(m)))
+
+
+class TopicAssessmentContractTests(unittest.TestCase):
+    @staticmethod
+    def _plan_with_topic(m, topic):
+        decision = SearchModelFixtures(m).decision()
+        return m.SearchPlan(
+            decision,
+            "question",
+            m.PlanningStatus.NORMAL,
+            (),
+            None,
+            (
+                m.SearchQuery(
+                    "initial-1",
+                    m.SearchRoundKind.INITIAL,
+                    m.QueryPurpose.DIRECT,
+                    "question",
+                    query_index=1,
+                    target_topic_ids=("topic-1",),
+                ),
+            ),
+            (topic,),
+            frozenset(),
+            (),
+            m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT],
+        )
+
+    def test_assessment_freshness_cannot_misrepresent_topic_requirement(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        cases = (
+            (
+                m.RequiredTopic(
+                    "topic-1",
+                    "current",
+                    True,
+                    m.FreshnessRequirement.CURRENT,
+                ),
+                m.FreshnessEligibility.NOT_REQUIRED,
+            ),
+            (
+                m.RequiredTopic(
+                    "topic-1",
+                    "version",
+                    True,
+                    m.FreshnessRequirement.VERSION,
+                    version_constraint="3.13",
+                ),
+                m.FreshnessEligibility.NOT_REQUIRED,
+            ),
+            (
+                m.RequiredTopic(
+                    "topic-1",
+                    "stable",
+                    True,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                ),
+                m.FreshnessEligibility.SATISFIED,
+            ),
+        )
+        for topic, freshness in cases:
+            with self.subTest(topic=topic.label, freshness=freshness):
+                plan = self._plan_with_topic(m, topic)
+                with self.assertRaises(ValueError):
+                    replace(
+                        fixtures.bundle(),
+                        decision=plan.decision,
+                        plan=plan,
+                        topic_assessments=(
+                            m.TopicAssessment("topic-1", freshness, ()),
+                        ),
+                        supported_topic_ids=(),
+                        missing_topic_ids=("topic-1",),
+                        missing_claim_topics=(topic.label,),
+                    )
+
+    def test_topic_support_requires_citable_relevance_gated_evidence(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        for evidence in (
+            replace(fixtures.evidence_item(), citable=False),
+            replace(fixtures.evidence_item(), relevance_gate_passed=False),
+        ):
+            with self.subTest(
+                citable=evidence.citable,
+                relevance_gate_passed=evidence.relevance_gate_passed,
+            ):
+                with self.assertRaises(ValueError):
+                    replace(
+                        fixtures.bundle(),
+                        initial_evidence_ids=(evidence.evidence_id,),
+            evidence_items=(evidence,),
+            evidence_state=m.EvidenceState.SUFFICIENT,
+            missing_claim_topics=(),
+            topic_assessments=(
+                            m.TopicAssessment(
+                                "topic-1",
+                                m.FreshnessEligibility.NOT_REQUIRED,
+                                (evidence.evidence_id,),
+                            ),
+                        ),
+                        supported_topic_ids=("topic-1",),
+                        missing_topic_ids=(),
+                    )
+
+    def test_supporting_evidence_ids_and_bundle_evidence_ids_must_be_unique(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        with self.assertRaises(ValueError):
+            m.TopicAssessment(
+                "topic-1",
+                m.FreshnessEligibility.NOT_REQUIRED,
+                ("e1", "e1"),
+            )
+        evidence = fixtures.evidence_item()
+        with self.assertRaises(ValueError):
+            replace(
+                fixtures.bundle(),
+                evidence_items=(evidence, evidence),
+            )
+
+    def test_topic_support_must_match_legacy_evidence_label_projection(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        evidence = replace(
+            fixtures.evidence_item(),
+            supported_topics=("unrelated label",),
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                fixtures.bundle(),
+                initial_evidence_ids=(evidence.evidence_id,),
+                evidence_items=(evidence,),
+                evidence_state=m.EvidenceState.SUFFICIENT,
+                missing_claim_topics=(),
+                topic_assessments=(
+                    m.TopicAssessment(
+                        "topic-1",
+                        m.FreshnessEligibility.NOT_REQUIRED,
+                        (evidence.evidence_id,),
+                    ),
+                ),
+                supported_topic_ids=("topic-1",),
+                missing_topic_ids=(),
+            )
+
+    def test_legacy_missing_claim_topics_must_project_missing_topic_ids(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        with self.assertRaises(ValueError):
+            replace(
+                fixtures.bundle(),
+                missing_claim_topics=("unrelated legacy label",),
+            )
+
+    def test_sufficient_bundle_rejects_stale_or_unknown_material_assessment(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        evidence = fixtures.evidence_item()
+        for freshness in (m.FreshnessEligibility.STALE, m.FreshnessEligibility.UNKNOWN):
+            with self.subTest(freshness=freshness):
+                assessment = m.TopicAssessment("topic-1", freshness, (evidence.evidence_id,))
+                with self.assertRaises(ValueError):
+                    replace(
+                        fixtures.bundle(),
+                        evidence_items=(evidence,),
+                        evidence_state=m.EvidenceState.SUFFICIENT,
+                        topic_assessments=(assessment,),
+                        supported_topic_ids=("topic-1",),
+                        missing_topic_ids=(),
+                    )
 
 
 if __name__ == "__main__":

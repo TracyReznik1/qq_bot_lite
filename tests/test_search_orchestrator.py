@@ -147,12 +147,30 @@ def _make_planner():
 
 
 class _FakeJudge:
-    def __init__(self, verdicts=None, supported_topics=("光合作用", "Rust", "Go")):
+    def __init__(self, verdicts=None, supported_topic_ids=None):
         self.verdicts = verdicts or {}
-        self.supported_topics = tuple(supported_topics)
+        self.supported_topic_ids = (
+            None
+            if supported_topic_ids is None
+            else tuple(supported_topic_ids)
+        )
 
     def judge(self, question, candidates, *, required_topics=None):
-        del question, required_topics
+        del question
+        available_topic_ids = tuple(
+            row["topic_id"]
+            for row in (required_topics or ())
+            if isinstance(row, dict) and isinstance(row.get("topic_id"), str)
+        )
+        supported_topic_ids = (
+            available_topic_ids
+            if self.supported_topic_ids is None
+            else tuple(
+                topic_id
+                for topic_id in self.supported_topic_ids
+                if topic_id in available_topic_ids
+            )
+        )
         result = {}
         for index, candidate in enumerate(candidates, 1):
             if f"C{index}" in self.verdicts:
@@ -165,7 +183,11 @@ class _FakeJudge:
                     "publisher_entity_match": False,
                     "ownership_basis": None,
                     "publisher": None,
-                    "supported_topics": list(self.supported_topics),
+                    "supported_topic_ids": list(supported_topic_ids),
+                    "freshness_by_topic": {
+                        topic_id: "satisfied"
+                        for topic_id in supported_topic_ids
+                    },
                     "conflict_key": None,
                     "conflict_value": None,
                     "conflict_relation": None,
@@ -347,7 +369,10 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
 
         class PartialJudge:
             def judge(self, _question, candidates, *, required_topics=None, **_kwargs):
-                supported = tuple(required_topics or ())[:1]
+                supported = tuple(
+                    row["topic_id"]
+                    for row in (required_topics or ())[:1]
+                )
                 return {
                     f"C{index}": {
                         "candidate_id": f"C{index}",
@@ -356,7 +381,10 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
                         "publisher_entity_match": False,
                         "ownership_basis": None,
                         "publisher": None,
-                        "supported_topics": list(supported),
+                        "supported_topic_ids": list(supported),
+                        "freshness_by_topic": {
+                            topic_id: "satisfied" for topic_id in supported
+                        },
                         "conflict_key": None,
                         "conflict_value": None,
                         "conflict_relation": None,
@@ -682,13 +710,11 @@ class OrchestratorStandardTests(unittest.TestCase):
 
     def _orchestrator(self, provider_hits, judge_verdicts=None, question="Rust 和 Go 的并发模型有什么区别"):
         provider = _FakeProvider(hits=provider_hits)
-        from src.search.planner import _derive_required_topics
-        topics = _derive_required_topics(question)
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(judge_verdicts or {}, supported_topics=topics),
+            judge=_FakeJudge(judge_verdicts or {}),
             providers=(provider,),
             extractor=_FakeExtractor(),
             clock=FakeClock(),
@@ -1360,7 +1386,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(supported_topics=()),
+            judge=_FakeJudge(supported_topic_ids=()),
             providers=(RepairBlockingProvider(),),
             extractor=_FakeExtractor(),
         )
@@ -1421,7 +1447,7 @@ class OrchestratorAccountingTests(unittest.TestCase):
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(supported_topics=("定义",)),
+            judge=_FakeJudge(supported_topic_ids=("topic-1",)),
             providers=(ManyHitsProvider(),),
             extractor=extractor,
         )
@@ -1467,7 +1493,7 @@ class OrchestratorAccountingTests(unittest.TestCase):
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(supported_topics=()),
+            judge=_FakeJudge(supported_topic_ids=()),
             providers=(PerQueryProvider(),),
             extractor=extractor,
         )
@@ -1537,7 +1563,7 @@ class OrchestratorTraceTests(unittest.TestCase):
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(supported_topics=()),
+            judge=_FakeJudge(supported_topic_ids=()),
             providers=(provider,),
             extractor=_FakeExtractor(),
             clock=FakeClock(),
@@ -1633,10 +1659,17 @@ class OrchestratorTraceTests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def judge(self, _question, candidates, **_kwargs):
+            def judge(self, _question, candidates, **kwargs):
                 clock.advance(0.023)
                 self.calls += 1
-                supported = ["topic"] if self.calls > 1 else []
+                supported = (
+                    [
+                        row["topic_id"]
+                        for row in kwargs.get("required_topics", ())
+                    ]
+                    if self.calls > 1
+                    else []
+                )
                 return {
                     f"C{index}": {
                         "candidate_id": f"C{index}",
@@ -1645,7 +1678,10 @@ class OrchestratorTraceTests(unittest.TestCase):
                         "publisher_entity_match": False,
                         "ownership_basis": None,
                         "publisher": "Example",
-                        "supported_topics": supported,
+                        "supported_topic_ids": supported,
+                        "freshness_by_topic": {
+                            topic_id: "satisfied" for topic_id in supported
+                        },
                         "conflict_key": None,
                         "conflict_value": None,
                         "conflict_relation": None,
