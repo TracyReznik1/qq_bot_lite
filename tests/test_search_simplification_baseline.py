@@ -58,8 +58,25 @@ class SearchSimplificationBaselineTests(unittest.TestCase):
         light = DEFAULT_TIER_BUDGETS[SearchTier.LIGHT]
         standard = DEFAULT_TIER_BUDGETS[SearchTier.STANDARD]
 
-        self.assertEqual((1, 5, 2, 0, 1, 1, 8), tuple(light.__dict__.values()))
-        self.assertEqual((3, 8, 5, 1, 4, 2, 20), tuple(standard.__dict__.values()))
+        self.assertEqual(1, light.max_initial_queries)
+        self.assertEqual(5, light.max_candidate_urls)
+        self.assertEqual(2, light.max_content_reads)
+        self.assertEqual(0, light.max_repair_queries)
+        self.assertEqual(1, light.max_total_queries)
+        self.assertEqual(1, light.max_retrieval_rounds)
+        self.assertEqual(8, light.hard_timeout_seconds)
+        self.assertEqual(3, standard.max_initial_queries)
+        self.assertEqual(8, standard.max_candidate_urls)
+        self.assertEqual(5, standard.max_content_reads)
+        self.assertEqual(1, standard.max_repair_queries)
+        self.assertEqual(4, standard.max_total_queries)
+        self.assertEqual(2, standard.max_retrieval_rounds)
+        self.assertEqual(20, standard.hard_timeout_seconds)
+
+    def test_budget_baseline_source_does_not_depend_on_dataclass_field_order(self):
+        source = Path(__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("__dict__" + ".values", source)
 
     def test_provider_registry_remains_ddgs_first_with_conditional_fallback(self):
         ddgs = Mock(name="ddgs")
