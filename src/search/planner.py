@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any, Callable, Mapping, Sequence
 
@@ -19,18 +19,22 @@ from src.search.models import (
     DEFAULT_TIER_BUDGETS,
     EvidenceGapAnalysis,
     Factuality,
-    Freshness,
+    FreshnessContext,
+    FreshnessRequirement,
     PlanningStatus,
     QueryPurpose,
+    RequiredTopic,
     RepairPlan,
     RequestSource,
     RetrievalDecision,
+    RetrievalContext,
     RetrievalRequest,
     SearchPlan,
     SearchQuery,
     SearchRoundKind,
     SearchTier,
     SourceRelation,
+    SourceRequirement,
 )
 
 _SOURCE_RELATION_PRIMARY = SourceRelation.PRIMARY
@@ -314,29 +318,38 @@ def _parse_planner_payload(content: Any) -> dict[str, Any] | None:
 
 
 PLANNER_SYSTEM_PROMPT = """\
-You plan bounded web-search queries for one user question. Preserve the user's
-original natural-language sentence for the direct query. Entity/time/intent
-extraction only creates supplementary queries; it never replaces the original
-with mechanical keywords.
+You plan bounded supplemental web-search queries for one user question. The
+application creates the user's original natural-language sentence as the
+first direct query; never generate, replace, or repeat that direct query.
 
 Return JSON only:
 {
-  "planning_status": "normal",
-  "entities": ["short entity names"],
-  "time_window": [null or "YYYY-MM-DD", null or "YYYY-MM-DD"],
-  "initial_queries": [
+  "supplemental_queries": [
     {
-      "purpose": "direct|primary|independent|time_bounded|disambiguation",
+      "purpose": "primary|independent|time_bounded|disambiguation|counterevidence",
       "text": "search text",
-      "include_domains": [],
-      "exclude_domains": []
+      "target_topic_ids": ["topic-1"],
+      "date_from": null,
+      "date_to": null
+    }
+  ],
+  "required_topics": [
+    {
+      "label": "short answer topic",
+      "material": true,
+      "freshness_requirement": "not_required",
+      "date_from": null,
+      "date_to": null,
+      "version_constraint": null,
+      "source_requirement": "any_relevant"
     }
   ]
 }
 
 Rules:
-- never exceed the tier's initial-query budget (light 1, standard 3, deep 5)
-- for high-freshness requests include a dated time_bounded query
+- never generate more than the supplied supplemental-query limit
+- use at most three topics; labels must be non-blank
+- supplemental target ids refer only to the ordered topic ids topic-1 through topic-3
 - never put API keys, secrets, callback codes, QQ/group ids, or data URLs in a query
 """
 
@@ -354,21 +367,40 @@ class SearchPlanner:
         self,
         request: RetrievalRequest,
         decision: RetrievalDecision,
+        retrieval_context: RetrievalContext,
+        freshness_context: FreshnessContext,
         *,
         deadline: float | None = None,
         timeout_seconds: float | None = None,
     ) -> SearchPlan:
+        if not isinstance(retrieval_context, RetrievalContext):
+            raise TypeError("retrieval_context must be a RetrievalContext")
+        if not isinstance(freshness_context, FreshnessContext):
+            raise TypeError("freshness_context must be a FreshnessContext")
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         original = str(request.question or "")
         direct_text, redaction_codes, direct_degraded = self._prepare_direct(original)
-        required_topics = _derive_required_topics(original)
+        effective_freshness = _effective_freshness_context(
+            freshness_context,
+            self._today(),
+        )
 
         if decision.route is SearchTier.LIGHT:
-            query = SearchQuery(
-                query_id="",
-                round_kind=SearchRoundKind.INITIAL,
-                purpose=QueryPurpose.DIRECT,
-                text=direct_text,
+            required_topics = _fallback_required_topics(
+                original,
+                retrieval_context,
+                effective_freshness,
+                single_implicit_topic=True,
+            )
+            query = _apply_freshness_bounds(
+                SearchQuery(
+                    query_id="",
+                    round_kind=SearchRoundKind.INITIAL,
+                    purpose=QueryPurpose.DIRECT,
+                    text=direct_text,
+                    target_topic_ids=_material_topic_ids(required_topics),
+                ),
+                effective_freshness,
             )
             status = PlanningStatus.DEGRADED if (direct_degraded or bool(redaction_codes)) else PlanningStatus.NORMAL
             return SearchPlan(
@@ -376,7 +408,7 @@ class SearchPlanner:
                 original_question=original,
                 planning_status=status,
                 entities=(),
-                time_window=None,
+                time_window=_time_window_for_context(effective_freshness),
                 initial_queries=_assign_initial_query_ids((query,)),
                 required_topics=required_topics,
                 required_source_relations=frozenset(),
@@ -387,25 +419,65 @@ class SearchPlanner:
         payload = self._ask_model(
             request,
             decision,
+            retrieval_context,
+            effective_freshness,
             deadline=deadline,
             timeout_seconds=timeout_seconds,
         )
-        planned = _model_initial_queries(payload, budget)
-        degraded_due_to_model = payload is None or planned is None
         required_relations = frozenset(
             {
                 _SOURCE_RELATION_PRIMARY,
                 _SOURCE_RELATION_INDEPENDENT,
             }
         )
-        if planned is None:
-            fallback = self._deterministic_plan(original, decision)
+        if payload is None:
+            required_topics = _fallback_required_topics(
+                original,
+                retrieval_context,
+                effective_freshness,
+            )
+            fallback = self._deterministic_plan(
+                original,
+                decision,
+                required_topics,
+                effective_freshness,
+            )
             return SearchPlan(
                 decision=decision,
                 original_question=original,
-                planning_status=PlanningStatus.DEGRADED if degraded_due_to_model else PlanningStatus.NORMAL,
+                planning_status=PlanningStatus.DEGRADED,
                 entities=_extract_entities(original),
-                time_window=_time_window_for_decision(original, decision, self._today()),
+                time_window=_time_window_for_context(effective_freshness),
+                initial_queries=_assign_initial_query_ids(fallback),
+                required_topics=required_topics,
+                required_source_relations=required_relations,
+                query_redaction_codes=redaction_codes,
+                budget=budget,
+            )
+
+        required_topics, topic_degraded = _seal_required_topics(
+            payload,
+            original,
+            retrieval_context,
+            effective_freshness,
+        )
+        planned, query_degraded = _model_supplemental_queries(
+            payload,
+            material_topic_ids=set(_material_topic_ids(required_topics)),
+        )
+        if planned is None:
+            fallback = self._deterministic_plan(
+                original,
+                decision,
+                required_topics,
+                effective_freshness,
+            )
+            return SearchPlan(
+                decision=decision,
+                original_question=original,
+                planning_status=PlanningStatus.DEGRADED,
+                entities=_extract_entities(original),
+                time_window=_time_window_for_context(effective_freshness),
                 initial_queries=_assign_initial_query_ids(fallback),
                 required_topics=required_topics,
                 required_source_relations=required_relations,
@@ -417,22 +489,34 @@ class SearchPlanner:
         seen_fingerprints: set[str] = set()
         # Always retain the redacted original natural-language question as the
         # first direct query; the model may supplement, never replace it.
-        redacted_queries.append(
+        direct = _apply_freshness_bounds(
             SearchQuery(
                 query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.DIRECT,
                 text=direct_text,
-            )
+                target_topic_ids=_material_topic_ids(required_topics),
+            ),
+            effective_freshness,
         )
+        redacted_queries.append(direct)
         seen_fingerprints.add(_query_fingerprint(direct_text))
         for query in planned:
             cleaned, codes, degraded = self._clean_query(query, original)
             redaction_codes = tuple(dict.fromkeys((*redaction_codes, *codes)))
+            query_degraded = query_degraded or degraded
             if _query_fingerprint(cleaned) in seen_fingerprints:
                 continue
+            if (
+                effective_freshness.requirement is FreshnessRequirement.VERSION
+                and not _has_exact_version_token(
+                    cleaned,
+                    effective_freshness.version_constraint,
+                )
+            ):
+                continue
             seen_fingerprints.add(_query_fingerprint(cleaned))
-            redacted_queries.append(
+            candidate = _apply_freshness_bounds(
                 SearchQuery(
                     query_id="",
                     round_kind=SearchRoundKind.INITIAL,
@@ -442,64 +526,28 @@ class SearchPlanner:
                     date_to=query.date_to,
                     include_domains=query.include_domains,
                     exclude_domains=query.exclude_domains,
-                )
+                    target_topic_ids=query.target_topic_ids,
+                ),
+                effective_freshness,
             )
-
-        # Model-owned date metadata is executable provider input. Remove every
-        # malformed candidate before slot selection so partial/reversed bounds
-        # cannot consume budget or reach an adapter. The direct query has no
-        # model-owned date metadata and remains first.
-        redacted_queries = [
-            query for query in redacted_queries if _has_valid_query_time_shape(query)
-        ][: budget.max_initial_queries]
-        needs_time_bounded_query = (
-            decision.route is SearchTier.DEEP
-            and decision.freshness is Freshness.HIGH
-            and not any(_is_genuine_time_bounded_query(query) for query in redacted_queries)
-        )
-        if needs_time_bounded_query:
-            today = self._today()
-            time_bounded = SearchQuery(
-                query_id="",
-                round_kind=SearchRoundKind.INITIAL,
-                purpose=QueryPurpose.TIME_BOUNDED,
-                text=f"{_deep_location_hint(direct_text)} {today.isoformat()} 新闻 重要事件",
-                date_from=today,
-                date_to=today,
-            )
+            if not _has_valid_query_time_shape(candidate):
+                query_degraded = True
+                continue
+            redacted_queries.append(candidate)
             if len(redacted_queries) >= budget.max_initial_queries:
-                # Preserve the original direct question (especially CJK/no-space
-                # text) and replace the final supplemental slot with a genuine
-                # date-bounded query after final slot selection.
-                replacement_index = next(
-                    (
-                        index
-                        for index in range(len(redacted_queries) - 1, 0, -1)
-                        if redacted_queries[index].purpose is not QueryPurpose.DIRECT
-                    ),
-                    len(redacted_queries) - 1,
-                )
-                time_bounded = SearchQuery(
-                    query_id="",
-                    round_kind=time_bounded.round_kind,
-                    purpose=time_bounded.purpose,
-                    text=time_bounded.text,
-                    date_from=time_bounded.date_from,
-                    date_to=time_bounded.date_to,
-                )
-                redacted_queries[replacement_index] = time_bounded
-            else:
-                redacted_queries.append(time_bounded)
+                break
 
-        status = _planning_status(payload, direct_degraded or degraded_due_to_model)
+        status = _planning_status(
+            payload,
+            direct_degraded or topic_degraded or query_degraded,
+        )
         entities = _string_list(payload.get("entities"))
-        time_window = _parse_time_window(payload.get("time_window"))
         return SearchPlan(
             decision=decision,
             original_question=original,
             planning_status=status,
             entities=tuple(entities),
-            time_window=time_window,
+            time_window=_time_window_for_context(effective_freshness),
             initial_queries=_assign_initial_query_ids(redacted_queries),
             required_topics=required_topics,
             required_source_relations=required_relations,
@@ -586,6 +634,8 @@ class SearchPlanner:
         self,
         request: RetrievalRequest,
         decision: RetrievalDecision,
+        retrieval_context: RetrievalContext,
+        freshness_context: FreshnessContext,
         *,
         deadline: float | None = None,
         timeout_seconds: float | None = None,
@@ -594,8 +644,22 @@ class SearchPlanner:
         payload = {
             "question": request.question,
             "tier": decision.route.value,
-            "max_initial_queries": budget.max_initial_queries,
-            "freshness": decision.freshness.value,
+            "max_supplemental_queries": max(budget.max_initial_queries - 1, 0),
+            "source_requirement": retrieval_context.source_requirement.value,
+            "freshness_requirement": freshness_context.requirement.value,
+            "as_of": (
+                freshness_context.as_of.isoformat()
+                if freshness_context.as_of is not None else None
+            ),
+            "date_from": (
+                freshness_context.date_from.isoformat()
+                if freshness_context.date_from is not None else None
+            ),
+            "date_to": (
+                freshness_context.date_to.isoformat()
+                if freshness_context.date_to is not None else None
+            ),
+            "version_constraint": freshness_context.version_constraint,
         }
         messages = [
             {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
@@ -632,16 +696,20 @@ class SearchPlanner:
         self,
         original: str,
         decision: RetrievalDecision,
+        required_topics: Sequence[RequiredTopic],
+        freshness_context: FreshnessContext,
     ) -> tuple[SearchQuery, ...]:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         direct_text, _, _ = self._prepare_direct(original)
         today = self._today()
+        material_topic_ids = _material_topic_ids(required_topics)
         queries: list[SearchQuery] = [
             SearchQuery(
                 query_id="",
                 round_kind=SearchRoundKind.INITIAL,
                 purpose=QueryPurpose.DIRECT,
                 text=direct_text,
+                target_topic_ids=material_topic_ids,
             )
         ]
         if decision.route is SearchTier.DEEP:
@@ -654,6 +722,7 @@ class SearchPlanner:
                     text=f"{location_hint} {today.isoformat()} 新闻 重要事件",
                     date_from=today,
                     date_to=today,
+                    target_topic_ids=material_topic_ids,
                 )
             )
             queries.append(
@@ -662,6 +731,7 @@ class SearchPlanner:
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.PRIMARY,
                     text=f"{location_hint} {today.isoformat()} 官方 通报",
+                    target_topic_ids=material_topic_ids,
                 )
             )
             queries.append(
@@ -670,6 +740,7 @@ class SearchPlanner:
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.INDEPENDENT,
                     text=f"{location_hint} {today.isoformat()} 新闻 重要事件 独立报道",
+                    target_topic_ids=material_topic_ids,
                 )
             )
         elif decision.route is SearchTier.STANDARD:
@@ -681,6 +752,7 @@ class SearchPlanner:
                     text=f"{direct_text} Rust 官方文档 Go 官方文档"
                     if "Rust" in direct_text and "Go" in direct_text
                     else f"{direct_text} 官方文档",
+                    target_topic_ids=material_topic_ids,
                 )
             )
             queries.append(
@@ -689,48 +761,150 @@ class SearchPlanner:
                     round_kind=SearchRoundKind.INITIAL,
                     purpose=QueryPurpose.INDEPENDENT,
                     text=f"{direct_text} 独立技术对比",
+                    target_topic_ids=material_topic_ids,
                 )
             )
-        return tuple(queries[: budget.max_initial_queries])
+        return tuple(
+            _apply_freshness_bounds(query, freshness_context)
+            for query in queries[: budget.max_initial_queries]
+        )
 
 
-def _model_initial_queries(payload: Any, budget: Any) -> tuple[SearchQuery, ...] | None:
-    if not isinstance(payload, dict):
-        return None
-    raw_queries = payload.get("initial_queries")
-    if not isinstance(raw_queries, list) or not raw_queries:
-        return None
-    queries: list[SearchQuery] = []
-    seen: set[str] = set()
-    for index, raw in enumerate(raw_queries):
-        if index >= budget.max_initial_queries:
-            break
-        parsed = _parse_model_query(raw)
-        if parsed is None:
-            return None
-        fingerprint = _query_fingerprint(parsed.text)
-        if fingerprint in seen:
+def _seal_required_topics(
+    payload: Mapping[str, Any],
+    original: str,
+    retrieval_context: RetrievalContext,
+    freshness_context: FreshnessContext,
+) -> tuple[tuple[RequiredTopic, ...], bool]:
+    raw_topics = payload.get("required_topics")
+    if not isinstance(raw_topics, list):
+        return _fallback_required_topics(
+            original,
+            retrieval_context,
+            freshness_context,
+        ), True
+
+    parsed: list[RequiredTopic] = []
+    degraded = False
+    for raw in raw_topics[:3]:
+        topic = _parse_model_topic(raw, len(parsed) + 1)
+        if topic is None:
+            degraded = True
             continue
-        seen.add(fingerprint)
-        queries.append(parsed)
-    if not queries:
-        return None
-    return tuple(queries)
+        parsed.append(topic)
+
+    if not any(topic.material for topic in parsed):
+        degraded = True
+        if len(parsed) >= 3:
+            parsed = parsed[:2]
+        parsed.append(
+            _fallback_required_topics(
+                original,
+                retrieval_context,
+                freshness_context,
+            )[0]
+        )
+
+    sealed = tuple(
+        RequiredTopic(
+            topic_id=f"topic-{index}",
+            label=topic.label,
+            material=topic.material,
+            freshness_requirement=freshness_context.requirement,
+            date_from=freshness_context.date_from,
+            date_to=freshness_context.date_to,
+            version_constraint=freshness_context.version_constraint,
+            source_requirement=retrieval_context.source_requirement,
+        )
+        for index, topic in enumerate(parsed, 1)
+    )
+    return sealed, degraded
 
 
-def _parse_model_query(raw: Any) -> SearchQuery | None:
+def _parse_model_topic(raw: Any, index: int) -> RequiredTopic | None:
     if not isinstance(raw, dict):
         return None
+    label = raw.get("label")
+    material = raw.get("material")
+    freshness_requirement = _parse_enum(
+        raw.get("freshness_requirement"),
+        FreshnessRequirement,
+    )
+    source_requirement = _parse_enum(
+        raw.get("source_requirement"),
+        SourceRequirement,
+    )
+    date_from, valid_start = _parse_model_date(raw.get("date_from"))
+    date_to, valid_end = _parse_model_date(raw.get("date_to"))
+    version_constraint = raw.get("version_constraint")
+    if (
+        not isinstance(label, str)
+        or type(material) is not bool
+        or freshness_requirement is None
+        or source_requirement is None
+        or not valid_start
+        or not valid_end
+        or (version_constraint is not None and type(version_constraint) is not str)
+    ):
+        return None
+    try:
+        return RequiredTopic(
+            topic_id=f"model-topic-{index}",
+            label=label,
+            material=material,
+            freshness_requirement=freshness_requirement,
+            date_from=date_from,
+            date_to=date_to,
+            version_constraint=version_constraint,
+            source_requirement=source_requirement,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _model_supplemental_queries(
+    payload: Mapping[str, Any],
+    *,
+    material_topic_ids: set[str],
+) -> tuple[tuple[SearchQuery, ...] | None, bool]:
+    raw_queries = payload.get("supplemental_queries")
+    if not isinstance(raw_queries, list):
+        return None, True
+    queries: list[SearchQuery] = []
+    degraded = False
+    for raw in raw_queries:
+        query, malformed = _parse_model_supplemental_query(raw)
+        degraded = degraded or malformed
+        if query is None:
+            continue
+        target_topic_ids = set(query.target_topic_ids)
+        if not target_topic_ids or not target_topic_ids.issubset(material_topic_ids):
+            continue
+        queries.append(query)
+    return tuple(queries), degraded
+
+
+def _parse_model_supplemental_query(
+    raw: Any,
+) -> tuple[SearchQuery | None, bool]:
+    if not isinstance(raw, dict):
+        return None, True
     purpose = _parse_enum(raw.get("purpose"), QueryPurpose)
-    if purpose is None:
-        return None
     text = raw.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return None
-    date_from = _parse_date(raw.get("date_from"))
-    date_to = _parse_date(raw.get("date_to"))
-    include = validate_domain_list(raw.get("include_domains") or ())
-    exclude = validate_domain_list(raw.get("exclude_domains") or ())
+    date_from, valid_start = _parse_model_date(raw.get("date_from"))
+    date_to, valid_end = _parse_model_date(raw.get("date_to"))
+    if (
+        purpose is None
+        or purpose in {QueryPurpose.DIRECT, QueryPurpose.REPAIR}
+        or not isinstance(text, str)
+        or not text.strip()
+        or not valid_start
+        or not valid_end
+    ):
+        return None, True
+    target_topic_ids = tuple(
+        dict.fromkeys(_string_list(raw.get("target_topic_ids")))
+    )
     return SearchQuery(
         query_id="",
         round_kind=SearchRoundKind.INITIAL,
@@ -738,9 +912,106 @@ def _parse_model_query(raw: Any) -> SearchQuery | None:
         text=_normalize_whitespace(text),
         date_from=date_from,
         date_to=date_to,
-        include_domains=include,
-        exclude_domains=exclude,
+        include_domains=validate_domain_list(raw.get("include_domains") or ()),
+        exclude_domains=validate_domain_list(raw.get("exclude_domains") or ()),
+        target_topic_ids=target_topic_ids,
+    ), False
+
+
+def _parse_model_date(value: Any) -> tuple[date | None, bool]:
+    if value is None:
+        return None, True
+    parsed = _parse_date(value)
+    return parsed, parsed is not None
+
+
+def _effective_freshness_context(
+    context: FreshnessContext,
+    today: date,
+) -> FreshnessContext:
+    """Resolve only the conservative implicit current window for planning."""
+    if context.requirement is FreshnessRequirement.NOT_REQUIRED:
+        return context
+    if context.date_from is not None or context.date_to is not None:
+        return context
+    if context.as_of is not None:
+        return FreshnessContext(
+            requirement=context.requirement,
+            as_of=context.as_of,
+            date_from=context.as_of,
+            date_to=context.as_of,
+            version_constraint=context.version_constraint,
+        )
+    if context.requirement is FreshnessRequirement.CURRENT:
+        return FreshnessContext(
+            requirement=context.requirement,
+            as_of=None,
+            date_from=today,
+            date_to=today,
+            version_constraint=context.version_constraint,
+        )
+    return context
+
+
+def _apply_freshness_bounds(
+    query: SearchQuery,
+    context: FreshnessContext,
+) -> SearchQuery:
+    """Freshness changes only executable date bounds, never query slots/text."""
+    if context.requirement is FreshnessRequirement.NOT_REQUIRED:
+        return query
+    return replace(
+        query,
+        date_from=context.date_from,
+        date_to=context.date_to,
     )
+
+
+def _fallback_required_topics(
+    original: str,
+    retrieval_context: RetrievalContext,
+    freshness_context: FreshnessContext,
+    *,
+    single_implicit_topic: bool = False,
+) -> tuple[RequiredTopic, ...]:
+    if single_implicit_topic:
+        labels = (_short_original(original)[:160] or "用户问题",)
+    else:
+        labels = _derive_required_topics(original)[:3] or ("用户问题",)
+    return tuple(
+        RequiredTopic(
+            topic_id=f"topic-{index}",
+            label=label[:160],
+            material=True,
+            freshness_requirement=freshness_context.requirement,
+            date_from=freshness_context.date_from,
+            date_to=freshness_context.date_to,
+            version_constraint=freshness_context.version_constraint,
+            source_requirement=retrieval_context.source_requirement,
+        )
+        for index, label in enumerate(labels, 1)
+    )
+
+
+def _material_topic_ids(
+    topics: Sequence[RequiredTopic],
+) -> tuple[str, ...]:
+    return tuple(topic.topic_id for topic in topics if topic.material)
+
+
+def _time_window_for_context(
+    context: FreshnessContext,
+) -> tuple[date | None, date | None] | None:
+    if context.date_from is None and context.date_to is None:
+        return None
+    return (context.date_from, context.date_to)
+
+
+def _has_exact_version_token(text: str, version_constraint: str | None) -> bool:
+    if not isinstance(version_constraint, str) or not version_constraint.strip():
+        return False
+    token = re.escape(_normalize_whitespace(version_constraint))
+    return re.search(rf"(?<![0-9.]){token}(?![0-9.])", text) is not None
 
 
 def _parse_enum(value: Any, enum_type: type[Any]) -> Any:
@@ -801,6 +1072,8 @@ def _assign_initial_query_ids(queries: Sequence[SearchQuery]) -> tuple[SearchQue
             date_to=query.date_to,
             include_domains=query.include_domains,
             exclude_domains=query.exclude_domains,
+            query_index=index,
+            target_topic_ids=query.target_topic_ids,
         )
         for index, query in enumerate(queries, 1)
     )
@@ -812,31 +1085,11 @@ def _string_list(value: Any) -> list[str]:
     return [str(item) for item in value if isinstance(item, str) and item.strip()][:20]
 
 
-def _parse_time_window(value: Any) -> tuple[date | None, date | None] | None:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        return None
-    start = _parse_date(value[0])
-    end = _parse_date(value[1])
-    return (start, end)
-
-
 def _planning_status(payload: dict[str, Any], degraded: bool) -> PlanningStatus:
     if degraded:
         return PlanningStatus.DEGRADED
     status = _parse_enum(payload.get("planning_status"), PlanningStatus)
     return status if status is not None else PlanningStatus.NORMAL
-
-
-def _time_window_for_decision(
-    original: str,
-    decision: RetrievalDecision,
-    today: date,
-) -> tuple[date | None, date | None] | None:
-    if decision.freshness is Freshness.HIGH:
-        return (today, today)
-    if "今天" in original or "最近" in original or "最新" in original:
-        return (today, today)
-    return None
 
 
 def _extract_entities(original: str) -> tuple[str, ...]:
@@ -881,7 +1134,7 @@ def _derive_required_topics(original: str) -> tuple[str, ...]:
 
 def _short_original(original: str) -> str:
     text = str(original or "")
-    for phrase in ("有什么区别", "有什么不同", "是什么", "怎么回事"):
+    for phrase in ("有什么区别", "有什么不同", "什么是", "是什么", "啥是", "怎么回事"):
         text = text.replace(phrase, "")
     text = text.replace("的", " ")
     return _normalize_whitespace(text)

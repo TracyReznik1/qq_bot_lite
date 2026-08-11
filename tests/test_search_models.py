@@ -945,5 +945,217 @@ class RequestAnalysisContextContractTests(unittest.TestCase):
         self.assertIs(analysis, result.analysis)
 
 
+class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
+    """Task 4 contracts: material topics own query targets and freshness."""
+
+    @staticmethod
+    def _decision(m):
+        return m.RetrievalDecision(
+            m.SearchTier.STANDARD, None, False, (), frozenset(),
+            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
+            m.Actionability.NONE, m.PotentialHarm.NONE,
+            m.SearchTier.STANDARD, None, (),
+        )
+
+    @staticmethod
+    def _topic(m, topic_id="topic-1", label="并发 API", *, material=True,
+               freshness_requirement=None, date_from=None, date_to=None,
+               version_constraint=None, source_requirement=None):
+        return m.RequiredTopic(
+            topic_id=topic_id,
+            label=label,
+            material=material,
+            freshness_requirement=(
+                m.FreshnessRequirement.NOT_REQUIRED
+                if freshness_requirement is None else freshness_requirement
+            ),
+            date_from=date_from,
+            date_to=date_to,
+            version_constraint=version_constraint,
+            source_requirement=(
+                m.SourceRequirement.ANY_RELEVANT
+                if source_requirement is None else source_requirement
+            ),
+        )
+
+    @staticmethod
+    def _query(m, *, query_id="initial-1", query_index=1,
+               purpose=None, targets=("topic-1",), text="比较并发 API"):
+        return m.SearchQuery(
+            query_id=query_id,
+            round_kind=m.SearchRoundKind.INITIAL,
+            purpose=m.QueryPurpose.DIRECT if purpose is None else purpose,
+            text=text,
+            query_index=query_index,
+            target_topic_ids=targets,
+        )
+
+    def _plan(self, m, *, topics=None, queries=None):
+        topics = (self._topic(m),) if topics is None else topics
+        queries = (self._query(m),) if queries is None else queries
+        return m.SearchPlan(
+            decision=self._decision(m),
+            original_question="比较并发 API",
+            planning_status=m.PlanningStatus.NORMAL,
+            entities=(),
+            time_window=None,
+            initial_queries=queries,
+            required_topics=topics,
+            required_source_relations=frozenset(),
+            query_redaction_codes=(),
+            budget=m.DEFAULT_TIER_BUDGETS[m.SearchTier.STANDARD],
+        )
+
+    def test_required_topic_validates_closed_freshness_source_and_labels(self):
+        m = models()
+        version = self._topic(
+            m,
+            label="  Python 3.13  ",
+            freshness_requirement=m.FreshnessRequirement.VERSION,
+            version_constraint=" 3.13 ",
+            source_requirement=m.SourceRequirement.INDEPENDENT_CORROBORATION,
+        )
+        self.assertEqual("Python 3.13", version.label)
+        self.assertEqual("3.13", version.version_constraint)
+        self.assertIs(
+            m.SourceRequirement.INDEPENDENT_CORROBORATION,
+            version.source_requirement,
+        )
+        invalid_cases = (
+            {"topic_id": " "},
+            {"label": "\t"},
+            {"material": "yes"},
+            {"freshness_requirement": "current"},
+            {"source_requirement": "any_relevant"},
+            {"date_from": date(2026, 8, 12), "date_to": date(2026, 8, 11)},
+            {"date_from": date(2026, 8, 11)},
+            {
+                "freshness_requirement": m.FreshnessRequirement.VERSION,
+                "version_constraint": " ",
+            },
+        )
+        for overrides in invalid_cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises((TypeError, ValueError)):
+                    self._topic(m, **overrides)
+
+    def test_structured_plan_closes_topic_ids_material_targets_and_query_slots(self):
+        m = models()
+        topics = (
+            self._topic(m, "topic-1", "主张一"),
+            self._topic(m, "topic-2", "背景", material=False),
+            self._topic(m, "topic-3", "主张二"),
+        )
+        direct = self._query(m, targets=("topic-1", "topic-3"))
+        supplement = self._query(
+            m,
+            query_id="initial-2",
+            query_index=2,
+            purpose=m.QueryPurpose.PRIMARY,
+            targets=("topic-1",),
+            text="主张一官方资料",
+        )
+        plan = self._plan(m, topics=topics, queries=(direct, supplement))
+        self.assertEqual(("topic-1", "topic-2", "topic-3"), tuple(topic.topic_id for topic in plan.required_topics))
+        self.assertEqual((1, 2), tuple(query.query_index for query in plan.initial_queries))
+
+        invalid_plans = (
+            {"topics": (self._topic(m, "topic-2", "跳号"),)},
+            {"topics": tuple(self._topic(m, f"topic-{index}", f"主题{index}") for index in range(1, 5))},
+            {"topics": (self._topic(m, material=False),)},
+            {
+                "topics": topics,
+                "queries": (self._query(m, targets=("topic-1",)),),
+            },
+            {
+                "topics": topics,
+                "queries": (
+                    direct,
+                    self._query(
+                        m,
+                        query_id="initial-2",
+                        query_index=2,
+                        purpose=m.QueryPurpose.PRIMARY,
+                        targets=("topic-2",),
+                        text="背景资料",
+                    ),
+                ),
+            },
+            {
+                "queries": (
+                    self._query(m, query_index=2),
+                ),
+            },
+        )
+        for values in invalid_plans:
+            with self.subTest(values=values):
+                with self.assertRaises((TypeError, ValueError)):
+                    self._plan(m, **values)
+
+        with self.assertRaises((TypeError, ValueError)):
+            self._query(m, query_index=0)
+
+    def test_structured_plan_rejects_query_ids_outside_the_final_sealed_order(self):
+        m = models()
+        direct = self._query(m)
+        supplement = self._query(
+            m,
+            query_id="initial-2",
+            query_index=2,
+            purpose=m.QueryPurpose.PRIMARY,
+            text="并发 API 官方资料",
+        )
+        invalid_queries = (
+            (self._query(m, query_id="initial-2"),),
+            (direct, self._query(
+                m,
+                query_id="initial-3",
+                query_index=2,
+                purpose=m.QueryPurpose.PRIMARY,
+                text="跳号资料",
+            )),
+            (direct, self._query(
+                m,
+                query_id="initial-1",
+                query_index=2,
+                purpose=m.QueryPurpose.PRIMARY,
+                text="重复资料",
+            )),
+            (supplement,),
+        )
+        for queries in invalid_queries:
+            with self.subTest(queries=queries):
+                with self.assertRaises((TypeError, ValueError)):
+                    self._plan(m, queries=queries)
+
+    def test_legacy_topic_labels_do_not_admit_unsealed_structured_plans(self):
+        m = models()
+        legacy_query = m.SearchQuery(
+            "q1",
+            m.SearchRoundKind.INITIAL,
+            m.QueryPurpose.DIRECT,
+            "legacy query",
+        )
+        legacy_plan = self._plan(
+            m,
+            topics=("legacy label",),
+            queries=(legacy_query,),
+        )
+        self.assertEqual(("legacy label",), tuple(
+            topic.label for topic in legacy_plan.required_topics
+        ))
+        self.assertTrue(all(topic.material for topic in legacy_plan.required_topics))
+        replace(legacy_plan, original_question="replaced legacy question")
+
+        empty_legacy = self._plan(m, topics=())
+        self.assertEqual(1, len(empty_legacy.required_topics))
+        self.assertTrue(empty_legacy.required_topics[0].material)
+
+        with self.assertRaises((TypeError, ValueError)):
+            self._plan(m, topics=(self._topic(m),), queries=(legacy_query,))
+        with self.assertRaises((TypeError, ValueError)):
+            self._plan(m, topics=("legacy label", self._topic(m)))
+
+
 if __name__ == "__main__":
     unittest.main()

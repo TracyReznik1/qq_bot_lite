@@ -26,6 +26,7 @@ from src.search.models import (
     ProviderAttempt,
     ProviderResult,
     ProviderStatus,
+    QueryPurpose,
     RequestAnalysis,
     RepairPlan,
     RequestSource,
@@ -188,12 +189,24 @@ class SearchOrchestrator:
             deadline,
             request,
             retrieval_decision,
+            analysis.retrieval,
+            analysis.freshness,
             deadline,
         )
         if not plan_completed or not isinstance(plan, SearchPlan):
-            plan = self._degraded_plan(request, retrieval_decision)
+            plan = self._degraded_plan(
+                request,
+                retrieval_decision,
+                analysis.retrieval,
+                analysis.freshness,
+            )
+        if (
+            len(plan.initial_queries) > budget.max_initial_queries
+            or not plan.initial_queries
+            or plan.initial_queries[0].purpose is not QueryPurpose.DIRECT
+        ):
+            raise AssertionError("planner initial queries violated the tier/direct contract")
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
-        trace.initial_query_count = len(plan.initial_queries)
         trace.initial_query_redaction_codes = plan.query_redaction_codes
 
         if self._expired(deadline):
@@ -412,7 +425,14 @@ class SearchOrchestrator:
     ) -> list[ProviderResult]:
         budget_cap = min(budget.max_initial_queries, len(plan.initial_queries))
         queries = plan.initial_queries[:budget_cap]
-        return self._dispatch_queries(queries, decision, deadline, trace)
+        results = self._dispatch_queries(queries, decision, deadline, trace)
+        initial_query_ids = {query.query_id for query in queries}
+        trace.initial_query_count = sum(
+            1
+            for query_id, _purpose in trace.executed_queries
+            if query_id in initial_query_ids
+        )
+        return results
 
     def _run_repair_query(
         self,
@@ -599,12 +619,16 @@ class SearchOrchestrator:
         self,
         request: RetrievalRequest,
         decision: Any,
+        retrieval_context: Any,
+        freshness_context: Any,
         deadline: float,
     ) -> SearchPlan:
         return _call_with_supported_kwargs(
             self._planner.plan,
             request,
             decision,
+            retrieval_context,
+            freshness_context,
             deadline=deadline,
             timeout_seconds=self._remaining(deadline),
         )
@@ -625,7 +649,13 @@ class SearchOrchestrator:
             timeout_seconds=self._remaining(deadline),
         )
 
-    def _degraded_plan(self, request: RetrievalRequest, decision: Any) -> SearchPlan:
+    def _degraded_plan(
+        self,
+        request: RetrievalRequest,
+        decision: Any,
+        retrieval_context: Any,
+        freshness_context: Any,
+    ) -> SearchPlan:
         class _UnavailableModel:
             def chat(self, *_args: Any, **_kwargs: Any) -> Any:
                 raise TimeoutError("planner deadline expired")
@@ -633,6 +663,8 @@ class SearchOrchestrator:
         fallback = SearchPlanner(_UnavailableModel()).plan(
             request,
             decision,
+            retrieval_context,
+            freshness_context,
             deadline=self._monotonic(),
         )
         return replace(fallback, planning_status=PlanningStatus.DEGRADED)
@@ -941,7 +973,7 @@ def _empty_bundle(
     limitation: str = "provider_failure",
 ) -> EvidenceBundle:
     from src.search.models import EvidenceGapAnalysis, RepairPlan
-    missing = tuple(plan.required_topics) or ("material_claim",)
+    missing = tuple(topic.label for topic in plan.required_topics) or ("material_claim",)
     return EvidenceBundle(
         request_id="req-empty",
         decision=plan.decision,

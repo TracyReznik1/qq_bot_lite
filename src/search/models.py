@@ -522,6 +522,95 @@ DEFAULT_TIER_BUDGETS: Mapping[SearchTier, TierBudget] = MappingProxyType(
 
 
 @dataclass(frozen=True)
+class RequiredTopic:
+    """One bounded answer topic owned by the retrieval/freshness contracts."""
+
+    topic_id: str
+    label: str
+    material: bool
+    freshness_requirement: FreshnessRequirement
+    date_from: date | None = None
+    date_to: date | None = None
+    version_constraint: str | None = None
+    source_requirement: SourceRequirement = SourceRequirement.ANY_RELEVANT
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.topic_id, str) or not self.topic_id.strip():
+            raise ValueError("topic_id must be a non-blank string")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("label must be a non-blank string")
+        if type(self.material) is not bool:
+            raise TypeError("material must be a boolean")
+        _require_enum(
+            self.freshness_requirement,
+            FreshnessRequirement,
+            "freshness_requirement",
+        )
+        _require_enum(
+            self.source_requirement,
+            SourceRequirement,
+            "source_requirement",
+        )
+        for field_name in ("date_from", "date_to"):
+            value = getattr(self, field_name)
+            if value is not None and type(value) is not date:
+                raise TypeError(f"{field_name} must be a date or None")
+        if self.version_constraint is not None and type(self.version_constraint) is not str:
+            raise TypeError("version_constraint must be a string or None")
+        version_constraint = (
+            self.version_constraint.strip()
+            if self.version_constraint is not None
+            else None
+        )
+        _normalize_fields(
+            self,
+            topic_id=self.topic_id.strip(),
+            label=self.label.strip(),
+            version_constraint=version_constraint,
+        )
+        if self.date_from is not None and self.date_to is not None and self.date_from > self.date_to:
+            raise ValueError("topic date_from cannot exceed date_to")
+        if self.freshness_requirement is FreshnessRequirement.NOT_REQUIRED and any(
+            value is not None
+            for value in (self.date_from, self.date_to, self.version_constraint)
+        ):
+            raise ValueError("not_required topic freshness cannot carry a constraint")
+        if (
+            self.freshness_requirement is FreshnessRequirement.VERSION
+            and not self.version_constraint
+        ):
+            raise ValueError("version topic freshness requires version_constraint")
+
+
+_LEGACY_REQUIRED_TOPIC_MARKER = "_task4_legacy_required_topic"
+
+
+def _legacy_required_topic(topic_id: str, label: str) -> RequiredTopic:
+    """Build the Task 10-removable label-only SearchPlan input shim."""
+    topic = RequiredTopic(
+        topic_id=topic_id,
+        label=label,
+        material=True,
+        freshness_requirement=FreshnessRequirement.NOT_REQUIRED,
+        source_requirement=SourceRequirement.ANY_RELEVANT,
+    )
+    # `dataclasses.replace(plan, ...)` retains topic objects.  The marker
+    # therefore preserves only the explicit legacy-string constructor path;
+    # newly-built RequiredTopic plans must pass sealed-query validation.
+    object.__setattr__(topic, _LEGACY_REQUIRED_TOPIC_MARKER, True)
+    return topic
+
+
+def _has_legacy_required_topic_provenance(
+    topics: tuple[RequiredTopic, ...],
+) -> bool:
+    return bool(topics) and all(
+        getattr(topic, _LEGACY_REQUIRED_TOPIC_MARKER, False) is True
+        for topic in topics
+    )
+
+
+@dataclass(frozen=True)
 class SearchQuery:
     query_id: str
     round_kind: SearchRoundKind
@@ -531,9 +620,23 @@ class SearchQuery:
     date_to: date | None = None
     include_domains: tuple[str, ...] = ()
     exclude_domains: tuple[str, ...] = ()
+    query_index: int = None  # type: ignore[assignment]
+    target_topic_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, include_domains=_strings(self.include_domains, "include_domains"), exclude_domains=_strings(self.exclude_domains, "exclude_domains"))
+        if self.query_index is None:
+            query_index = None
+        else:
+            if type(self.query_index) is not int or self.query_index <= 0:
+                raise ValueError("query_index must be a positive integer")
+            query_index = self.query_index
+        _normalize_fields(
+            self,
+            include_domains=_strings(self.include_domains, "include_domains"),
+            exclude_domains=_strings(self.exclude_domains, "exclude_domains"),
+            query_index=query_index,
+            target_topic_ids=_strings(self.target_topic_ids, "target_topic_ids"),
+        )
         _require_enum(self.round_kind, SearchRoundKind, "round_kind")
         _require_enum(self.purpose, QueryPurpose, "purpose")
 
@@ -546,7 +649,7 @@ class SearchPlan:
     entities: tuple[str, ...]
     time_window: tuple[date | None, date | None] | None
     initial_queries: tuple[SearchQuery, ...]
-    required_topics: tuple[str, ...]
+    required_topics: tuple[RequiredTopic, ...]
     required_source_relations: frozenset[SourceRelation]
     query_redaction_codes: tuple[RedactionCode, ...]
     budget: TierBudget
@@ -557,9 +660,119 @@ class SearchPlan:
         time_window = None if self.time_window is None else _tuple(self.time_window)
         if time_window is not None and (len(time_window) != 2 or any(item is not None and not isinstance(item, date) for item in time_window)):
             raise ValueError("time_window must be a two-element date tuple")
-        _normalize_fields(self, entities=_strings(self.entities, "entities"), time_window=time_window, initial_queries=_records(self.initial_queries, SearchQuery, "initial_queries"), required_topics=_strings(self.required_topics, "required_topics"), required_source_relations=_enum_set(self.required_source_relations, SourceRelation, "required_source_relations"), query_redaction_codes=_redaction_codes(self.query_redaction_codes, "query_redaction_codes"))
+        if isinstance(self.required_topics, (str, bytes, Mapping)) or not isinstance(
+            self.required_topics,
+            (tuple, list, set, frozenset),
+        ):
+            raise TypeError("required_topics must be a collection of RequiredTopic values")
+        raw_topics = _tuple(self.required_topics)
+        legacy_topic_labels = all(type(topic) is str for topic in raw_topics)
+        if legacy_topic_labels:
+            topic_labels = _strings(raw_topics, "required_topics")
+            if not topic_labels:
+                topic_labels = (
+                    str(self.original_question or "").strip() or "用户问题",
+                )
+            required_topics = tuple(
+                _legacy_required_topic(
+                    topic_id=f"topic-{index}",
+                    label=label,
+                )
+                for index, label in enumerate(topic_labels, 1)
+            )
+        else:
+            required_topics = _records(
+                raw_topics,
+                RequiredTopic,
+                "required_topics",
+            )
+        initial_queries = _records(
+            self.initial_queries,
+            SearchQuery,
+            "initial_queries",
+        )
+        legacy_query_slots = all(
+            query.query_index is None and not query.target_topic_ids
+            for query in initial_queries
+        )
+        _normalize_fields(
+            self,
+            entities=_strings(self.entities, "entities"),
+            time_window=time_window,
+            initial_queries=initial_queries,
+            required_topics=required_topics,
+            required_source_relations=_enum_set(
+                self.required_source_relations,
+                SourceRelation,
+                "required_source_relations",
+            ),
+            query_redaction_codes=_redaction_codes(
+                self.query_redaction_codes,
+                "query_redaction_codes",
+            ),
+        )
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
+        legacy_topic_provenance = (
+            legacy_topic_labels
+            or _has_legacy_required_topic_provenance(required_topics)
+        )
+        # Task 10 removes this constructor shim.  Only a plan that originated
+        # from legacy strings may retain legacy query slots through
+        # `dataclasses.replace`; a newly-built RequiredTopic plan is always
+        # required to carry sealed initial query metadata.
+        if not (legacy_topic_provenance and legacy_query_slots):
+            self._validate_structured_queries()
+
+    def _validate_structured_queries(self) -> None:
+        if not self.required_topics or len(self.required_topics) > 3:
+            raise ValueError("structured plans require one to three topics")
+        expected_topic_ids = tuple(
+            f"topic-{index}" for index in range(1, len(self.required_topics) + 1)
+        )
+        if tuple(topic.topic_id for topic in self.required_topics) != expected_topic_ids:
+            raise ValueError("required topic ids must be closed and sequential")
+        material_topic_ids = {
+            topic.topic_id for topic in self.required_topics if topic.material
+        }
+        if not material_topic_ids:
+            raise ValueError("structured plans require at least one material topic")
+        if not self.initial_queries:
+            raise ValueError("structured plans require an initial query")
+        if len(self.initial_queries) > self.budget.max_initial_queries:
+            raise ValueError("initial queries exceed the tier budget")
+        if any(query.round_kind is not SearchRoundKind.INITIAL for query in self.initial_queries):
+            raise ValueError("structured plan queries must be initial queries")
+        if self.initial_queries[0].purpose is not QueryPurpose.DIRECT:
+            raise ValueError("the first initial query must be direct")
+        if any(
+            query.purpose is QueryPurpose.DIRECT
+            for query in self.initial_queries[1:]
+        ):
+            raise ValueError("only the first initial query may be direct")
+        if any(
+            not isinstance(query.query_id, str) or not query.query_id.strip()
+            for query in self.initial_queries
+        ) or len({query.query_id for query in self.initial_queries}) != len(self.initial_queries):
+            raise ValueError("initial query ids must be unique and non-blank")
+        expected_query_ids = tuple(
+            f"initial-{index}" for index in range(1, len(self.initial_queries) + 1)
+        )
+        if tuple(query.query_id for query in self.initial_queries) != expected_query_ids:
+            raise ValueError("initial query ids must match their sealed order")
+        expected_query_indexes = tuple(range(1, len(self.initial_queries) + 1))
+        if tuple(query.query_index for query in self.initial_queries) != expected_query_indexes:
+            raise ValueError("initial query indexes must be unique and sequential")
+        known_topic_ids = {topic.topic_id for topic in self.required_topics}
+        direct = self.initial_queries[0]
+        if not direct.target_topic_ids or not material_topic_ids.issubset(
+            set(direct.target_topic_ids)
+        ) or not set(direct.target_topic_ids).issubset(known_topic_ids):
+            raise ValueError("direct query must target every material topic")
+        for query in self.initial_queries[1:]:
+            target_topic_ids = set(query.target_topic_ids)
+            if not target_topic_ids or not target_topic_ids.issubset(material_topic_ids):
+                raise ValueError("supplemental queries must target known material topics")
 
 
 @dataclass(frozen=True)

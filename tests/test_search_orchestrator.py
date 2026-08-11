@@ -21,6 +21,7 @@ from src.search.models import (
     PotentialHarm,
     ProviderReadiness,
     ProviderStatus,
+    QueryPurpose,
     RequestSource,
     RetrievalDecision,
     RetrievalRequest,
@@ -150,8 +151,8 @@ class _FakeJudge:
         self.verdicts = verdicts or {}
         self.supported_topics = tuple(supported_topics)
 
-    def judge(self, question, candidates):
-        del question
+    def judge(self, question, candidates, *, required_topics=None):
+        del question, required_topics
         result = {}
         for index, candidate in enumerate(candidates, 1):
             if f"C{index}" in self.verdicts:
@@ -402,12 +403,16 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
         class CapturingPlanner:
             def __init__(self):
                 self.decision = None
+                self.contexts = None
 
-            def plan(self, retrieval_request, retrieval_decision, **kwargs):
+            def plan(self, retrieval_request, retrieval_decision, retrieval_context, freshness_context, **kwargs):
                 self.decision = retrieval_decision
+                self.contexts = (retrieval_context, freshness_context)
                 return _make_planner().plan(
                     retrieval_request,
                     retrieval_decision,
+                    retrieval_context,
+                    freshness_context,
                     **kwargs,
                 )
 
@@ -425,9 +430,82 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
 
         self.assertIs(planner.decision.freshness, Freshness.NONE)
         self.assertIs(planner.decision.risk, RiskLevel.LOW)
+        self.assertEqual((analysis.retrieval, analysis.freshness), planner.contexts)
         self.assertIs(result.decision.route, SearchTier.LIGHT)
         self.assertIs(result.decision.freshness, Freshness.HIGH)
         self.assertIs(result.decision.risk, RiskLevel.HIGH)
+
+    def test_planner_receives_only_retrieval_and_freshness_contexts_and_trace_counts_dispatch(self):
+        m = importlib.import_module("src.search.models")
+        retrieval = m.RetrievalContext(
+            must_search=True,
+            skip_reason=None,
+            factuality=m.Factuality.FACTUAL,
+            external_fact_required=True,
+            complexity_codes=(m.RetrievalComplexityCode.COMPARISON,),
+            source_requirement=m.SourceRequirement.INDEPENDENT_CORROBORATION,
+        )
+        freshness = m.FreshnessContext(
+            m.FreshnessRequirement.CURRENT,
+            None,
+            None,
+            None,
+            None,
+        )
+        analysis = m.RequestAnalysis(
+            retrieval,
+            freshness,
+            m.RiskContext(True, True, True),
+        )
+        standard = m.RetrievalDecision(
+            m.SearchTier.STANDARD, None, False, (), frozenset(),
+            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
+            m.Actionability.NONE, m.PotentialHarm.NONE,
+            m.SearchTier.STANDARD, None, (),
+        )
+
+        class Router:
+            def decide(self, context):
+                self.context = context
+                return standard
+
+        class CapturingPlanner:
+            def __init__(self):
+                self.contexts = None
+
+            def plan(self, retrieval_request, retrieval_decision, retrieval_context, freshness_context, **kwargs):
+                self.contexts = (retrieval_context, freshness_context)
+                return _make_planner().plan(
+                    retrieval_request,
+                    retrieval_decision,
+                    retrieval_context,
+                    freshness_context,
+                    **kwargs,
+                )
+
+            def plan_repair(self, *args, **kwargs):
+                return _make_planner().plan_repair(*args, **kwargs)
+
+        provider = _FakeProvider(hits=[_hit()])
+        router = Router()
+        planner = CapturingPlanner()
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_RecordingRequestAnalyzer(analysis),
+            router=router,
+            planner=planner,
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+
+        result = orchestrator.run(request("比较 Python 并发 API"))
+
+        self.assertIs(retrieval, router.context)
+        self.assertEqual((retrieval, freshness), planner.contexts)
+        self.assertEqual(len(provider.calls), result.trace.initial_query_count)
+        self.assertIs(QueryPurpose.DIRECT, result.plan.initial_queries[0].purpose)
+        self.assertIn(QueryPurpose.DIRECT, [query.purpose for query in provider.calls])
 
     def test_retrieval_deadline_starts_after_analysis_but_trace_keeps_analysis_time(self):
         m = importlib.import_module("src.search.models")
@@ -448,11 +526,13 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
             def __init__(self):
                 self.deadline = None
 
-            def plan(self, retrieval_request, retrieval_decision, **kwargs):
+            def plan(self, retrieval_request, retrieval_decision, retrieval_context, freshness_context, **kwargs):
                 self.deadline = kwargs["deadline"]
                 return _make_planner().plan(
                     retrieval_request,
                     retrieval_decision,
+                    retrieval_context,
+                    freshness_context,
                     **kwargs,
                 )
 
@@ -920,6 +1000,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertEqual(provider.calls, [])
         self.assertEqual(result.trace.provider_attempts, ())
         self.assertEqual(result.trace.executed_queries, ())
+        self.assertEqual(result.trace.initial_query_count, 0)
         self.assertFalse(result.trace.provider_invocation_started)
         self.assertEqual(result.trace.to_log_dict()["semantic_query_count"], 0)
 
@@ -1163,16 +1244,20 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 from src.search.models import QueryPurpose, SearchQuery, SearchRoundKind
 
                 base = _make_planner().plan(*args, **kwargs)
-                queries = tuple(
-                    SearchQuery(
-                        f"initial-{index}",
-                        SearchRoundKind.INITIAL,
-                        QueryPurpose.DIRECT,
-                        f"query {index}",
-                    )
-                    for index in range(1, 5)
+                fourth = SearchQuery(
+                    "initial-4",
+                    SearchRoundKind.INITIAL,
+                    QueryPurpose.PRIMARY,
+                    "fourth query",
+                    query_index=4,
+                    target_topic_ids=base.initial_queries[0].target_topic_ids,
                 )
-                return replace(base, initial_queries=queries)
+                object.__setattr__(
+                    base,
+                    "initial_queries",
+                    (*base.initial_queries, fourth),
+                )
+                return base
 
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("standard")),
@@ -1184,15 +1269,14 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         )
 
         with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", budgets):
-            result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+            with self.assertRaisesRegex(
+                AssertionError,
+                "tier/direct contract",
+            ):
+                orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
         time.sleep(0.27)
 
-        self.assertEqual(len(started_queries), 3)
-        executed_ids = [query_id for query_id, _purpose in result.trace.executed_queries]
-        attempted_ids = [attempt.query_id for attempt in result.trace.provider_attempts]
-        self.assertCountEqual(executed_ids, started_queries)
-        self.assertCountEqual(attempted_ids, started_queries)
-        self.assertNotIn("initial-4", executed_ids)
+        self.assertEqual(started_queries, [])
 
     def test_repair_timeout_preserves_citable_truth_and_deduplicates_failure(self):
         class RepairBlockingProvider:

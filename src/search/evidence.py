@@ -410,7 +410,7 @@ class EvidenceAssembler:
             names = {parameter.name for parameter in parameters}
             kwargs: dict[str, Any] = {}
             if accepts_kwargs or "required_topics" in names:
-                kwargs["required_topics"] = plan.required_topics
+                kwargs["required_topics"] = _required_topic_labels(plan)
             if accepts_kwargs or "timeout_seconds" in names:
                 kwargs["timeout_seconds"] = timeout_seconds
             judged = method(plan.original_question, list(indexed.values()), **kwargs)
@@ -425,7 +425,7 @@ class EvidenceAssembler:
         plan: SearchPlan,
         items: Sequence[EvidenceItem],
     ) -> EvidenceBundle:
-        required = set(plan.required_topics)
+        required = set(_required_topic_labels(plan))
         citable_items = [item for item in items if item.citable]
         supported = _supported_required_topics(plan, citable_items)
 
@@ -450,7 +450,9 @@ class EvidenceAssembler:
                 limitations=("no_citable_evidence",),
             )
 
-        missing = tuple(topic for topic in plan.required_topics if topic not in supported)
+        missing = tuple(
+            topic for topic in _required_topic_labels(plan) if topic not in supported
+        )
 
         conflicts = _detect_conflicts(citable_items, plan)
         conflict_groups = tuple(conflict.conflict_id for conflict in conflicts)
@@ -759,6 +761,11 @@ def _item_supports_topic(item: EvidenceItem, topic: str) -> bool:
     return any(_topic_matches(topic, supported) for supported in item.supported_topics)
 
 
+def _required_topic_labels(plan: SearchPlan) -> tuple[str, ...]:
+    """Task 4 compatibility projection for the legacy label-based judge."""
+    return tuple(topic.label for topic in plan.required_topics)
+
+
 def _has_independent_corroboration(primary: EvidenceItem, items: Sequence[EvidenceItem]) -> bool:
     return any(
         item.source_relation is SourceRelation.INDEPENDENT
@@ -771,7 +778,7 @@ def _has_independent_corroboration(primary: EvidenceItem, items: Sequence[Eviden
 
 def _supported_required_topics(plan: SearchPlan, items: Sequence[EvidenceItem]) -> set[str]:
     supported: set[str] = set()
-    for topic in plan.required_topics:
+    for topic in _required_topic_labels(plan):
         topic_items = [item for item in items if _item_supports_topic(item, topic)]
         if _requires_strong_support(plan):
             topic_items = [item for item in topic_items if _strong_support(item, plan)]
@@ -792,7 +799,7 @@ def _supported_required_topics(plan: SearchPlan, items: Sequence[EvidenceItem]) 
 
 
 def _uses_authoritative_single_source(plan: SearchPlan, items: Sequence[EvidenceItem]) -> bool:
-    for topic in plan.required_topics:
+    for topic in _required_topic_labels(plan):
         topic_items = [item for item in items if _item_supports_topic(item, topic) and _strong_support(item, plan)]
         primaries = [item for item in topic_items if item.source_relation is SourceRelation.PRIMARY]
         if primaries and not any(_has_independent_corroboration(primary, topic_items) for primary in primaries):
