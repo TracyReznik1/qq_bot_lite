@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from dataclasses import replace
 from datetime import date
 
 from src.search.models import (
@@ -14,6 +15,7 @@ from src.search.models import (
     FreshnessRequirement,
     PlanningStatus,
     QueryPurpose,
+    RequiredTopic,
     RequestSource,
     RetrievalDecision,
     RetrievalContext,
@@ -89,14 +91,32 @@ def plan_with_context(
     *,
     source_requirement: SourceRequirement = SourceRequirement.ANY_RELEVANT,
     freshness: FreshnessContext | None = None,
+    material_topic_label: str | None = None,
     **kwargs,
 ):
-    return planner.plan(
+    plan = planner.plan(
         retrieval_request,
         retrieval_decision,
         retrieval_context(source_requirement),
         freshness_context() if freshness is None else freshness,
         **kwargs,
+    )
+    if material_topic_label is None:
+        return plan
+    return replace(
+        plan,
+        initial_queries=tuple(
+            replace(query, target_topic_ids=("topic-1",))
+            for query in plan.initial_queries
+        ),
+        required_topics=(
+            RequiredTopic(
+                "topic-1",
+                material_topic_label,
+                True,
+                FreshnessRequirement.NOT_REQUIRED,
+            ),
+        ),
     )
 
 
@@ -385,6 +405,29 @@ class PlannerDirectQueryContractTests(unittest.TestCase):
             for query in plan.initial_queries
         ))
 
+    def test_model_supplement_targets_are_canonicalized_to_material_plan_order(self):
+        plan = self._plan(StaticPlannerModel(strict_payload(
+            topics=(
+                model_topic("第一主张"),
+                model_topic("第二主张"),
+                model_topic("背景", material=False),
+            ),
+            supplements=(supplemental_query(
+                "primary",
+                "两个主张的官方资料",
+                targets=("topic-2", "topic-1", "topic-2"),
+            ),),
+        )))
+
+        self.assertEqual(
+            ("topic-1", "topic-2"),
+            plan.initial_queries[0].target_topic_ids,
+        )
+        self.assertEqual(
+            ("topic-1", "topic-2"),
+            plan.initial_queries[1].target_topic_ids,
+        )
+
 
 class PlannerLightTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -462,7 +505,12 @@ class PlannerStandardTests(unittest.TestCase):
 
     def test_standard_repair_emits_at_most_one_distinct_query(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
+        plan = plan_with_context(
+            planner,
+            request("Rust 和 Go 的并发模型有什么区别"),
+            standard_decision(),
+            material_topic_label="内存安全",
+        )
         repair = planner.plan_repair(plan, gap(missing=("内存安全",)))
         self.assertTrue(repair.triggered)
         self.assertIsNotNone(repair.repair_query)
@@ -473,7 +521,12 @@ class PlannerStandardTests(unittest.TestCase):
 
     def test_standard_rejects_duplicate_repair(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
+        plan = plan_with_context(
+            planner,
+            request("Rust 和 Go 的并发模型有什么区别"),
+            standard_decision(),
+            material_topic_label="x",
+        )
         first = planner.plan_repair(plan, gap(missing=("x",)))
         self.assertTrue(first.triggered)
         # A second repair for the same request is refused via the
@@ -490,11 +543,21 @@ class PlannerStandardTests(unittest.TestCase):
 
     def test_repair_state_does_not_leak_across_requests(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan_a = plan_with_context(planner, request("Rust 和 Go 的并发模型有什么区别"), standard_decision())
+        plan_a = plan_with_context(
+            planner,
+            request("Rust 和 Go 的并发模型有什么区别"),
+            standard_decision(),
+            material_topic_label="内存",
+        )
         first = planner.plan_repair(plan_a, gap(missing=("内存",)))
         self.assertTrue(first.triggered)
         # An unrelated request must be able to plan its own repair.
-        plan_b = plan_with_context(planner, request("什么是光合作用"), standard_decision())
+        plan_b = plan_with_context(
+            planner,
+            request("什么是光合作用"),
+            standard_decision(),
+            material_topic_label="机制",
+        )
         second = planner.plan_repair(plan_b, gap(missing=("机制",)))
         self.assertTrue(second.triggered)
 
@@ -529,7 +592,12 @@ class PlannerDeepTests(unittest.TestCase):
 
     def test_deep_repair_allows_one(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("北京今天有什么新闻"), deep_decision())
+        plan = plan_with_context(
+            planner,
+            request("北京今天有什么新闻"),
+            deep_decision(),
+            material_topic_label="事件细节",
+        )
         repair = planner.plan_repair(plan, gap(missing=("事件细节",)))
         self.assertTrue(repair.triggered)
         self.assertEqual(plan.budget.max_total_queries, 6)
@@ -619,20 +687,35 @@ class PlannerRedactionTests(unittest.TestCase):
 
     def test_repair_query_phone_removed(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("什么是光合作用"), standard_decision())
+        plan = plan_with_context(
+            planner,
+            request("什么是光合作用"),
+            standard_decision(),
+            material_topic_label="13800138000 是什么号码",
+        )
         repair = planner.plan_repair(plan, gap(missing=("13800138000 是什么号码",)))
-        if repair.triggered:
-            self.assertNotIn("13800138000", repair.repair_query.text)
+        self.assertTrue(repair.triggered)
+        self.assertNotIn("13800138000", repair.repair_query.text)
 
     def test_repair_redaction_codes_are_request_scoped_and_auditable(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("什么是光合作用"), standard_decision())
+        plan = plan_with_context(
+            planner,
+            request("什么是光合作用"),
+            standard_decision(),
+            material_topic_label="回调签名 abcdef123456 如何处理",
+        )
         repair = planner.plan_repair(plan, gap(missing=("回调签名 abcdef123456 如何处理",)))
         self.assertTrue(repair.triggered)
         self.assertNotIn("abcdef123456", repair.repair_query.text)
         self.assertIn("callback_secret", repair.query_redaction_codes)
 
-        unrelated_plan = plan_with_context(planner, request("什么是光合作用"), standard_decision())
+        unrelated_plan = plan_with_context(
+            planner,
+            request("什么是光合作用"),
+            standard_decision(),
+            material_topic_label="证据缺口",
+        )
         unrelated_repair = planner.plan_repair(unrelated_plan, gap(missing=("证据缺口",)))
         self.assertNotIn("callback_secret", unrelated_repair.query_redaction_codes)
 

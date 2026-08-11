@@ -763,6 +763,47 @@ class OrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(result.trace.executed_queries, ())
         self.assertEqual(result.trace.to_log_dict()["semantic_query_count"], 0)
 
+    def test_empty_bundle_marks_only_material_topics_missing(self):
+        m = importlib.import_module("src.search.models")
+        decision = m.RetrievalDecision(
+            m.SearchTier.STANDARD, None, False, (), frozenset(),
+            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
+            m.Actionability.NONE, m.PotentialHarm.NONE,
+            m.SearchTier.STANDARD, None, (),
+        )
+        search_plan = m.SearchPlan(
+            decision,
+            "比较并发 API",
+            m.PlanningStatus.NORMAL,
+            (),
+            None,
+            (m.SearchQuery(
+                "initial-1",
+                m.SearchRoundKind.INITIAL,
+                m.QueryPurpose.DIRECT,
+                "比较并发 API",
+                query_index=1,
+                target_topic_ids=("topic-2",),
+            ),),
+            (
+                m.RequiredTopic(
+                    "topic-1", "background", False,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                ),
+                m.RequiredTopic(
+                    "topic-2", "core", True,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                ),
+            ),
+            frozenset(),
+            (),
+            m.DEFAULT_TIER_BUDGETS[m.SearchTier.STANDARD],
+        )
+
+        bundle = self.module._empty_bundle(search_plan)
+
+        self.assertEqual(("core",), bundle.missing_claim_topics)
+
     def _assert_bundle_trace_mirror(self, result):
         bundle = result.evidence
         self.assertIsNotNone(bundle)

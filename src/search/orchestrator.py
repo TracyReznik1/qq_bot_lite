@@ -973,7 +973,9 @@ def _empty_bundle(
     limitation: str = "provider_failure",
 ) -> EvidenceBundle:
     from src.search.models import EvidenceGapAnalysis, RepairPlan
-    missing = tuple(topic.label for topic in plan.required_topics) or ("material_claim",)
+    missing = tuple(
+        topic.label for topic in plan.required_topics if topic.material
+    ) or ("material_claim",)
     return EvidenceBundle(
         request_id="req-empty",
         decision=plan.decision,

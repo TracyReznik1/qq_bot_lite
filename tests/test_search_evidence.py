@@ -17,8 +17,11 @@ from src.search.models import (
     Factuality,
     FetchedDocument,
     Freshness,
+    FreshnessRequirement,
+    PlanningStatus,
     ProviderHit,
     QueryPurpose,
+    RequiredTopic,
     RequestSource,
     RetrievalDecision,
     RetrievalRequest,
@@ -28,6 +31,7 @@ from src.search.models import (
     SearchRoundKind,
     SearchTier,
     SourceRelation,
+    SourceRequirement,
 )
 from tests.search_fakes import StaticEvidenceJudge
 
@@ -58,6 +62,46 @@ def plan(required_topics=("定义",), route=SearchTier.STANDARD):
         d, "什么是光合作用", __import__("src.search.models", fromlist=["PlanningStatus"]).PlanningStatus.NORMAL,
         ("光合作用",), None, (query(),), tuple(required_topics),
         frozenset({SourceRelation.PRIMARY, SourceRelation.INDEPENDENT}), (), _budget(route),
+    )
+
+
+def material_topic_plan():
+    d = decision(SearchTier.STANDARD)
+    topics = (
+        RequiredTopic(
+            "topic-1",
+            "background",
+            False,
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        ),
+        RequiredTopic(
+            "topic-2",
+            "core",
+            True,
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        ),
+    )
+    direct = SearchQuery(
+        "initial-1",
+        SearchRoundKind.INITIAL,
+        QueryPurpose.DIRECT,
+        "比较并发 API",
+        query_index=1,
+        target_topic_ids=("topic-2",),
+    )
+    return SearchPlan(
+        d,
+        "比较并发 API",
+        PlanningStatus.NORMAL,
+        (),
+        None,
+        (direct,),
+        topics,
+        frozenset({SourceRelation.PRIMARY, SourceRelation.INDEPENDENT}),
+        (),
+        _budget(SearchTier.STANDARD),
     )
 
 
@@ -260,6 +304,110 @@ class EvidenceAdmissionTests(unittest.TestCase):
 
         self.assertEqual(bundle.evidence_items, ())
         self.assertEqual(bundle.conflicts, ())
+
+
+class MaterialTopicEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = evidence_module()
+
+    def test_nonmaterial_background_does_not_block_material_sufficiency_or_gap(self):
+        search_plan = material_topic_plan()
+        assembler = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=("core",))})
+        )
+
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual((), bundle.missing_claim_topics)
+        self.assertEqual((), gap.missing_claim_topics)
+
+    def test_missing_material_topic_drives_repair_without_background(self):
+        search_plan = material_topic_plan()
+        assembler = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=())})
+        )
+
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        planner = importlib.import_module("src.search.planner").SearchPlanner(object())
+        repair = planner.plan_repair(search_plan, gap)
+
+        self.assertEqual(("core",), bundle.missing_claim_topics)
+        self.assertEqual(("core",), gap.missing_claim_topics)
+        self.assertTrue(repair.triggered)
+        self.assertIn("core", repair.repair_query.text)
+        self.assertNotIn("background", repair.repair_query.text)
+
+    def test_nonmaterial_conflicts_do_not_create_gap_or_repair(self):
+        search_plan = material_topic_plan()
+        assembler = self.module.EvidenceAssembler(StaticEvidenceJudge({
+            "C1": judge_ok(
+                "C1", supported=("background",),
+                conflict_key="background-version", conflict_value="1",
+            ),
+            "C2": judge_ok(
+                "C2", supported=("background",),
+                conflict_key="background-version", conflict_value="2",
+            ),
+            "C3": judge_ok("C3", supported=("core",)),
+        }))
+
+        bundle = assembler.assemble(
+            search_plan,
+            (
+                candidate(url="https://one.example/background"),
+                candidate(url="https://two.example/background"),
+                candidate(url="https://three.example/core"),
+            ),
+        )
+        gap = assembler.analyze_gap(search_plan, bundle)
+        repair = importlib.import_module("src.search.planner").SearchPlanner(
+            object()
+        ).plan_repair(search_plan, gap)
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual((), bundle.conflict_groups)
+        self.assertFalse(gap.repair_eligible)
+        self.assertFalse(repair.triggered)
+
+    def test_repair_ignores_a_nonmaterial_only_missing_topic(self):
+        search_plan = material_topic_plan()
+        gap = EvidenceGapAnalysis(
+            ("background",), (), True, "fill missing topic", ("missing_topic",),
+        )
+
+        repair = importlib.import_module("src.search.planner").SearchPlanner(
+            object()
+        ).plan_repair(search_plan, gap)
+
+        self.assertFalse(repair.triggered)
+
+    def test_repair_keeps_a_label_shared_by_material_and_nonmaterial_topics(self):
+        search_plan = replace(
+            material_topic_plan(),
+            required_topics=(
+                RequiredTopic(
+                    "topic-1", "shared", False,
+                    FreshnessRequirement.NOT_REQUIRED,
+                ),
+                RequiredTopic(
+                    "topic-2", "shared", True,
+                    FreshnessRequirement.NOT_REQUIRED,
+                ),
+            ),
+        )
+        gap = EvidenceGapAnalysis(
+            ("shared",), (), True, "fill missing topic", ("missing_topic",),
+        )
+
+        repair = importlib.import_module("src.search.planner").SearchPlanner(
+            object()
+        ).plan_repair(search_plan, gap)
+
+        self.assertTrue(repair.triggered)
+        self.assertIn("shared", repair.repair_query.text)
 
 
 class EvidenceDedupTests(unittest.TestCase):

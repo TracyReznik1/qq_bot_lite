@@ -1138,6 +1138,50 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     self._plan(m, queries=queries)
 
+    def test_structured_plan_requires_canonical_material_target_tuples(self):
+        m = models()
+        topics = (
+            self._topic(m, "topic-1", "第一主张"),
+            self._topic(m, "topic-2", "第二主张"),
+            self._topic(m, "topic-3", "背景", material=False),
+        )
+        direct = self._query(m, targets=("topic-1", "topic-2"))
+        supplement = self._query(
+            m,
+            query_id="initial-2",
+            query_index=2,
+            purpose=m.QueryPurpose.PRIMARY,
+            targets=("topic-1",),
+            text="第一主张官方资料",
+        )
+        invalid_queries = (
+            (self._query(m, targets=("topic-2", "topic-1")),),
+            (self._query(m, targets=("topic-1", "topic-2", "topic-1")),),
+            (direct, self._query(
+                m,
+                query_id="initial-2",
+                query_index=2,
+                purpose=m.QueryPurpose.PRIMARY,
+                targets=("topic-1", "topic-1"),
+                text="重复目标",
+            )),
+            (direct, self._query(
+                m,
+                query_id="initial-2",
+                query_index=2,
+                purpose=m.QueryPurpose.PRIMARY,
+                targets=("topic-2", "topic-1"),
+                text="倒序目标",
+            )),
+        )
+        self.assertEqual((direct, supplement), self._plan(
+            m, topics=topics, queries=(direct, supplement)
+        ).initial_queries)
+        for queries in invalid_queries:
+            with self.subTest(queries=queries):
+                with self.assertRaises((TypeError, ValueError)):
+                    self._plan(m, topics=topics, queries=queries)
+
     def test_legacy_topic_labels_do_not_admit_unsealed_structured_plans(self):
         m = models()
         legacy_query = m.SearchQuery(

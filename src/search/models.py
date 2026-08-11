@@ -734,9 +734,9 @@ class SearchPlan:
         )
         if tuple(topic.topic_id for topic in self.required_topics) != expected_topic_ids:
             raise ValueError("required topic ids must be closed and sequential")
-        material_topic_ids = {
+        material_topic_ids = tuple(
             topic.topic_id for topic in self.required_topics if topic.material
-        }
+        )
         if not material_topic_ids:
             raise ValueError("structured plans require at least one material topic")
         if not self.initial_queries:
@@ -766,11 +766,22 @@ class SearchPlan:
         if tuple(query.query_index for query in self.initial_queries) != expected_query_indexes:
             raise ValueError("initial query indexes must be unique and sequential")
         direct = self.initial_queries[0]
-        if set(direct.target_topic_ids) != material_topic_ids:
+        if tuple(direct.target_topic_ids) != material_topic_ids:
             raise ValueError("direct query must target every material topic")
+        material_topic_id_set = set(material_topic_ids)
         for query in self.initial_queries[1:]:
-            target_topic_ids = set(query.target_topic_ids)
-            if not target_topic_ids or not target_topic_ids.issubset(material_topic_ids):
+            target_topic_ids = tuple(query.target_topic_ids)
+            target_topic_id_set = set(target_topic_ids)
+            if (
+                not target_topic_ids
+                or len(target_topic_id_set) != len(target_topic_ids)
+                or not target_topic_id_set.issubset(material_topic_id_set)
+                or tuple(
+                    topic_id
+                    for topic_id in material_topic_ids
+                    if topic_id in target_topic_id_set
+                ) != target_topic_ids
+            ):
                 raise ValueError("supplemental queries must target known material topics")
 
 

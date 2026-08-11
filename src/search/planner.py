@@ -484,7 +484,7 @@ class SearchPlanner:
         )
         planned, query_degraded = _model_supplemental_queries(
             payload,
-            material_topic_ids=set(_material_topic_ids(required_topics)),
+            material_topic_ids=_material_topic_ids(required_topics),
         )
         if planned is None:
             fallback = self._deterministic_plan(
@@ -591,7 +591,24 @@ class SearchPlanner:
         if not gap.repair_reason_codes:
             return RepairPlan(triggered=False, gap_codes=(), repair_query=None)
 
-        missing_topics = gap.missing_claim_topics
+        material_topic_labels = {
+            topic.label for topic in plan.required_topics if topic.material
+        }
+        missing_topics = tuple(
+            topic
+            for topic in gap.missing_claim_topics
+            if topic in material_topic_labels
+        )
+        if (
+            gap.missing_claim_topics
+            and not missing_topics
+            and not gap.conflict_group_ids
+        ):
+            return RepairPlan(
+                triggered=False,
+                gap_codes=gap.repair_reason_codes,
+                repair_query=None,
+            )
         topic = missing_topics[0] if missing_topics else "证据缺口"
         repair_text = f"{topic} {_short_original(plan.original_question)}"
         repaired, codes, degraded = self._clean_repair_text(repair_text, plan.original_question, plan.decision)
@@ -885,11 +902,13 @@ def _parse_model_topic(raw: Any, index: int) -> RequiredTopic | None:
 def _model_supplemental_queries(
     payload: Mapping[str, Any],
     *,
-    material_topic_ids: set[str],
+    material_topic_ids: Sequence[str],
 ) -> tuple[tuple[SearchQuery, ...] | None, bool]:
     raw_queries = payload.get("supplemental_queries")
     if not isinstance(raw_queries, list):
         return None, True
+    ordered_material_topic_ids = tuple(material_topic_ids)
+    material_topic_id_set = set(ordered_material_topic_ids)
     queries: list[SearchQuery] = []
     degraded = False
     for raw in raw_queries:
@@ -897,10 +916,22 @@ def _model_supplemental_queries(
         degraded = degraded or malformed
         if query is None:
             continue
-        target_topic_ids = set(query.target_topic_ids)
-        if not target_topic_ids or not target_topic_ids.issubset(material_topic_ids):
+        target_topic_ids = tuple(dict.fromkeys(query.target_topic_ids))
+        target_topic_id_set = set(target_topic_ids)
+        if (
+            not target_topic_ids
+            or not target_topic_id_set.issubset(material_topic_id_set)
+        ):
             continue
-        queries.append(query)
+        canonical_target_topic_ids = tuple(
+            topic_id
+            for topic_id in ordered_material_topic_ids
+            if topic_id in target_topic_id_set
+        )
+        queries.append(replace(
+            query,
+            target_topic_ids=canonical_target_topic_ids,
+        ))
     return tuple(queries), degraded
 
 
