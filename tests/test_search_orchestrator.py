@@ -13,10 +13,12 @@ from datetime import date
 from unittest import mock
 
 from src.search.models import (
+    Actionability,
     DEFAULT_TIER_BUDGETS,
     EvidenceState,
     Factuality,
     Freshness,
+    PotentialHarm,
     ProviderReadiness,
     ProviderStatus,
     RequestSource,
@@ -281,18 +283,81 @@ class OrchestratorLightTests(unittest.TestCase):
         self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIsNone(result.failure_code)
 
-    def test_production_trace_never_serializes_deep_route(self):
-        provider = _FakeProvider(hits=[_hit()])
+    def test_legacy_deep_router_raises_before_trace_route_can_change(self):
+        legacy_decision = RetrievalDecision(
+            route=SearchTier.DEEP,
+            skip_reason=None,
+            forced_search=False,
+            trigger_codes=(TriggerCode.FACTUAL_DEFAULT,),
+            benefit_dimensions=frozenset(),
+            factuality=Factuality.FACTUAL,
+            external_fact_required=True,
+            freshness=Freshness.NONE,
+            risk=RiskLevel.LOW,
+            actionability=Actionability.NONE,
+            potential_harm=PotentialHarm.NONE,
+            program_minimum_tier=SearchTier.DEEP,
+            model_recommended_tier=None,
+            final_reason_codes=(TriggerCode.FACTUAL_DEFAULT,),
+        )
+
+        class LegacyDeepRouter:
+            def __init__(self):
+                self.requests = []
+
+            def decide(self, retrieval_request):
+                self.requests.append(retrieval_request)
+                return legacy_decision
+
+        class RecordingTrace:
+            instances = []
+
+            def __init__(self, **kwargs):
+                self.request_id = kwargs["request_id"]
+                self.request_source = kwargs["request_source"]
+                self._route = kwargs["route"]
+                self.response_started_at = kwargs["response_started_at"]
+                self.__class__.instances.append(self)
+
+            @property
+            def route(self):
+                return self._route
+
+            @route.setter
+            def route(self, _value):
+                raise AssertionError("retired deep decision must not update the trace route")
+
+        class Planner:
+            def __init__(self):
+                self.calls = 0
+
+            def plan(self, *_args, **_kwargs):
+                self.calls += 1
+                raise AssertionError("retired deep decision must not reach planning")
+
+        router = LegacyDeepRouter()
+        planner = Planner()
         orchestrator = self.module.SearchOrchestrator(
-            router=_make_router(router_payload("deep")),
-            planner=_make_planner(),
+            router=router,
+            planner=planner,
             judge=_FakeJudge(),
-            providers=(provider,),
+            providers=(),
             extractor=_FakeExtractor(),
             clock=FakeClock(),
         )
-        result = orchestrator.run(request("北京今天有什么新闻？"))
-        self.assertNotEqual("deep", result.trace.to_log_dict()["route"])
+        retrieval_request = request("北京今天有什么新闻？")
+
+        with mock.patch.object(self.module, "SearchTrace", RecordingTrace):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^production router emitted retired deep route$",
+            ):
+                orchestrator.run(retrieval_request)
+
+        self.assertEqual(router.requests, [retrieval_request])
+        self.assertEqual(planner.calls, 0)
+        self.assertEqual(len(RecordingTrace.instances), 1)
+        self.assertIs(RecordingTrace.instances[0].route, SearchTier.LIGHT)
 
 
 class OrchestratorStandardTests(unittest.TestCase):

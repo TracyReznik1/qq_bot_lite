@@ -587,7 +587,7 @@ class HighConsequenceWarningTests(unittest.TestCase):
         p = replace(
             plan(),
             decision=d,
-            budget=models().DEFAULT_TIER_BUDGETS[SearchTier.DEEP],
+            budget=models().DEFAULT_TIER_BUDGETS[d.route],
         )
         b = replace(bundle((item(),)), decision=d, plan=p)
         draft = GroundedDraft(
@@ -599,10 +599,10 @@ class HighConsequenceWarningTests(unittest.TestCase):
             draft, draft.answer_blocks, draft.claims, (), {}, (),
         )
         success = models().SearchPipelineResult(
-            d, p, b, trace(SearchTier.DEEP), None,
+            d, p, b, trace(d.route), None,
         )
         failure = models().SearchPipelineResult(
-            d, p, None, trace(SearchTier.DEEP),
+            d, p, None, trace(d.route),
             SearchFailureCode.PROVIDER_NOT_CONFIGURED,
         )
 
@@ -911,7 +911,7 @@ class HighConsequenceWarningTests(unittest.TestCase):
             p = replace(
                 plan(),
                 decision=d,
-                budget=models().DEFAULT_TIER_BUDGETS[SearchTier.DEEP],
+                budget=models().DEFAULT_TIER_BUDGETS[d.route],
             )
             b = replace(bundle((item(),)), decision=d, plan=p)
             draft = GroundedDraft(
@@ -920,9 +920,9 @@ class HighConsequenceWarningTests(unittest.TestCase):
                 (), (), False,
             )
             report = ValidationReport(draft, draft.answer_blocks, draft.claims, (), {}, ())
-            success = models().SearchPipelineResult(d, p, b, trace(SearchTier.DEEP), None)
+            success = models().SearchPipelineResult(d, p, b, trace(d.route), None)
             failure = models().SearchPipelineResult(
-                d, p, None, trace(SearchTier.DEEP), SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+                d, p, None, trace(d.route), SearchFailureCode.PROVIDER_NOT_CONFIGURED,
             )
             with self.subTest(advisor=label, path="success"):
                 rendered = module.render_search_reply(success, report, qq_limit=1700)
