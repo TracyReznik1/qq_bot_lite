@@ -582,7 +582,7 @@ class HighConsequenceWarningTests(unittest.TestCase):
         d = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
             models().RetrievalRequest("一条腿突然没力气，要去急诊吗？")
         )
-        self.assertIs(d.route, SearchTier.DEEP)
+        self.assertIs(d.route, SearchTier.STANDARD)
         self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, d.trigger_codes)
         p = replace(
             plan(),

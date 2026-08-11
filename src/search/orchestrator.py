@@ -133,6 +133,8 @@ class SearchOrchestrator:
             response_started_at=response_started,
         )
         decision = self._router.decide(request)
+        if decision.route is SearchTier.DEEP:
+            raise RuntimeError("production router emitted retired deep route")
         trace.route = decision.route
         trace.skip_reason = decision.skip_reason
         trace.trigger_codes = decision.trigger_codes

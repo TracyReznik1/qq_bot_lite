@@ -214,7 +214,7 @@ def _is_pure_greeting(question: str) -> bool:
     )
 
 
-# Dynamic-attribute words only force a DEEP/current-state floor when the
+# Dynamic-attribute words only force a STANDARD/current-state floor when the
 # request asks about the current value/state, not for a stable definition.
 _DYNAMIC_ATTRIBUTE_WORDS = ("版本", "价格", "行情", "利率", "汇率")
 _FRESHNESS_MODIFIERS = ("最新", "当前", "现在", "目前", "最近", "今天", "实时", "今日", "当下")
@@ -227,7 +227,7 @@ def _detect_current_state(question: str) -> tuple[TriggerCode, ...]:
     for marker, code in _CURRENT_STATE_TRIGGERS:
         if marker in lowered:
             if marker in _DYNAMIC_ATTRIBUTE_WORDS:
-                # Only current-version/price questions trigger DEEP; a stable
+                # Only current-version/price questions trigger STANDARD; a stable
                 # definition such as "什么是版本控制" must not.
                 if any(mod in lowered for mod in _FRESHNESS_MODIFIERS):
                     codes.append(code)
@@ -1083,7 +1083,7 @@ def _validated_classification(raw: Any) -> _Classification:
     actionability = _parse_enum(raw.get("actionability"), Actionability) or Actionability.NONE
     potential_harm = _parse_enum(raw.get("potential_harm"), PotentialHarm) or PotentialHarm.NONE
     recommended = _parse_enum(raw.get("recommended_tier"), SearchTier)
-    if recommended is SearchTier.SKIP:
+    if recommended not in {SearchTier.LIGHT, SearchTier.STANDARD}:
         recommended = None
     benefits = _parse_enum_list(raw.get("benefit_dimensions"), BenefitDimension) or ()
     triggers = _parse_enum_list(raw.get("trigger_codes"), TriggerCode) or ()
@@ -1113,7 +1113,6 @@ _ADVISOR_ENUM_FIELDS: Mapping[str, type[Any]] = {
     "risk": RiskLevel,
     "actionability": Actionability,
     "potential_harm": PotentialHarm,
-    "recommended_tier": SearchTier,
     "benefit_dimensions": BenefitDimension,
     "trigger_codes": TriggerCode,
 }
@@ -1147,9 +1146,11 @@ def _normalized_advisor_output(payload: dict[str, Any]) -> dict[str, Any]:
             if parsed is None:
                 raise ValueError(f"invalid enum value: {field_name}")
             payload[field_name] = parsed
-    recommended = payload.get("recommended_tier")
-    if recommended is SearchTier.SKIP:
-        raise ValueError("model may not recommend skip")
+    if "recommended_tier" in payload:
+        recommended = _parse_enum(payload["recommended_tier"], SearchTier)
+        if recommended not in {SearchTier.LIGHT, SearchTier.STANDARD}:
+            raise ValueError("model recommended tier is not in the closed set")
+        payload["recommended_tier"] = recommended
     skip_candidate = payload.get("skip_candidate")
     if skip_candidate is not None:
         if not isinstance(skip_candidate, dict) or "reason" not in skip_candidate:
@@ -1201,7 +1202,7 @@ Return JSON only with exactly these fields:
   "risk": "low|medium|high",
   "actionability": "none|general|personalized",
   "potential_harm": "none|low|high",
-  "recommended_tier": "light|standard|deep",
+  "recommended_tier": "light|standard",
   "trigger_codes": ["one or more closed trigger codes"]
 }
 
@@ -1337,8 +1338,8 @@ class RetrievalBenefitRouter:
             )
 
         raw = self._advisor.advise(request)
-        classification = _validated_classification(raw)
-        valid_advisor = bool(raw)
+        valid_advisor = _has_allowed_advisor_tier(raw)
+        classification = _validated_classification(raw) if valid_advisor else _Classification()
 
         # Compute forced / dynamic / high-consequence / mixed floors BEFORE any
         # closed-task skip, so a mixed request can never skip retrieval.
@@ -1354,13 +1355,10 @@ class RetrievalBenefitRouter:
             conservative = _conservative_uncertain_floor(question)
             floors = _max_tier(floors, conservative) if conservative is not None else floors
             uncertain_codes = [*floor_codes, TriggerCode.CLASSIFIER_UNCERTAIN]
-            if (
-                conservative is SearchTier.DEEP
-                and _classify_safety_intent(question) == _SAFETY_ACTIONABLE
-            ):
+            if _classify_safety_intent(question) == _SAFETY_ACTIONABLE:
                 uncertain_codes.append(TriggerCode.HIGH_CONSEQUENCE_ACTION)
             floor_codes = _dedupe_codes(tuple(uncertain_codes))
-        floor = floors if floors is not None else SearchTier.LIGHT
+        floor = _operational_tier(floors) if floors is not None else SearchTier.LIGHT
         if not floor_codes:
             floor_codes = (TriggerCode.FACTUAL_DEFAULT,)
         deterministic_high_consequence = (
@@ -1379,7 +1377,7 @@ class RetrievalBenefitRouter:
                 forced_search=False,
             )
 
-        recommended = classification.recommended_tier
+        recommended = _operational_tier(classification.recommended_tier)
         final_route = max_tier(floor, recommended) if recommended is not None else floor
 
         trigger_codes = _dedupe_codes((*explicit_codes, *classification.trigger_codes, *floor_codes))
@@ -1423,19 +1421,19 @@ def _compute_floors(
 
     safety_intent = _classify_safety_intent(question)
     if classification.freshness is Freshness.HIGH:
-        floor = _max_tier(floor, SearchTier.DEEP)
+        floor = _max_tier(floor, SearchTier.STANDARD)
         codes.append(TriggerCode.FRESHNESS_MARKER)
 
     current_state_codes = (
         () if safety_intent == _SAFETY_STABLE else _detect_current_state(question)
     )
     if current_state_codes:
-        floor = _max_tier(floor, SearchTier.DEEP)
+        floor = _max_tier(floor, SearchTier.STANDARD)
         codes.extend(current_state_codes)
 
     high_consequence = _detect_personalized_high_consequence(question)
     if high_consequence is not None:
-        floor = _max_tier(floor, SearchTier.DEEP)
+        floor = _max_tier(floor, SearchTier.STANDARD)
         codes.append(high_consequence)
 
     regulated = _detect_regulated_foundation(question)
@@ -1469,21 +1467,38 @@ def _max_tier(current: SearchTier | None, candidate: SearchTier) -> SearchTier:
     return current if _rank(current) >= _rank(candidate) else candidate
 
 
+def _operational_tier(tier: SearchTier | None) -> SearchTier | None:
+    if tier is SearchTier.DEEP:
+        return SearchTier.STANDARD
+    return tier
+
+
+def _has_allowed_advisor_tier(raw: Any) -> bool:
+    if not isinstance(raw, dict) or not raw:
+        return False
+    if "recommended_tier" not in raw:
+        return True
+    return _parse_enum(raw["recommended_tier"], SearchTier) in {
+        SearchTier.LIGHT,
+        SearchTier.STANDARD,
+    }
+
+
 def _conservative_uncertain_floor(question: str) -> SearchTier | None:
     """When the classifier fails, requests that touch high-consequence or
     current-state domains must not be silently under-routed to light."""
     lowered = question.casefold()
     safety_intent = _classify_safety_intent(question)
     if safety_intent == _SAFETY_ACTIONABLE:
-        return SearchTier.DEEP
+        return SearchTier.STANDARD
     if safety_intent == _SAFETY_STABLE:
         return SearchTier.STANDARD
     if any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS):
         if any(phrase in lowered for phrase in _HIGH_CONSEQUENCE_ACTION_PHRASES):
-            return SearchTier.DEEP
+            return SearchTier.STANDARD
         return SearchTier.STANDARD
     if _detect_current_state(question):
-        return SearchTier.DEEP
+        return SearchTier.STANDARD
     if any(marker in question for marker in _REGULATED_DOMAIN_FOUNDATION_WORDS):
         return SearchTier.STANDARD
     return None

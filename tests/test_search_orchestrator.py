@@ -281,6 +281,19 @@ class OrchestratorLightTests(unittest.TestCase):
         self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIsNone(result.failure_code)
 
+    def test_production_trace_never_serializes_deep_route(self):
+        provider = _FakeProvider(hits=[_hit()])
+        orchestrator = self.module.SearchOrchestrator(
+            router=_make_router(router_payload("deep")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+        result = orchestrator.run(request("北京今天有什么新闻？"))
+        self.assertNotEqual("deep", result.trace.to_log_dict()["route"])
+
 
 class OrchestratorStandardTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -799,7 +812,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
 
-    def test_queued_fifth_query_is_never_recorded_as_executed_or_invoked(self):
+    def test_queued_fourth_query_is_never_recorded_as_executed_or_invoked(self):
         started_queries = []
         lock = threading.Lock()
 
@@ -816,8 +829,8 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 from src.search.models import ProviderResult
                 return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
 
-        original = DEFAULT_TIER_BUDGETS[SearchTier.DEEP]
-        short_deep = SimpleNamespace(
+        original = DEFAULT_TIER_BUDGETS[SearchTier.STANDARD]
+        short_standard = SimpleNamespace(
             max_initial_queries=original.max_initial_queries,
             max_candidate_urls=original.max_candidate_urls,
             max_content_reads=original.max_content_reads,
@@ -827,9 +840,9 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             hard_timeout_seconds=0.05,
         )
         budgets = dict(DEFAULT_TIER_BUDGETS)
-        budgets[SearchTier.DEEP] = short_deep
+        budgets[SearchTier.STANDARD] = short_standard
 
-        class FiveQueryPlanner:
+        class FourQueryPlanner:
             def plan(self, *args, **kwargs):
                 from src.search.models import QueryPurpose, SearchQuery, SearchRoundKind
 
@@ -841,13 +854,13 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                         QueryPurpose.DIRECT,
                         f"query {index}",
                     )
-                    for index in range(1, 6)
+                    for index in range(1, 5)
                 )
                 return replace(base, initial_queries=queries)
 
         orchestrator = self.module.SearchOrchestrator(
-            router=_make_router(router_payload("deep")),
-            planner=FiveQueryPlanner(),
+            router=_make_router(router_payload("standard")),
+            planner=FourQueryPlanner(),
             judge=_FakeJudge(),
             providers=(BlockingProvider(),),
             extractor=_FakeExtractor(),
@@ -857,12 +870,12 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
         time.sleep(0.27)
 
-        self.assertEqual(len(started_queries), 4)
+        self.assertEqual(len(started_queries), 3)
         executed_ids = [query_id for query_id, _purpose in result.trace.executed_queries]
         attempted_ids = [attempt.query_id for attempt in result.trace.provider_attempts]
         self.assertCountEqual(executed_ids, started_queries)
         self.assertCountEqual(attempted_ids, started_queries)
-        self.assertNotIn("initial-5", executed_ids)
+        self.assertNotIn("initial-4", executed_ids)
 
     def test_repair_timeout_preserves_citable_truth_and_deduplicates_failure(self):
         class RepairBlockingProvider:

@@ -122,21 +122,34 @@ class RouterTableTests(unittest.TestCase):
         decision = decide("什么是股票")
         self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
 
-    def test_should_i_buy_this_stock_is_deep(self):
+    def test_should_i_buy_this_stock_is_standard_during_migration(self):
         decision = decide("我现在是否应该买这只股票")
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
     def test_what_is_civil_law_is_standard(self):
         decision = decide("什么是民法")
         self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
 
-    def test_is_my_situation_illegal_is_deep(self):
+    def test_is_my_situation_illegal_is_standard_during_migration(self):
         decision = decide("我的具体情况是否违法")
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
-    def test_beijing_news_today_is_deep(self):
+    def test_beijing_news_today_is_standard_during_migration(self):
         decision = decide("北京今天有什么新闻")
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
+
+    def test_production_router_never_emits_deep_during_migration(self):
+        questions = (
+            "北京今天有什么新闻？",
+            "我发烧39度，该吃多少布洛芬？",
+            "比较 Rust 和 Go 的并发模型并给出来源",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertIn(
+                    decide(question, NEUTRAL).route,
+                    {SearchTier.LIGHT, SearchTier.STANDARD},
+                )
 
     def test_explicit_search_with_source_is_forced_standard(self):
         decision = decide("请搜索并给出来源：CRAG 是什么")
@@ -189,7 +202,7 @@ class RouterTableTests(unittest.TestCase):
 class WarningSignalBoundaryTests(unittest.TestCase):
     def test_one_leg_sudden_weakness_is_high_consequence(self):
         decision = decide("一条腿突然没力气，要去急诊吗？", {})
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
         self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
         self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
@@ -202,7 +215,7 @@ class WarningSignalBoundaryTests(unittest.TestCase):
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(question=question, advisor=label):
                     decision = decide(question, advisor)
-                    self.assertIs(decision.route, SearchTier.DEEP)
+                    self.assertIs(decision.route, SearchTier.STANDARD)
                     self.assertIn(
                         TriggerCode.HIGH_CONSEQUENCE_ACTION,
                         decision.trigger_codes,
@@ -259,7 +272,7 @@ class WarningSignalBoundaryTests(unittest.TestCase):
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(suffix=suffix, advisor=label):
                     decision = decide("一条腿突然没力气，要去急诊吗？" + suffix, advisor)
-                    self.assertIs(decision.route, SearchTier.DEEP)
+                    self.assertIs(decision.route, SearchTier.STANDARD)
                     self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
                     self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
@@ -269,7 +282,7 @@ class WarningSignalBoundaryTests(unittest.TestCase):
             "后来我真的一条腿突然没力气，要去急诊吗？",
             {},
         )
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
         self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
         self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
 
@@ -301,7 +314,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
     def test_mixed_social_plus_news_cannot_skip(self):
         decision = decide("今天心情不错，但北京今天有什么新闻")
         self.assertNotEqual(decision.route, SearchTier.SKIP)
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.DEEP))
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
     def test_proof_plus_current_version_cannot_skip(self):
         decision = decide("证明一下，顺便看看最新版本是多少")
@@ -311,7 +324,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         decision = decide("这种药每天吃多少剂量", NEUTRAL)
         self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
 
-    def test_advisor_failure_floors_actionable_medical_and_chemical_requests_at_deep(self):
+    def test_advisor_failure_floors_actionable_medical_and_chemical_requests_at_standard(self):
         # Removing the conservative safety signal must make these fall back to
         # light when the advisor returns no usable classification.
         cases = (
@@ -322,7 +335,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         for question in cases:
             with self.subTest(question=question):
                 decision = decide(question, {})
-                self.assertIs(decision.route, SearchTier.DEEP)
+                self.assertIs(decision.route, SearchTier.STANDARD)
 
     def test_empty_and_malformed_advisor_keep_high_consequence_and_uncertain_codes(self):
         malformed_advisor = self.module.LLMRoutingAdvisor(_FakeRoutingLLM(content="not-json"))
@@ -333,7 +346,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         for label, router in routers:
             with self.subTest(advisor=label):
                 decision = router.decide(chat_request("我发烧39度，该吃多少布洛芬？"))
-                self.assertIs(decision.route, SearchTier.DEEP)
+                self.assertIs(decision.route, SearchTier.STANDARD)
                 self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
                 self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
 
@@ -355,7 +368,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in positive_cases:
             with self.subTest(kind="actionable", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
         stable_concepts = (
             "什么是药物剂量？",
@@ -386,7 +399,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(kind="actionable", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
         stable_concepts = (
             "什么是药物剂量？",
@@ -430,7 +443,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
     def test_advisor_failure_handles_family_level_units_paraphrases_and_scoped_negation(self):
         actionable_cases = (
@@ -452,7 +465,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
     def test_advisor_failure_keeps_stable_explanations_and_benign_scopes_below_deep(self):
         stable_explanations = (
@@ -493,7 +506,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
     def test_advisor_failure_scopes_absence_and_meta_without_hiding_later_emergencies(self):
         excluded_cases = (
@@ -518,7 +531,7 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in active_after_excluded_scope:
             with self.subTest(kind="active_after_excluded", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.DEEP)
+                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
 
     def test_advisor_failure_binds_dose_frequency_and_change_to_medication_subject(self):
         benign_overlaps = (
@@ -549,13 +562,13 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         decision = decide("什么是版本控制")
         self.assertNotEqual(decision.route, SearchTier.DEEP)
 
-    def test_current_version_question_is_deep(self):
+    def test_current_version_question_is_standard_during_migration(self):
         decision = decide("最新版本是多少")
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
 
 class FreshnessAndGreetingRegressionTests(unittest.TestCase):
-    def test_model_high_freshness_cannot_remain_light(self):
+    def test_model_high_freshness_is_standard_during_migration(self):
         payload = {
             **NEUTRAL,
             "freshness": "high",
@@ -563,13 +576,13 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
             "trigger_codes": ["freshness_marker"],
         }
         decision = decide("昨天天曼契约EDGVSTEC谁赢了", payload)
-        self.assertIs(decision.route, SearchTier.DEEP)
-        self.assertIs(decision.program_minimum_tier, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
+        self.assertIs(decision.program_minimum_tier, SearchTier.STANDARD)
         self.assertIn(TriggerCode.FRESHNESS_MARKER, decision.trigger_codes)
         self.assertEqual(decision.trigger_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
         self.assertEqual(decision.final_reason_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
 
-    def test_model_high_freshness_sets_deep_floor_without_question_signal(self):
+    def test_model_high_freshness_sets_standard_floor_without_question_signal(self):
         payload = {
             **NEUTRAL,
             "freshness": "high",
@@ -577,10 +590,10 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
             "trigger_codes": ["freshness_marker"],
         }
         decision = decide("什么是光合作用", payload)
-        self.assertIs(decision.route, SearchTier.DEEP)
-        self.assertIs(decision.program_minimum_tier, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
+        self.assertIs(decision.program_minimum_tier, SearchTier.STANDARD)
 
-    def test_relative_time_and_result_intent_is_deep_without_model_help(self):
+    def test_relative_time_and_result_intent_is_standard_without_model_help(self):
         for question in (
             "昨天EDG和TEC谁赢了",
             "前天比赛比分是多少",
@@ -588,7 +601,7 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
             "刚刚发生了什么",
         ):
             with self.subTest(question=question):
-                self.assertIs(decide(question, NEUTRAL).route, SearchTier.DEEP)
+                self.assertIs(decide(question, NEUTRAL).route, SearchTier.STANDARD)
 
     def test_pure_greetings_skip_search(self):
         for question in ("你好", "您好！", "下午好", "晚上好，ATRI", "哈喽"):
@@ -599,7 +612,7 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
 
     def test_greeting_plus_current_fact_does_not_skip(self):
         decision = decide("下午好，昨天EDG赢了吗", NEUTRAL)
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
         self.assertIsNone(decision.skip_reason)
 
     def test_result_variant_without_relative_time_stays_light(self):
@@ -653,15 +666,21 @@ class RouterProgramFloorTests(unittest.TestCase):
         decision = decide("什么是光合作用", payload)
         self.assertNotEqual(decision.route, SearchTier.SKIP)
 
-    def test_model_cannot_downgrade_deep(self):
+    def test_model_cannot_downgrade_standard_floor_during_migration(self):
         payload = {**NEUTRAL, "recommended_tier": "light"}
         decision = decide("我现在是否应该买这只股票", payload)
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
-    def test_model_can_upgrade_light(self):
+    def test_model_deep_recommendation_is_rejected_to_light(self):
         payload = {**NEUTRAL, "recommended_tier": "deep"}
         decision = decide("什么是光合作用", payload)
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+        self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
+
+    def test_deep_advisor_tier_uses_conservative_handling(self):
+        decision = decide("北京今天有什么新闻？", {"recommended_tier": "deep"})
+        self.assertIsNot(decision.route, SearchTier.DEEP)
+        self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
 
     def test_forced_search_conflict_never_calls_provider_route(self):
         decision = decide("请联网查，但不要联网", force_search=True)
@@ -698,7 +717,7 @@ class AdversarialAdvisorTests(unittest.TestCase):
 
     def test_lower_tier_recommendation_is_rejected(self):
         decision = decide("我现在是否应该买这只股票", {**NEUTRAL, "recommended_tier": "light"})
-        self.assertIs(decision.route, SearchTier.DEEP)
+        self.assertIs(decision.route, SearchTier.STANDARD)
 
     def test_memory_conflict_claim_cannot_create_skip_or_conflict(self):
         payload = {
@@ -771,6 +790,10 @@ class LLMRoutingAdvisorTests(unittest.TestCase):
 
     def test_recommending_skip_is_empty(self):
         result = self._advise('{"recommended_tier": "skip"}')
+        self.assertEqual(result, {})
+
+    def test_recommending_deep_is_empty(self):
+        result = self._advise('{"recommended_tier": "deep"}')
         self.assertEqual(result, {})
 
     def test_advisor_exception_is_empty(self):
