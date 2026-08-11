@@ -82,6 +82,29 @@ class Factuality(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+class RetrievalComplexityCode(StrEnum):
+    MULTI_FACT = "multi_fact"
+    MULTI_ENTITY = "multi_entity"
+    COMPARISON = "comparison"
+    RECOMMENDATION = "recommendation"
+    MULTI_SOURCE_REQUIRED = "multi_source_required"
+    CROSS_VERIFICATION_REQUIRED = "cross_verification_required"
+    AMBIGUOUS_ENTITY = "ambiguous_entity"
+
+
+class SourceRequirement(StrEnum):
+    ANY_RELEVANT = "any_relevant"
+    INDEPENDENT_CORROBORATION = "independent_corroboration"
+
+
+class FreshnessRequirement(StrEnum):
+    NOT_REQUIRED = "not_required"
+    CURRENT = "current"
+    AS_OF = "as_of"
+    WINDOW = "window"
+    VERSION = "version"
+
+
 class Freshness(StrEnum):
     NONE = "none"
     LOW = "low"
@@ -307,6 +330,106 @@ class RetrievalRequest:
 
 
 @dataclass(frozen=True)
+class RetrievalContext:
+    must_search: bool
+    skip_reason: SkipReason | None
+    factuality: Factuality
+    external_fact_required: bool
+    complexity_codes: tuple[RetrievalComplexityCode, ...]
+    source_requirement: SourceRequirement
+
+    def __post_init__(self) -> None:
+        if type(self.must_search) is not bool:
+            raise TypeError("must_search must be a boolean")
+        if type(self.external_fact_required) is not bool:
+            raise TypeError("external_fact_required must be a boolean")
+        if self.skip_reason is not None:
+            _require_enum(self.skip_reason, SkipReason, "skip_reason")
+        _require_enum(self.factuality, Factuality, "factuality")
+        _require_enum(self.source_requirement, SourceRequirement, "source_requirement")
+        complexity_codes = _tuple(self.complexity_codes)
+        _require_enum_values(
+            complexity_codes,
+            RetrievalComplexityCode,
+            "complexity_codes",
+        )
+        _normalize_fields(self, complexity_codes=complexity_codes)
+
+
+@dataclass(frozen=True)
+class FreshnessContext:
+    requirement: FreshnessRequirement
+    as_of: date | None
+    date_from: date | None
+    date_to: date | None
+    version_constraint: str | None
+
+    def __post_init__(self) -> None:
+        _require_enum(self.requirement, FreshnessRequirement, "requirement")
+        for field_name in ("as_of", "date_from", "date_to"):
+            value = getattr(self, field_name)
+            if value is not None and type(value) is not date:
+                raise TypeError(f"{field_name} must be a date or None")
+        if self.version_constraint is not None and type(self.version_constraint) is not str:
+            raise TypeError("version_constraint must be a string or None")
+        version_constraint = (
+            self.version_constraint.strip()
+            if self.version_constraint is not None
+            else None
+        )
+        _normalize_fields(self, version_constraint=version_constraint)
+        if self.date_from is not None and self.date_to is not None and self.date_from > self.date_to:
+            raise ValueError("freshness date_from cannot exceed date_to")
+        if self.requirement is FreshnessRequirement.NOT_REQUIRED and any(
+            value is not None
+            for value in (
+                self.as_of,
+                self.date_from,
+                self.date_to,
+                self.version_constraint,
+            )
+        ):
+            raise ValueError("not_required freshness cannot carry a constraint")
+        if (
+            self.requirement is FreshnessRequirement.VERSION
+            and not self.version_constraint
+        ):
+            raise ValueError("version freshness requires version_constraint")
+
+
+@dataclass(frozen=True)
+class RiskContext:
+    high_consequence: bool
+    warning_required: bool
+    fail_closed: bool
+
+    def __post_init__(self) -> None:
+        if not all(
+            type(value) is bool
+            for value in (
+                self.high_consequence,
+                self.warning_required,
+                self.fail_closed,
+            )
+        ):
+            raise TypeError("risk flags must be booleans")
+        if self.warning_required and not self.high_consequence:
+            raise ValueError("warning requires a high-consequence request")
+
+
+@dataclass(frozen=True)
+class RequestAnalysis:
+    retrieval: RetrievalContext
+    freshness: FreshnessContext
+    risk: RiskContext
+
+    def __post_init__(self) -> None:
+        _require_record(self.retrieval, RetrievalContext, "retrieval")
+        _require_record(self.freshness, FreshnessContext, "freshness")
+        _require_record(self.risk, RiskContext, "risk")
+
+
+@dataclass(frozen=True)
 class RetrievalDecision:
     route: SearchTier
     skip_reason: SkipReason | None
@@ -362,8 +485,7 @@ class RetrievalDecision:
         return (
             self.route is SearchTier.SKIP
             and self.skip_reason is SkipReason.USER_FORBID_WEB
-            and TriggerCode.EXPLICIT_NO_WEB in self.trigger_codes
-            and TriggerCode.EXPLICIT_SEARCH in self.trigger_codes
+            and self.forced_search
         )
 
 
@@ -893,8 +1015,12 @@ class SearchPipelineResult:
     evidence: EvidenceBundle | None
     trace: SearchTrace
     failure_code: SearchFailureCode | None = None
+    # Task 10 retains old direct constructors; production must always supply
+    # the immutable analysis created at the beginning of the request.
+    analysis: RequestAnalysis | None = None
 
     def __post_init__(self) -> None:
+        _require_record(self.analysis, RequestAnalysis, "analysis", optional=True)
         if self.failure_code is not None:
             _require_enum(self.failure_code, SearchFailureCode, "failure_code")
         if self.decision.route is SearchTier.SKIP:

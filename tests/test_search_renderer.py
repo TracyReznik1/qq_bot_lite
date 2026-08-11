@@ -6,6 +6,7 @@ import importlib
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from src.search.models import (
     AnswerBlock,
@@ -49,6 +50,21 @@ def renderer_module():
 
 def models():
     return importlib.import_module("src.search.models")
+
+
+def analyzed_decision(question: str, analyzer_content: str = "{}"):
+    """Use Task 3's analyzer -> context router path in renderer fixtures."""
+    from src.search.orchestrator import _with_legacy_analysis_metadata
+    from src.search.router import LLMRequestAnalyzer, RetrievalBenefitRouter
+
+    class StaticLLM:
+        def chat(self, *_args, **_kwargs):
+            return SimpleNamespace(content=analyzer_content)
+
+    request = models().RetrievalRequest(question, request_source=RequestSource.CHAT)
+    analysis = LLMRequestAnalyzer(StaticLLM()).analyze(request)
+    routed = RetrievalBenefitRouter().decide(analysis.retrieval)
+    return _with_legacy_analysis_metadata(routed, analysis), analysis
 
 
 def decision(tier=SearchTier.STANDARD):
@@ -574,16 +590,11 @@ class RenderPlainReplyTests(unittest.TestCase):
 
 class HighConsequenceWarningTests(unittest.TestCase):
     def test_empty_advisor_language_miss_warns_on_search_success_and_failure(self):
-        from src.search.router import RetrievalBenefitRouter
-        from tests.search_fakes import StaticRouterAdvisor
-
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-        d = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
-            models().RetrievalRequest("一条腿突然没力气，要去急诊吗？")
-        )
-        self.assertIs(d.route, SearchTier.STANDARD)
-        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, d.trigger_codes)
+        d, analysis = analyzed_decision("一条腿突然没力气，要去急诊吗？")
+        self.assertIs(d.route, SearchTier.LIGHT)
+        self.assertTrue(analysis.risk.high_consequence)
         p = replace(
             plan(),
             decision=d,
@@ -783,12 +794,8 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertEqual(1, rendered.degradation_disclosures.count(warning))
 
     def test_closed_skip_has_no_warning_but_no_web_high_consequence_gets_fixed_warning(self):
-        from src.search.router import RetrievalBenefitRouter
-        from tests.search_fakes import StaticRouterAdvisor
-
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-        router = RetrievalBenefitRouter(StaticRouterAdvisor({}))
         social = models().RetrievalDecision(
             SearchTier.SKIP,
             SkipReason.SOCIAL_OR_EMOTIONAL,
@@ -805,8 +812,8 @@ class HighConsequenceWarningTests(unittest.TestCase):
             None,
             (),
         )
-        no_web_high_consequence = router.decide(
-            models().RetrievalRequest("不要联网，我发烧39度，该吃多少布洛芬？")
+        no_web_high_consequence, analysis = analyzed_decision(
+            "不要联网，我发烧39度，该吃多少布洛芬？"
         )
 
         social_rendered = module.render_search_reply(
@@ -829,17 +836,15 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertEqual("你好呀", social_rendered.text)
         self.assertNotIn(warning, social_rendered.text)
         self.assertIs(no_web_high_consequence.route, SearchTier.SKIP)
+        self.assertTrue(analysis.risk.high_consequence)
         self.assertEqual(1, no_web_rendered.text.count("本次未联网核验"))
         self.assertNotIn("本次没有联网核验", no_web_rendered.text)
         self.assertNotIn(warning, no_web_rendered.text)
 
     def test_no_web_high_consequence_uses_no_web_warning_once(self):
-        from src.search.router import RetrievalBenefitRouter
-        from tests.search_fakes import StaticRouterAdvisor
-
         module = renderer_module()
-        decision = RetrievalBenefitRouter(StaticRouterAdvisor({})).decide(
-            models().RetrievalRequest("不要联网，我发烧39度，该吃多少布洛芬？")
+        decision, analysis = analyzed_decision(
+            "不要联网，我发烧39度，该吃多少布洛芬？"
         )
         search_result = models().SearchPipelineResult(
             decision,
@@ -862,6 +867,7 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertNotIn("本次没有联网核验", rendered.text)
         self.assertNotIn("搜索结果可能不完整或不准确", rendered.text)
         self.assertIn("有限说明", rendered.text)
+        self.assertTrue(analysis.risk.high_consequence)
 
     def test_warning_is_additive_to_grounded_answer_and_not_duplicated(self):
         module = renderer_module()
@@ -892,22 +898,18 @@ class HighConsequenceWarningTests(unittest.TestCase):
         self.assertEqual(1, rendered.text.count("搜索结果可能不完整或不准确"))
 
     def test_empty_and_malformed_advisor_warning_renders_on_success_and_failure(self):
-        from src.search.router import LLMRoutingAdvisor, RetrievalBenefitRouter
-        from src.services.llm_types import ChatResponse
-        from tests.search_fakes import StaticRouterAdvisor
-
-        class MalformedLLM:
-            def chat(self, *_args, **_kwargs):
-                return ChatResponse(content="not-json")
-
-        routers = (
-            ("empty", RetrievalBenefitRouter(StaticRouterAdvisor({}))),
-            ("malformed", RetrievalBenefitRouter(LLMRoutingAdvisor(MalformedLLM()))),
+        analyzer_contents = (
+            ("empty", "{}"),
+            ("malformed", "not-json"),
         )
         module = renderer_module()
         warning = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
-        for label, router in routers:
-            d = router.decide(models().RetrievalRequest("我发烧39度，该吃多少布洛芬？"))
+        for label, analyzer_content in analyzer_contents:
+            d, analysis = analyzed_decision(
+                "我发烧39度，该吃多少布洛芬？",
+                analyzer_content,
+            )
+            self.assertTrue(analysis.risk.high_consequence)
             p = replace(
                 plan(),
                 decision=d,

@@ -161,12 +161,14 @@ class SkipFlowTests(unittest.TestCase):
 
     def test_no_web_high_consequence_uses_no_provider_or_answer_model(self):
         from src.search.orchestrator import SearchOrchestrator
-        from src.search.router import RetrievalBenefitRouter
-        from tests.search_fakes import StaticRouterAdvisor
+        from src.search.router import LLMRequestAnalyzer, RetrievalBenefitRouter
 
         provider = mock.Mock()
+        analyzer_llm = mock.Mock()
+        analyzer_llm.chat.return_value = ChatResponse(content="{}")
         orchestrator = SearchOrchestrator(
-            router=RetrievalBenefitRouter(StaticRouterAdvisor({})),
+            request_analyzer=LLMRequestAnalyzer(analyzer_llm),
+            router=RetrievalBenefitRouter(),
             planner=mock.Mock(),
             judge=mock.Mock(),
             providers=(provider,),

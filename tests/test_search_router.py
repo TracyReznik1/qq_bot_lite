@@ -4,22 +4,31 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
+import json
 import unittest
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.search.models import (
     Actionability,
+    Factuality,
+    FreshnessContext,
+    FreshnessRequirement,
     PotentialHarm,
     RequestSource,
     RetrievalRequest,
+    RetrievalComplexityCode,
+    RetrievalContext,
+    RequestAnalysis,
+    RiskContext,
     RiskLevel,
     SearchTier,
     SkipReason,
+    SourceRequirement,
     TriggerCode,
 )
 from src.services.llm_types import ChatResponse
-from tests.search_fakes import StaticRouterAdvisor
 
 
 def router_module():
@@ -30,16 +39,18 @@ def router_module():
 
 
 NEUTRAL = {
-    "skip_candidate": None,
-    "benefit_dimensions": ["accuracy"],
     "factuality": "factual",
     "external_fact_required": True,
-    "freshness": "none",
-    "risk": "low",
-    "actionability": "none",
-    "potential_harm": "none",
-    "recommended_tier": "light",
-    "trigger_codes": ["factual_default"],
+    "complexity_codes": [],
+    "source_requirement": "any_relevant",
+    "freshness_requirement": "not_required",
+    "as_of": None,
+    "date_from": None,
+    "date_to": None,
+    "version_constraint": None,
+    "high_consequence": False,
+    "warning_required": False,
+    "fail_closed": False,
 }
 
 
@@ -51,23 +62,56 @@ def chat_request(question: str, *, force_search: bool = False) -> RetrievalReque
     )
 
 
+def _payload_content(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if payload is None:
+        return ""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def analyze(question, advisor_payload=NEUTRAL, **kwargs):
+    module = router_module()
+    assert module is not None, "src.search.router must exist"
+    llm = _FakeRoutingLLM(content=_payload_content(advisor_payload))
+    return module.LLMRequestAnalyzer(llm).analyze(chat_request(question, **kwargs))
+
+
 def decide(question, advisor_payload=NEUTRAL, **kwargs):
     module = router_module()
     assert module is not None, "src.search.router must exist"
-    router = module.RetrievalBenefitRouter(StaticRouterAdvisor(advisor_payload))
-    return router.decide(chat_request(question, **kwargs))
+    analysis = analyze(question, advisor_payload, **kwargs)
+    return module.RetrievalBenefitRouter().decide(analysis.retrieval)
 
 
-@dataclass
-class _RecordingAdvisor:
-    """Advisor that records every call for privacy assertions."""
+def _assert_high_consequence(
+    testcase: unittest.TestCase,
+    question: str,
+    advisor_payload: Any = NEUTRAL,
+    **kwargs: Any,
+):
+    """Keep the legacy safety cases, but assert them in RiskContext."""
 
-    calls: list[Any] = field(default_factory=list)
-    payload: Any = field(default_factory=lambda: dict(NEUTRAL))
+    analysis = analyze(question, advisor_payload, **kwargs)
+    decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+    testcase.assertTrue(analysis.risk.high_consequence)
+    testcase.assertTrue(analysis.risk.warning_required)
+    testcase.assertTrue(analysis.risk.fail_closed)
+    return analysis, decision
 
-    def advise(self, request: Any) -> Any:
-        self.calls.append(request)
-        return self.payload
+
+def _assert_not_high_consequence(
+    testcase: unittest.TestCase,
+    question: str,
+    advisor_payload: Any = NEUTRAL,
+    **kwargs: Any,
+):
+    analysis = analyze(question, advisor_payload, **kwargs)
+    decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+    testcase.assertFalse(analysis.risk.high_consequence)
+    testcase.assertFalse(analysis.risk.warning_required)
+    testcase.assertFalse(analysis.risk.fail_closed)
+    return analysis, decision
 
 
 @dataclass
@@ -120,7 +164,7 @@ class RouterTableTests(unittest.TestCase):
 
     def test_what_is_stock_is_standard(self):
         decision = decide("什么是股票")
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_should_i_buy_this_stock_is_standard_during_migration(self):
         decision = decide("我现在是否应该买这只股票")
@@ -128,15 +172,17 @@ class RouterTableTests(unittest.TestCase):
 
     def test_what_is_civil_law_is_standard(self):
         decision = decide("什么是民法")
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_is_my_situation_illegal_is_standard_during_migration(self):
         decision = decide("我的具体情况是否违法")
-        self.assertIs(decision.route, SearchTier.STANDARD)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_beijing_news_today_is_standard_during_migration(self):
-        decision = decide("北京今天有什么新闻")
-        self.assertIs(decision.route, SearchTier.STANDARD)
+        analysis = analyze("北京今天有什么新闻")
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_production_router_never_emits_deep_during_migration(self):
         questions = (
@@ -154,7 +200,7 @@ class RouterTableTests(unittest.TestCase):
     def test_explicit_search_with_source_is_forced_standard(self):
         decision = decide("请搜索并给出来源：CRAG 是什么")
         self.assertTrue(decision.forced_search)
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_no_web_summary_skips_with_zero_eligibility(self):
         decision = decide("不要联网，只根据我贴的内容总结")
@@ -165,14 +211,15 @@ class RouterTableTests(unittest.TestCase):
         self.assertIsNone(decision.program_minimum_tier)
 
     def test_no_web_high_consequence_keeps_deterministic_safety_signal(self):
-        decision = decide("不要联网，我发烧39度，该吃多少布洛芬？", {})
+        analysis, decision = _assert_high_consequence(
+            self,
+            "不要联网，我发烧39度，该吃多少布洛芬？",
+            {},
+        )
         self.assertIs(decision.route, SearchTier.SKIP)
         self.assertIs(decision.skip_reason, SkipReason.USER_FORBID_WEB)
         self.assertIn(TriggerCode.EXPLICIT_NO_WEB, decision.trigger_codes)
-        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-        self.assertIs(decision.risk, RiskLevel.HIGH)
-        self.assertIs(decision.actionability, Actionability.PERSONALIZED)
-        self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+        self.assertFalse(analysis.retrieval.external_fact_required)
 
     def test_conflicting_web_no_web_is_clarification(self):
         decision = decide("请联网查，但不要联网")
@@ -201,10 +248,12 @@ class RouterTableTests(unittest.TestCase):
 
 class WarningSignalBoundaryTests(unittest.TestCase):
     def test_one_leg_sudden_weakness_is_high_consequence(self):
-        decision = decide("一条腿突然没力气，要去急诊吗？", {})
-        self.assertIs(decision.route, SearchTier.STANDARD)
-        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-        self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+        _, decision = _assert_high_consequence(
+            self,
+            "一条腿突然没力气，要去急诊吗？",
+            {},
+        )
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_unilateral_sudden_no_strength_is_high_consequence(self):
         for question in (
@@ -214,13 +263,8 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         ):
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(question=question, advisor=label):
-                    decision = decide(question, advisor)
-                    self.assertIs(decision.route, SearchTier.STANDARD)
-                    self.assertIn(
-                        TriggerCode.HIGH_CONSEQUENCE_ACTION,
-                        decision.trigger_codes,
-                    )
-                    self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+                    _, decision = _assert_high_consequence(self, question, advisor)
+                    self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_no_strength_nonurgent_contexts_are_not_high_consequence(self):
         questions = (
@@ -234,12 +278,7 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         for question in questions:
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(question=question, advisor=label):
-                    decision = decide(question, advisor)
-                    self.assertNotIn(
-                        TriggerCode.HIGH_CONSEQUENCE_ACTION,
-                        decision.trigger_codes,
-                    )
-                    self.assertIsNot(decision.potential_harm, PotentialHarm.HIGH)
+                    _assert_not_high_consequence(self, question, advisor)
 
     def test_affirmative_meta_tail_variants_are_not_high_consequence(self):
         suffixes = (
@@ -251,10 +290,12 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         for suffix in suffixes:
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(suffix=suffix, advisor=label):
-                    decision = decide("一条腿突然没力气，要去急诊吗？" + suffix, advisor)
+                    _, decision = _assert_not_high_consequence(
+                        self,
+                        "一条腿突然没力气，要去急诊吗？" + suffix,
+                        advisor,
+                    )
                     self.assertIs(decision.route, SearchTier.LIGHT)
-                    self.assertNotIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-                    self.assertIs(decision.potential_harm, PotentialHarm.NONE)
 
     def test_negated_meta_tail_variants_keep_high_consequence(self):
         suffixes = (
@@ -271,20 +312,21 @@ class WarningSignalBoundaryTests(unittest.TestCase):
         for suffix in suffixes:
             for label, advisor in (("empty", {}), ("neutral", NEUTRAL)):
                 with self.subTest(suffix=suffix, advisor=label):
-                    decision = decide("一条腿突然没力气，要去急诊吗？" + suffix, advisor)
-                    self.assertIs(decision.route, SearchTier.STANDARD)
-                    self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-                    self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+                    _, decision = _assert_high_consequence(
+                        self,
+                        "一条腿突然没力气，要去急诊吗？" + suffix,
+                        advisor,
+                    )
+                    self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_meta_title_suffix_keeps_later_emergency_active(self):
-        decision = decide(
+        _, decision = _assert_high_consequence(
+            self,
             "一条腿突然没力气，要去急诊吗？这只是测试用例标题。"
             "后来我真的一条腿突然没力气，要去急诊吗？",
             {},
         )
-        self.assertIs(decision.route, SearchTier.STANDARD)
-        self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-        self.assertIs(decision.potential_harm, PotentialHarm.HIGH)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_stable_or_negated_leg_text_is_not_high_consequence(self):
         for question in (
@@ -292,11 +334,7 @@ class WarningSignalBoundaryTests(unittest.TestCase):
             "我并没有一条腿突然没力气，只是在引用这个句子",
         ):
             with self.subTest(question=question):
-                decision = decide(question, NEUTRAL)
-                self.assertNotIn(
-                    TriggerCode.HIGH_CONSEQUENCE_ACTION,
-                    decision.trigger_codes,
-                )
+                _assert_not_high_consequence(self, question, NEUTRAL)
 
 
 class RouterConflictAndFloorTests(unittest.TestCase):
@@ -312,17 +350,19 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         self.assertTrue(decision.requires_clarification)
 
     def test_mixed_social_plus_news_cannot_skip(self):
-        decision = decide("今天心情不错，但北京今天有什么新闻")
+        analysis = analyze("今天心情不错，但北京今天有什么新闻")
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
         self.assertNotEqual(decision.route, SearchTier.SKIP)
-        self.assertIs(decision.route, SearchTier.STANDARD)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_proof_plus_current_version_cannot_skip(self):
         decision = decide("证明一下，顺便看看最新版本是多少")
         self.assertNotEqual(decision.route, SearchTier.SKIP)
 
     def test_advisor_failure_with_high_consequence_domain_is_not_light(self):
-        decision = decide("这种药每天吃多少剂量", NEUTRAL)
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+        _, decision = _assert_high_consequence(self, "这种药每天吃多少剂量", NEUTRAL)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_floors_actionable_medical_and_chemical_requests_at_standard(self):
         # Removing the conservative safety signal must make these fall back to
@@ -334,29 +374,27 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in cases:
             with self.subTest(question=question):
-                decision = decide(question, {})
-                self.assertIs(decision.route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_empty_and_malformed_advisor_keep_high_consequence_and_uncertain_codes(self):
-        malformed_advisor = self.module.LLMRoutingAdvisor(_FakeRoutingLLM(content="not-json"))
-        routers = (
-            ("empty", self.module.RetrievalBenefitRouter(StaticRouterAdvisor({}))),
-            ("malformed", self.module.RetrievalBenefitRouter(malformed_advisor)),
-        )
-        for label, router in routers:
+        for label, payload in (("empty", {}), ("malformed", "not-json")):
             with self.subTest(advisor=label):
-                decision = router.decide(chat_request("我发烧39度，该吃多少布洛芬？"))
-                self.assertIs(decision.route, SearchTier.STANDARD)
-                self.assertIn(TriggerCode.HIGH_CONSEQUENCE_ACTION, decision.trigger_codes)
-                self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
+                analysis, decision = _assert_high_consequence(
+                    self,
+                    "我发烧39度，该吃多少布洛芬？",
+                    payload,
+                )
+                self.assertIs(decision.route, SearchTier.LIGHT)
+                self.assertIs(analysis.retrieval.factuality, Factuality.AMBIGUOUS)
 
     def test_advisor_failure_keeps_stable_regulated_definitions_standard(self):
         # These are concepts, not personal or urgent action requests. A domain
         # word alone must not promote them to deep.
         for question in ("什么是疫苗？", "什么是民法？", "什么是基金？"):
             with self.subTest(question=question):
-                decision = decide(question, {})
-                self.assertIs(decision.route, SearchTier.STANDARD)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_structures_actionable_safety_intent_without_promoting_concepts(self):
         positive_cases = (
@@ -368,7 +406,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in positive_cases:
             with self.subTest(kind="actionable", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
         stable_concepts = (
             "什么是药物剂量？",
@@ -377,7 +416,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in stable_concepts:
             with self.subTest(kind="concept", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
         quoted_or_nonpersonal = (
             "“泰诺每次吃几片？”这句话是什么意思？",
@@ -385,7 +425,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in quoted_or_nonpersonal:
             with self.subTest(kind="quoted", question=question):
-                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIsNot(decision.route, SearchTier.DEEP)
 
     def test_advisor_failure_handles_structural_safety_scope_and_unseen_variants(self):
         actionable_cases = (
@@ -399,7 +440,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(kind="actionable", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
         stable_concepts = (
             "什么是药物剂量？",
@@ -408,7 +450,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in stable_concepts:
             with self.subTest(kind="concept", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
         excluded_or_harmless = (
             "薯片每次吃几片比较合适？",
@@ -420,7 +463,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in excluded_or_harmless:
             with self.subTest(kind="excluded", question=question):
-                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIsNot(decision.route, SearchTier.DEEP)
 
     def test_advisor_failure_covers_round_two_actionable_safety_families(self):
         actionable_cases = (
@@ -443,7 +487,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_handles_family_level_units_paraphrases_and_scoped_negation(self):
         actionable_cases = (
@@ -465,7 +510,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_keeps_stable_explanations_and_benign_scopes_below_deep(self):
         stable_explanations = (
@@ -476,7 +522,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in stable_explanations:
             with self.subTest(kind="stable", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
         quoted_or_harmless = (
             "胸痛怎么办”这只是示例。",
@@ -490,7 +537,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in quoted_or_harmless:
             with self.subTest(kind="excluded", question=question):
-                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIsNot(decision.route, SearchTier.DEEP)
 
     def test_advisor_failure_covers_round_three_medication_acute_and_exposure_actions(self):
         actionable_cases = (
@@ -506,7 +554,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in actionable_cases:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_scopes_absence_and_meta_without_hiding_later_emergencies(self):
         excluded_cases = (
@@ -520,7 +569,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in excluded_cases:
             with self.subTest(kind="excluded", question=question):
-                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIsNot(decision.route, SearchTier.DEEP)
 
         active_after_excluded_scope = (
             "我没有出现胸痛，但呼吸困难怎么办？",
@@ -531,7 +581,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in active_after_excluded_scope:
             with self.subTest(kind="active_after_excluded", question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_advisor_failure_binds_dose_frequency_and_change_to_medication_subject(self):
         benign_overlaps = (
@@ -543,7 +594,8 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in benign_overlaps:
             with self.subTest(question=question):
-                self.assertIsNot(decide(question, {}).route, SearchTier.DEEP)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIsNot(decision.route, SearchTier.DEEP)
 
     def test_advisor_failure_floors_stable_effect_use_and_meaning_explanations_at_standard(self):
         stable_explanations = (
@@ -556,42 +608,42 @@ class RouterConflictAndFloorTests(unittest.TestCase):
         )
         for question in stable_explanations:
             with self.subTest(question=question):
-                self.assertIs(decide(question, {}).route, SearchTier.STANDARD)
+                _, decision = _assert_not_high_consequence(self, question, {})
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_stable_version_definition_is_not_deep(self):
-        decision = decide("什么是版本控制")
+        analysis = analyze("什么是版本控制")
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.NOT_REQUIRED)
         self.assertNotEqual(decision.route, SearchTier.DEEP)
 
     def test_current_version_question_is_standard_during_migration(self):
-        decision = decide("最新版本是多少")
-        self.assertIs(decision.route, SearchTier.STANDARD)
+        analysis = analyze("最新版本是多少")
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
 
 class FreshnessAndGreetingRegressionTests(unittest.TestCase):
     def test_model_high_freshness_is_standard_during_migration(self):
         payload = {
             **NEUTRAL,
-            "freshness": "high",
-            "recommended_tier": "light",
-            "trigger_codes": ["freshness_marker"],
+            "freshness_requirement": "current",
         }
-        decision = decide("昨天天曼契约EDGVSTEC谁赢了", payload)
-        self.assertIs(decision.route, SearchTier.STANDARD)
-        self.assertIs(decision.program_minimum_tier, SearchTier.STANDARD)
-        self.assertIn(TriggerCode.FRESHNESS_MARKER, decision.trigger_codes)
-        self.assertEqual(decision.trigger_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
-        self.assertEqual(decision.final_reason_codes.count(TriggerCode.FRESHNESS_MARKER), 1)
+        analysis = analyze("昨天天曼契约EDGVSTEC谁赢了", payload)
+        decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_model_high_freshness_sets_standard_floor_without_question_signal(self):
         payload = {
             **NEUTRAL,
-            "freshness": "high",
-            "recommended_tier": "light",
-            "trigger_codes": ["freshness_marker"],
+            "freshness_requirement": "current",
         }
-        decision = decide("什么是光合作用", payload)
-        self.assertIs(decision.route, SearchTier.STANDARD)
-        self.assertIs(decision.program_minimum_tier, SearchTier.STANDARD)
+        analysis = analyze("什么是光合作用", payload)
+        decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_relative_time_and_result_intent_is_standard_without_model_help(self):
         for question in (
@@ -601,7 +653,10 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
             "刚刚发生了什么",
         ):
             with self.subTest(question=question):
-                self.assertIs(decide(question, NEUTRAL).route, SearchTier.STANDARD)
+                analysis = analyze(question, NEUTRAL)
+                decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+                self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+                self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_pure_greetings_skip_search(self):
         for question in ("你好", "您好！", "下午好", "晚上好，ATRI", "哈喽"):
@@ -611,8 +666,10 @@ class FreshnessAndGreetingRegressionTests(unittest.TestCase):
                 self.assertIs(decision.skip_reason, SkipReason.SOCIAL_OR_EMOTIONAL)
 
     def test_greeting_plus_current_fact_does_not_skip(self):
-        decision = decide("下午好，昨天EDG赢了吗", NEUTRAL)
-        self.assertIs(decision.route, SearchTier.STANDARD)
+        analysis = analyze("下午好，昨天EDG赢了吗", NEUTRAL)
+        decision = router_module().RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIs(decision.route, SearchTier.LIGHT)
         self.assertIsNone(decision.skip_reason)
 
     def test_result_variant_without_relative_time_stays_light(self):
@@ -673,14 +730,16 @@ class RouterProgramFloorTests(unittest.TestCase):
 
     def test_model_deep_recommendation_is_rejected_to_light(self):
         payload = {**NEUTRAL, "recommended_tier": "deep"}
-        decision = decide("什么是光合作用", payload)
+        analysis = analyze("什么是光合作用", payload)
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
         self.assertIs(decision.route, SearchTier.LIGHT)
-        self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
+        self.assertIs(analysis.retrieval.factuality, Factuality.AMBIGUOUS)
 
     def test_deep_advisor_tier_uses_conservative_handling(self):
-        decision = decide("北京今天有什么新闻？", {"recommended_tier": "deep"})
+        analysis = analyze("北京今天有什么新闻？", {"recommended_tier": "deep"})
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
         self.assertIsNot(decision.route, SearchTier.DEEP)
-        self.assertIn(TriggerCode.CLASSIFIER_UNCERTAIN, decision.trigger_codes)
+        self.assertIs(analysis.retrieval.factuality, Factuality.AMBIGUOUS)
 
     def test_forced_search_conflict_never_calls_provider_route(self):
         decision = decide("请联网查，但不要联网", force_search=True)
@@ -704,7 +763,7 @@ class AdversarialAdvisorTests(unittest.TestCase):
     def test_high_confidence_cannot_skip(self):
         decision = decide("什么是民法", self._adversarial("closed_context_only"))
         self.assertIsNot(decision.route, SearchTier.SKIP)
-        self.assertGreaterEqual(_tier_index(decision.route), _tier_index(SearchTier.STANDARD))
+        self.assertIs(decision.route, SearchTier.LIGHT)
 
     def test_common_knowledge_cannot_skip(self):
         decision = decide("什么是光合作用", self._adversarial("social_or_emotional"))
@@ -737,10 +796,10 @@ class AdvisorPrivacyTests(unittest.TestCase):
         self.module = router_module()
 
     def test_llm_advisor_receives_only_question_and_schemas(self):
-        llm = _FakeRoutingLLM(content='{"skip_candidate": null}')
-        advisor = self.module.LLMRoutingAdvisor(llm)
+        llm = _FakeRoutingLLM(content=_payload_content(NEUTRAL))
+        advisor = self.module.LLMRequestAnalyzer(llm)
         request = chat_request("什么是光合作用")
-        advisor.advise(request)
+        advisor.analyze(request)
         self.assertEqual(len(llm.calls), 1)
         messages = llm.calls[0][0]
         joined = "\n".join(str(m.get("content", "")) for m in messages)
@@ -749,15 +808,14 @@ class AdvisorPrivacyTests(unittest.TestCase):
             self.assertNotIn(forbidden, joined)
 
     def test_static_advisor_capture_has_no_private_identifiers(self):
-        advisor = _RecordingAdvisor()
-        router = self.module.RetrievalBenefitRouter(advisor)
-        router.decide(chat_request("什么是光合作用"))
-        self.assertEqual(len(advisor.calls), 1)
-        self.assertEqual(advisor.calls[0].question, "什么是光合作用")
-        self.assertFalse(advisor.calls[0].has_images)
-        # The advisor only sees the request, never memory or history.
-        self.assertFalse(hasattr(advisor.calls[0], "memory"))
-        self.assertFalse(hasattr(advisor.calls[0], "history"))
+        llm = _FakeRoutingLLM(content=_payload_content(NEUTRAL))
+        analyzer = self.module.LLMRequestAnalyzer(llm)
+        analysis = analyzer.analyze(chat_request("什么是光合作用"))
+        decision = self.module.RetrievalBenefitRouter().decide(analysis.retrieval)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+        payload = json.loads(llm.calls[0][0][1]["content"])
+        self.assertEqual(payload, {"question": "什么是光合作用", "has_images": False})
 
 
 class LLMRoutingAdvisorTests(unittest.TestCase):
@@ -766,40 +824,200 @@ class LLMRoutingAdvisorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = router_module()
 
-    def _advise(self, content):
-        llm = _FakeRoutingLLM(content=content)
-        advisor = self.module.LLMRoutingAdvisor(llm)
-        return advisor.advise(chat_request("什么是光合作用"))
+    def _parse(self, content):
+        return self.module.parse_advisor_json(content)
 
     def test_parses_valid_json(self):
-        result = self._advise('{"skip_candidate": null, "benefit_dimensions": ["accuracy"], "factuality": "mixed", "external_fact_required": true, "freshness": "low", "risk": "low", "actionability": "none", "potential_harm": "none", "recommended_tier": "standard", "trigger_codes": ["external_fact_explanation_or_comparison"]}')
-        self.assertEqual(result["recommended_tier"], SearchTier.STANDARD)
-        self.assertEqual(result["factuality"], __import__("src.search.models", fromlist=["Factuality"]).Factuality.MIXED)
+        result = self._parse(json.dumps({
+            **NEUTRAL,
+            "factuality": "mixed",
+            "complexity_codes": ["comparison"],
+        }))
+        self.assertEqual(result["complexity_codes"], (self.module.RetrievalComplexityCode.COMPARISON,))
+        self.assertIs(result["factuality"], Factuality.MIXED)
 
     def test_parses_fenced_json(self):
-        result = self._advise('```json\n{"skip_candidate": null}\n```')
-        self.assertIsNone(result["skip_candidate"])
+        result = self._parse(f"```json\n{json.dumps(NEUTRAL)}\n```")
+        self.assertEqual(result["complexity_codes"], ())
 
     def test_invalid_json_is_empty(self):
-        result = self._advise("I think the answer is 42")
+        result = self._parse("I think the answer is 42")
         self.assertEqual(result, {})
 
     def test_unknown_enum_is_empty(self):
-        result = self._advise('{"factuality": "certainly_true"}')
+        result = self._parse(json.dumps({**NEUTRAL, "factuality": "certainly_true"}))
         self.assertEqual(result, {})
 
     def test_recommending_skip_is_empty(self):
-        result = self._advise('{"recommended_tier": "skip"}')
+        result = self._parse(json.dumps({**NEUTRAL, "recommended_tier": "skip"}))
         self.assertEqual(result, {})
 
     def test_recommending_deep_is_empty(self):
-        result = self._advise('{"recommended_tier": "deep"}')
+        result = self._parse(json.dumps({**NEUTRAL, "recommended_tier": "deep"}))
         self.assertEqual(result, {})
 
     def test_advisor_exception_is_empty(self):
         llm = _FakeRoutingLLM(raise_error=RuntimeError("boom"))
-        advisor = self.module.LLMRoutingAdvisor(llm)
-        self.assertEqual(advisor.advise(chat_request("什么是光合作用")), {})
+        analysis = self.module.LLMRequestAnalyzer(llm).analyze(chat_request("什么是光合作用"))
+        self.assertIs(analysis.retrieval.factuality, Factuality.AMBIGUOUS)
+
+
+class RequestAnalysisRouterTests(unittest.TestCase):
+    """Task 3 contracts: only RetrievalContext may determine a tier."""
+
+    def setUp(self) -> None:
+        self.module = router_module()
+        self.router = self.module.RetrievalBenefitRouter()
+
+    def _route(self, question: str, payload: Any = NEUTRAL):
+        analysis = analyze(question, payload)
+        return analysis, self.router.decide(analysis.retrieval)
+
+    def test_same_retrieval_context_has_same_route_across_risk_and_freshness(self):
+        retrieval = RetrievalContext(
+            must_search=False,
+            skip_reason=None,
+            factuality=Factuality.FACTUAL,
+            external_fact_required=True,
+            complexity_codes=(),
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        )
+        low_risk = RequestAnalysis(
+            retrieval=retrieval,
+            freshness=FreshnessContext(
+                FreshnessRequirement.NOT_REQUIRED, None, None, None, None
+            ),
+            risk=RiskContext(False, False, False),
+        )
+        high_risk_current = RequestAnalysis(
+            retrieval=retrieval,
+            freshness=FreshnessContext(
+                FreshnessRequirement.CURRENT, None, None, None, None
+            ),
+            risk=RiskContext(True, True, True),
+        )
+        self.assertIs(self.router.decide(low_risk.retrieval).route, SearchTier.LIGHT)
+        self.assertIs(
+            self.router.decide(high_risk_current.retrieval).route,
+            SearchTier.LIGHT,
+        )
+
+    def test_fda_definition_is_low_risk_not_required_and_light(self):
+        analysis, decision = self._route("FDA 是什么机构？")
+        self.assertFalse(analysis.risk.high_consequence)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.NOT_REQUIRED)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_personal_ibuprofen_dose_risk_does_not_raise_tier(self):
+        analysis, decision = self._route("布洛芬说明书标注的成人单次剂量是多少？")
+        self.assertTrue(analysis.risk.high_consequence)
+        self.assertTrue(analysis.risk.warning_required)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.NOT_REQUIRED)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_current_weather_freshness_does_not_raise_tier(self):
+        analysis, decision = self._route("北京今天气温是多少？")
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertFalse(analysis.risk.high_consequence)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_drug_comparison_is_standard_for_retrieval_complexity(self):
+        analysis, decision = self._route("比较两款药的适应症和副作用")
+        self.assertIn(RetrievalComplexityCode.COMPARISON, analysis.retrieval.complexity_codes)
+        self.assertIs(decision.route, SearchTier.STANDARD)
+
+    def test_personal_recommendation_is_standard_only_for_retrieval_complexity(self):
+        analysis, decision = self._route("根据我的症状比较两种药并建议今晚服用哪个")
+        self.assertTrue(analysis.risk.high_consequence)
+        self.assertIs(analysis.freshness.requirement, FreshnessRequirement.CURRENT)
+        self.assertIn(RetrievalComplexityCode.COMPARISON, analysis.retrieval.complexity_codes)
+        self.assertIn(RetrievalComplexityCode.RECOMMENDATION, analysis.retrieval.complexity_codes)
+        self.assertIs(decision.route, SearchTier.STANDARD)
+
+    def test_explicit_source_only_requires_any_relevant_and_light(self):
+        analysis, decision = self._route("请搜索光合作用定义并给出处")
+        self.assertTrue(analysis.retrieval.must_search)
+        self.assertIs(
+            analysis.retrieval.source_requirement,
+            SourceRequirement.ANY_RELEVANT,
+        )
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_independent_corroboration_is_standard(self):
+        analysis, decision = self._route("请用两个独立来源核验光合作用定义")
+        self.assertIs(
+            analysis.retrieval.source_requirement,
+            SourceRequirement.INDEPENDENT_CORROBORATION,
+        )
+        self.assertIn(
+            RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,
+            analysis.retrieval.complexity_codes,
+        )
+        self.assertIs(decision.route, SearchTier.STANDARD)
+
+    def test_plain_source_request_blocks_model_source_escalation(self):
+        payload = {
+            **NEUTRAL,
+            "source_requirement": "independent_corroboration",
+            "complexity_codes": ["multi_source_required"],
+        }
+        analysis, decision = self._route("请提供光合作用定义的来源", payload)
+        self.assertIs(
+            analysis.retrieval.source_requirement,
+            SourceRequirement.ANY_RELEVANT,
+        )
+        self.assertNotIn(
+            RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,
+            analysis.retrieval.complexity_codes,
+        )
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_no_web_conflict_keeps_must_search_but_hard_skips(self):
+        analysis, decision = self._route("请搜索光合作用定义，但不要联网")
+        self.assertTrue(analysis.retrieval.must_search)
+        self.assertIs(analysis.retrieval.skip_reason, SkipReason.USER_FORBID_WEB)
+        self.assertIs(decision.route, SearchTier.SKIP)
+        self.assertTrue(decision.requires_clarification)
+
+    def test_explicit_version_tokens_are_exact_and_current_free(self):
+        for question, expected in (
+            ("Python 3.13 有哪些变化？", "3.13"),
+            ("请查 v3.13 的发行说明", "3.13"),
+            ("版本3.13 有什么新功能？", "3.13"),
+        ):
+            with self.subTest(question=question):
+                analysis, decision = self._route(question)
+                self.assertIs(analysis.freshness.requirement, FreshnessRequirement.VERSION)
+                self.assertEqual(analysis.freshness.version_constraint, expected)
+                self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_dates_ips_and_dosage_decimals_are_not_version_tokens(self):
+        for question in (
+            "2026-08-11 是星期几？",
+            "192.168.0.1 是什么地址？",
+            "0.2g 的样品如何换算？",
+        ):
+            with self.subTest(question=question):
+                analysis, _ = self._route(question)
+                self.assertIs(analysis.freshness.requirement, FreshnessRequirement.NOT_REQUIRED)
+                self.assertIsNone(analysis.freshness.version_constraint)
+
+    def test_analyzer_calls_llm_once_and_router_accepts_only_context(self):
+        llm = _FakeRoutingLLM(content=_payload_content(NEUTRAL))
+        analyzer = self.module.LLMRequestAnalyzer(llm)
+        analysis = analyzer.analyze(chat_request("什么是光合作用"))
+        decision = self.router.decide(analysis.retrieval)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIs(decision.route, SearchTier.LIGHT)
+        with self.assertRaises(TypeError):
+            self.router.decide(chat_request("什么是光合作用"))
+
+    def test_router_source_has_no_risk_or_freshness_reads(self):
+        source = inspect.getsource(self.module.RetrievalBenefitRouter)
+        self.assertNotIn("RiskContext", source)
+        self.assertNotIn("FreshnessContext", source)
+        self.assertNotIn(".risk", source)
+        self.assertNotIn(".freshness", source)
 
 
 if __name__ == "__main__":

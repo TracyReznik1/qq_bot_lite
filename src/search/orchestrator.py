@@ -15,16 +15,22 @@ from src.config import config
 from src.search.evidence import EvidenceAssembler, LLMEvidenceJudge
 from src.search.extraction import SearchExtractor
 from src.search.models import (
+    Actionability,
     DEFAULT_TIER_BUDGETS,
     EvidenceBundle,
     EvidenceState,
+    Freshness,
+    FreshnessRequirement,
     PlanningStatus,
+    PotentialHarm,
     ProviderAttempt,
     ProviderResult,
     ProviderStatus,
+    RequestAnalysis,
     RepairPlan,
     RequestSource,
     RetrievalRequest,
+    RiskLevel,
     SearchFailureCode,
     SearchPipelineResult,
     SearchPlan,
@@ -41,7 +47,7 @@ from src.search.providers import (
     TavilySearchProvider,
 )
 from src.search.providers.base import ProviderSearchOutcome
-from src.search.router import LLMRoutingAdvisor, RetrievalBenefitRouter
+from src.search.router import LLMRequestAnalyzer, RetrievalBenefitRouter
 
 logger = logging.getLogger("qq-bot")
 
@@ -109,6 +115,7 @@ class SearchOrchestrator:
     def __init__(
         self,
         *,
+        request_analyzer: Any,
         router: Any,
         planner: Any,
         judge: Any,
@@ -116,6 +123,7 @@ class SearchOrchestrator:
         extractor: Any = None,
         clock: Any = None,
     ) -> None:
+        self._request_analyzer = request_analyzer
         self._router = router
         self._planner = planner
         self._judge = judge
@@ -126,26 +134,32 @@ class SearchOrchestrator:
 
     def run(self, request: RetrievalRequest) -> SearchPipelineResult:
         response_started = self._monotonic()
+        analysis = self._request_analyzer.analyze(request)
+        if not isinstance(analysis, RequestAnalysis):
+            raise TypeError("request_analyzer must return a RequestAnalysis")
         trace = SearchTrace(
             request_id=_new_request_id(),
             request_source=request.request_source,
             route=SearchTier.LIGHT,
             response_started_at=response_started,
         )
-        decision = self._router.decide(request)
-        if decision.route is SearchTier.DEEP:
+        retrieval_decision = self._router.decide(analysis.retrieval)
+        # Planner, providers, and budgets consume only retrieval metadata.
+        # Retained risk/freshness fields are output compatibility metadata.
+        decision = _with_legacy_analysis_metadata(retrieval_decision, analysis)
+        if retrieval_decision.route is SearchTier.DEEP:
             raise RuntimeError("production router emitted retired deep route")
-        trace.route = decision.route
-        trace.skip_reason = decision.skip_reason
-        trace.trigger_codes = decision.trigger_codes
-        trace.factuality = decision.factuality
-        trace.external_fact_required = decision.external_fact_required
-        trace.program_minimum_tier = decision.program_minimum_tier
-        trace.final_tier = decision.route
+        trace.route = retrieval_decision.route
+        trace.skip_reason = retrieval_decision.skip_reason
+        trace.trigger_codes = retrieval_decision.trigger_codes
+        trace.factuality = retrieval_decision.factuality
+        trace.external_fact_required = retrieval_decision.external_fact_required
+        trace.program_minimum_tier = retrieval_decision.program_minimum_tier
+        trace.final_tier = retrieval_decision.route
         trace.route_latency_ms = self._elapsed_ms(response_started)
 
-        if decision.route is SearchTier.SKIP:
-            if decision.requires_clarification:
+        if retrieval_decision.route is SearchTier.SKIP:
+            if retrieval_decision.requires_clarification:
                 trace.degradation_reason = SearchFailureCode.USER_FORBID_WEB
             result = SearchPipelineResult(
                 decision=decision,
@@ -154,15 +168,16 @@ class SearchOrchestrator:
                 trace=trace,
                 failure_code=(
                     SearchFailureCode.USER_FORBID_WEB
-                    if decision.skip_reason is SkipReason.USER_FORBID_WEB
+                    if retrieval_decision.skip_reason is SkipReason.USER_FORBID_WEB
                     else None
                 ),
+                analysis=analysis,
             )
             return result
 
         # One monotonic hard deadline per tier starts before planning, so
         # planner and Evidence-judge latency count toward the retrieval budget.
-        budget = DEFAULT_TIER_BUDGETS[decision.route]
+        budget = DEFAULT_TIER_BUDGETS[retrieval_decision.route]
         deadline = self._monotonic() + float(budget.hard_timeout_seconds)
 
         trace.orchestrator_started = True
@@ -172,17 +187,19 @@ class SearchOrchestrator:
             self._invoke_planner,
             deadline,
             request,
-            decision,
+            retrieval_decision,
             deadline,
         )
         if not plan_completed or not isinstance(plan, SearchPlan):
-            plan = self._degraded_plan(request, decision)
+            plan = self._degraded_plan(request, retrieval_decision)
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
         trace.initial_query_count = len(plan.initial_queries)
         trace.initial_query_redaction_codes = plan.query_redaction_codes
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, retrieval_started)
+            return self._timeout_result(
+                decision, plan, trace, retrieval_started, analysis=analysis,
+            )
 
         trace.provider_configured = any(
             provider.readiness().configured for provider in self._providers
@@ -194,7 +211,7 @@ class SearchOrchestrator:
 
         provider_results = self._run_initial_batch(
             plan,
-            decision,
+            retrieval_decision,
             budget,
             deadline,
             trace,
@@ -203,7 +220,9 @@ class SearchOrchestrator:
         trace.provider_search_total_latency_ms = trace.initial_provider_search_latency_ms
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, retrieval_started)
+            return self._timeout_result(
+                decision, plan, trace, retrieval_started, analysis=analysis,
+            )
 
         if not provider_results or all(
             result.status in {ProviderStatus.NOT_CONFIGURED, ProviderStatus.UNAVAILABLE, ProviderStatus.ERROR, ProviderStatus.TIMEOUT, ProviderStatus.EMPTY}
@@ -222,6 +241,7 @@ class SearchOrchestrator:
                 failure=failure,
                 bundle=None,
                 limitation=_limitation_for_failure(failure),
+                analysis=analysis,
             )
 
         content_started = self._monotonic()
@@ -233,7 +253,9 @@ class SearchOrchestrator:
         trace.candidate_url_count = len(candidate_keys)
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, retrieval_started)
+            return self._timeout_result(
+                decision, plan, trace, retrieval_started, analysis=analysis,
+            )
 
         evidence_started = self._monotonic()
         assembled, bundle = self._call_until_deadline(
@@ -251,7 +273,14 @@ class SearchOrchestrator:
         trace.evidence_state = bundle.evidence_state
 
         if self._expired(deadline):
-            return self._timeout_result(decision, plan, trace, retrieval_started, bundle=bundle)
+            return self._timeout_result(
+                decision,
+                plan,
+                trace,
+                retrieval_started,
+                bundle=bundle,
+                analysis=analysis,
+            )
 
         if not bundle.evidence_items and any(
             result.status is ProviderStatus.SUCCESS and result.hits
@@ -265,6 +294,7 @@ class SearchOrchestrator:
                 failure=SearchFailureCode.CONTENT_UNREADABLE,
                 bundle=None,
                 limitation="content_unreadable",
+                analysis=analysis,
             )
 
         gap_started = self._monotonic()
@@ -276,7 +306,7 @@ class SearchOrchestrator:
         repair = RepairPlan(False, gap.repair_reason_codes, None)
 
         repair_already_planned = False
-        if _repair_allowed(plan, decision) and gap.repair_eligible and not self._expired(deadline):
+        if _repair_allowed(plan, retrieval_decision) and gap.repair_eligible and not self._expired(deadline):
             repair_started = self._monotonic()
             repair_completed, planned_repair = self._call_until_deadline(
                 self._invoke_repair_planner,
@@ -297,7 +327,7 @@ class SearchOrchestrator:
                 repair_provider_started = self._monotonic()
                 repair_result = self._run_repair_query(
                     repair,
-                    decision,
+                    retrieval_decision,
                     budget,
                     deadline,
                     trace,
@@ -347,6 +377,7 @@ class SearchOrchestrator:
                 gap=gap,
                 repair=repair,
                 initial_canonical_urls=initial_canonical_urls,
+                analysis=analysis,
             )
 
         final_gap = self._assembler().analyze_gap(plan, bundle)
@@ -366,6 +397,7 @@ class SearchOrchestrator:
             evidence=bundle,
             trace=trace,
             failure_code=failure_code,
+            analysis=analysis,
         )
 
     # ── internal stages ─────────────────────────────────────────────
@@ -713,6 +745,7 @@ class SearchOrchestrator:
         trace: SearchTrace,
         started: float,
         *,
+        analysis: RequestAnalysis,
         failure: SearchFailureCode,
         bundle: EvidenceBundle | None,
         limitation: str,
@@ -740,6 +773,7 @@ class SearchOrchestrator:
                 evidence=None,
                 trace=trace,
                 failure_code=failure,
+                analysis=analysis,
             )
 
         if bundle is None:
@@ -768,6 +802,7 @@ class SearchOrchestrator:
             evidence=bundle,
             trace=trace,
             failure_code=failure,
+            analysis=analysis,
         )
 
     def _timeout_result(
@@ -777,6 +812,7 @@ class SearchOrchestrator:
         trace: SearchTrace,
         started: float,
         *,
+        analysis: RequestAnalysis,
         bundle: EvidenceBundle | None = None,
         gap: Any = None,
         repair: RepairPlan | None = None,
@@ -787,6 +823,7 @@ class SearchOrchestrator:
             plan,
             trace,
             started,
+            analysis=analysis,
             failure=SearchFailureCode.PROVIDER_TIMEOUT,
             bundle=bundle,
             limitation="hard_deadline_exceeded",
@@ -811,6 +848,39 @@ class SearchOrchestrator:
 
     def _elapsed_ms(self, started: float) -> int:
         return int((self._monotonic() - started) * 1000)
+
+
+def _with_legacy_analysis_metadata(
+    decision: Any,
+    analysis: RequestAnalysis,
+) -> Any:
+    """Bridge contexts to retained decision metadata without changing routing.
+
+    Task 3 keeps the legacy decision fields for downstream consumers.  This
+    mapping runs only after the pure retrieval-context router has chosen its
+    tier, so freshness and risk cannot influence provider, query, or budget
+    selection.
+    """
+    freshness = (
+        Freshness.NONE
+        if analysis.freshness.requirement is FreshnessRequirement.NOT_REQUIRED
+        else Freshness.HIGH
+    )
+    if analysis.risk.high_consequence:
+        risk = RiskLevel.HIGH
+        actionability = Actionability.PERSONALIZED
+        potential_harm = PotentialHarm.HIGH
+    else:
+        risk = RiskLevel.LOW
+        actionability = Actionability.NONE
+        potential_harm = PotentialHarm.NONE
+    return replace(
+        decision,
+        freshness=freshness,
+        risk=risk,
+        actionability=actionability,
+        potential_harm=potential_harm,
+    )
 
 
 def _call_with_supported_kwargs(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -931,10 +1001,10 @@ def reset_search_orchestrator() -> None:
 
 def _build_production_orchestrator() -> SearchOrchestrator:
     from src.services.llm_client import get_llm_client
-    from src.search.router import LLMRoutingAdvisor
 
     llm = get_llm_client()
-    router = RetrievalBenefitRouter(LLMRoutingAdvisor(llm))
+    request_analyzer = LLMRequestAnalyzer(llm)
+    router = RetrievalBenefitRouter()
     planner = SearchPlanner(llm)
     judge = LLMEvidenceJudge(llm)
     providers: list[Any] = [
@@ -951,6 +1021,7 @@ def _build_production_orchestrator() -> SearchOrchestrator:
             )
         )
     return SearchOrchestrator(
+        request_analyzer=request_analyzer,
         router=router,
         planner=planner,
         judge=judge,

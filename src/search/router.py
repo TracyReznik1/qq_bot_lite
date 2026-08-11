@@ -13,6 +13,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Callable, Mapping, Sequence
 
 from src.search.models import (
@@ -20,15 +21,20 @@ from src.search.models import (
     BenefitDimension,
     Factuality,
     Freshness,
+    FreshnessContext,
+    FreshnessRequirement,
     PotentialHarm,
-    RequestSource,
+    RequestAnalysis,
+    RetrievalComplexityCode,
+    RetrievalContext,
     RetrievalDecision,
     RetrievalRequest,
+    RiskContext,
     RiskLevel,
     SearchTier,
     SkipReason,
+    SourceRequirement,
     TriggerCode,
-    max_tier,
 )
 
 _CLASSIFIER_UNCERTAIN = TriggerCode.CLASSIFIER_UNCERTAIN
@@ -70,6 +76,7 @@ def _detect_explicit_no_web(question: str) -> bool:
 
 
 _SEARCH_MARKERS = (
+    "/search",
     "搜索",
     "搜一下",
     "搜一搜",
@@ -192,7 +199,7 @@ _RELATIVE_TIME_MARKERS = (
 )
 
 _CURRENT_RESULT_INTENTS = (
-    "谁赢了", "赢了", "胜负", "比分", "赛果", "比赛结果", "排名",
+    "谁赢了", "赢了", "赢", "胜负", "比分", "赛果", "比赛结果", "排名",
     "发生了什么", "结果如何", "最新进展",
 )
 
@@ -1059,45 +1066,19 @@ def _parse_enum_list(values: Any, enum_type: type[Any]) -> tuple[Any, ...] | Non
 # ── classification envelope ─────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class _Classification:
+class _RequestClassification:
     factuality: Factuality = Factuality.AMBIGUOUS
     external_fact_required: bool = True
-    freshness: Freshness = Freshness.NONE
-    risk: RiskLevel = RiskLevel.LOW
-    actionability: Actionability = Actionability.NONE
-    potential_harm: PotentialHarm = PotentialHarm.NONE
-    recommended_tier: SearchTier | None = None
-    benefit_dimensions: frozenset[BenefitDimension] = frozenset()
-    trigger_codes: tuple[TriggerCode, ...] = ()
-
-
-def _validated_classification(raw: Any) -> _Classification:
-    if not isinstance(raw, dict):
-        return _Classification()
-    factuality = _parse_enum(raw.get("factuality"), Factuality) or Factuality.AMBIGUOUS
-    external_fact_required = raw.get("external_fact_required", True)
-    if not isinstance(external_fact_required, bool):
-        external_fact_required = True
-    freshness = _parse_enum(raw.get("freshness"), Freshness) or Freshness.NONE
-    risk = _parse_enum(raw.get("risk"), RiskLevel) or RiskLevel.LOW
-    actionability = _parse_enum(raw.get("actionability"), Actionability) or Actionability.NONE
-    potential_harm = _parse_enum(raw.get("potential_harm"), PotentialHarm) or PotentialHarm.NONE
-    recommended = _parse_enum(raw.get("recommended_tier"), SearchTier)
-    if recommended not in {SearchTier.LIGHT, SearchTier.STANDARD}:
-        recommended = None
-    benefits = _parse_enum_list(raw.get("benefit_dimensions"), BenefitDimension) or ()
-    triggers = _parse_enum_list(raw.get("trigger_codes"), TriggerCode) or ()
-    return _Classification(
-        factuality=factuality,
-        external_fact_required=external_fact_required,
-        freshness=freshness,
-        risk=risk,
-        actionability=actionability,
-        potential_harm=potential_harm,
-        recommended_tier=recommended,
-        benefit_dimensions=frozenset(benefits),
-        trigger_codes=tuple(triggers),
-    )
+    complexity_codes: tuple[RetrievalComplexityCode, ...] = ()
+    source_requirement: SourceRequirement = SourceRequirement.ANY_RELEVANT
+    freshness_requirement: FreshnessRequirement = FreshnessRequirement.NOT_REQUIRED
+    as_of: date | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    version_constraint: str | None = None
+    high_consequence: bool = False
+    warning_required: bool = False
+    fail_closed: bool = False
 
 
 # ── strict JSON parsing for the routing advisor ─────────────────────────
@@ -1107,15 +1088,28 @@ _FENCE_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-_ADVISOR_ENUM_FIELDS: Mapping[str, type[Any]] = {
+_REQUEST_ANALYSIS_ENUM_FIELDS: Mapping[str, type[Any]] = {
     "factuality": Factuality,
-    "freshness": Freshness,
-    "risk": RiskLevel,
-    "actionability": Actionability,
-    "potential_harm": PotentialHarm,
-    "benefit_dimensions": BenefitDimension,
-    "trigger_codes": TriggerCode,
+    "source_requirement": SourceRequirement,
+    "freshness_requirement": FreshnessRequirement,
 }
+
+_REQUEST_ANALYSIS_FIELDS = frozenset(
+    {
+        "factuality",
+        "external_fact_required",
+        "complexity_codes",
+        "source_requirement",
+        "freshness_requirement",
+        "as_of",
+        "date_from",
+        "date_to",
+        "version_constraint",
+        "high_consequence",
+        "warning_required",
+        "fail_closed",
+    }
+)
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1131,35 +1125,53 @@ def _raise_invalid_constant(value: str) -> Any:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
+def _parse_optional_date(value: Any, field_name: str) -> date | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be an ISO date or null")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO date or null") from exc
+
+
 def _normalized_advisor_output(payload: dict[str, Any]) -> dict[str, Any]:
-    for field_name, enum_type in _ADVISOR_ENUM_FIELDS.items():
-        if field_name not in payload:
-            continue
-        value = payload[field_name]
-        if isinstance(value, list):
-            parsed = _parse_enum_list(value, enum_type)
-            if parsed is None:
-                raise ValueError(f"invalid enum list: {field_name}")
-            payload[field_name] = list(parsed)
-        else:
-            parsed = _parse_enum(value, enum_type)
-            if parsed is None:
-                raise ValueError(f"invalid enum value: {field_name}")
-            payload[field_name] = parsed
-    if "recommended_tier" in payload:
-        recommended = _parse_enum(payload["recommended_tier"], SearchTier)
-        if recommended not in {SearchTier.LIGHT, SearchTier.STANDARD}:
-            raise ValueError("model recommended tier is not in the closed set")
-        payload["recommended_tier"] = recommended
-    skip_candidate = payload.get("skip_candidate")
-    if skip_candidate is not None:
-        if not isinstance(skip_candidate, dict) or "reason" not in skip_candidate:
-            raise ValueError("skip_candidate must be null or an object with reason")
-        reason = _parse_enum(skip_candidate["reason"], SkipReason)
-        if reason is None:
-            raise ValueError("skip_candidate reason is not a closed enum")
-        payload["skip_candidate"] = {"reason": reason}
-    return payload
+    if set(payload) != _REQUEST_ANALYSIS_FIELDS:
+        raise ValueError("request analysis must contain exactly the closed fields")
+
+    normalized = dict(payload)
+    for field_name, enum_type in _REQUEST_ANALYSIS_ENUM_FIELDS.items():
+        parsed = _parse_enum(normalized[field_name], enum_type)
+        if parsed is None:
+            raise ValueError(f"invalid enum value: {field_name}")
+        normalized[field_name] = parsed
+
+    codes = normalized["complexity_codes"]
+    if type(codes) is not list:
+        raise ValueError("complexity_codes must be a JSON array")
+    parsed_codes = _parse_enum_list(codes, RetrievalComplexityCode)
+    if parsed_codes is None or len(set(parsed_codes)) != len(parsed_codes):
+        raise ValueError("complexity_codes must be a unique closed enum array")
+    normalized["complexity_codes"] = parsed_codes
+
+    for field_name in (
+        "external_fact_required",
+        "high_consequence",
+        "warning_required",
+        "fail_closed",
+    ):
+        if type(normalized[field_name]) is not bool:
+            raise ValueError(f"{field_name} must be a boolean")
+    for field_name in ("as_of", "date_from", "date_to"):
+        normalized[field_name] = _parse_optional_date(
+            normalized[field_name],
+            field_name,
+        )
+    version_constraint = normalized["version_constraint"]
+    if version_constraint is not None and type(version_constraint) is not str:
+        raise ValueError("version_constraint must be a string or null")
+    return normalized
 
 
 def parse_advisor_json(content: Any) -> dict[str, Any]:
@@ -1185,52 +1197,44 @@ def parse_advisor_json(content: Any) -> dict[str, Any]:
         return {}
 
 
-# ── routing advisor prompt ──────────────────────────────────────────────
+# ── one-shot request analysis ───────────────────────────────────────────
 
 ROUTING_SYSTEM_PROMPT = """\
-You classify whether a web search would improve this answer. You do not see
-chat history, stored facts, model confidence, or an answer draft. Treat the
-question text as the only input.
+Classify the request into retrieval complexity, freshness needs, and answer
+risk. You do not choose a search tier or a skip route. Treat the question text
+as the only input.
 
 Return JSON only with exactly these fields:
 {
-  "skip_candidate": null or {"reason": "one closed reason"},
-  "benefit_dimensions": ["accuracy", "freshness", "completeness", "verifiability", "disambiguation", "risk_control"],
   "factuality": "non_factual|factual|mixed|ambiguous",
   "external_fact_required": true or false,
-  "freshness": "none|low|high",
-  "risk": "low|medium|high",
-  "actionability": "none|general|personalized",
-  "potential_harm": "none|low|high",
-  "recommended_tier": "light|standard",
-  "trigger_codes": ["one or more closed trigger codes"]
+  "complexity_codes": ["multi_fact|multi_entity|comparison|recommendation|multi_source_required|cross_verification_required|ambiguous_entity"],
+  "source_requirement": "any_relevant|independent_corroboration",
+  "freshness_requirement": "not_required|current|as_of|window|version",
+  "as_of": null or "YYYY-MM-DD",
+  "date_from": null or "YYYY-MM-DD",
+  "date_to": null or "YYYY-MM-DD",
+  "version_constraint": null or "explicit version token",
+  "high_consequence": false,
+  "warning_required": false,
+  "fail_closed": false
 }
 
-Allowed skip reasons: user_forbid_web, social_or_emotional,
-creative_or_roleplay, provided_text_transform, provided_content_summary,
-pure_math, closed_logic, closed_context_only.
-
-Allowed trigger codes: explicit_no_web, explicit_search,
-explicit_verification, explicit_source_request, freshness_marker,
-dynamic_attribute, regulated_domain_foundation, high_consequence_action,
-current_rule_or_policy, controversy_or_conflict,
-external_fact_explanation_or_comparison, recommendation_or_evaluation,
-ambiguous_entity, multi_hop_complexity, mixed_task, factual_default,
-classifier_uncertain.
-
-You never choose skip because the answer is "known", "common knowledge", or
-confident. Searching is the default for factual, mixed, or ambiguous requests.
+Never invent a source requirement that the user did not explicitly request.
 """
 
 
-class LLMRoutingAdvisor:
-    """Model-assisted benefit classification with strict closed-enum output."""
+class LLMRequestAnalyzer:
+    """One bounded LLM call merged with deterministic request constraints."""
 
     def __init__(self, llm: Any, *, max_tokens: int = 512) -> None:
         self._llm = llm
         self._max_tokens = max_tokens
 
-    def advise(self, request: RetrievalRequest) -> dict[str, Any]:
+    def analyze(self, request: RetrievalRequest) -> RequestAnalysis:
+        return _build_request_analysis(request, _validated_request_classification(self._call(request)))
+
+    def _call(self, request: RetrievalRequest) -> dict[str, Any]:
         payload = {
             "question": request.question,
             "has_images": request.has_images,
@@ -1255,254 +1259,391 @@ class LLMRoutingAdvisor:
         return parse_advisor_json(response.content)
 
 
+# Temporary caller-name compatibility through Task 10.  The new class exposes
+# ``analyze`` rather than the retired advisor's tier-recommendation interface.
+LLMRoutingAdvisor = LLMRequestAnalyzer
+
+
 # ── decision construction ───────────────────────────────────────────────
 
-def _skip_decision(
-    request: RetrievalRequest,
-    reason: SkipReason,
-    trigger_codes: tuple[TriggerCode, ...],
-    *,
-    forced_search: bool = False,
-    high_consequence: bool = False,
-) -> RetrievalDecision:
-    non_factual = reason in {
-        SkipReason.SOCIAL_OR_EMOTIONAL,
-        SkipReason.CREATIVE_OR_ROLEPLAY,
-        SkipReason.PURE_MATH,
-        SkipReason.CLOSED_LOGIC,
-        SkipReason.CLOSED_CONTEXT_ONLY,
-    }
-    factuality = Factuality.NON_FACTUAL if non_factual else Factuality.MIXED
-    if reason is SkipReason.USER_FORBID_WEB:
-        factuality = Factuality.AMBIGUOUS
+_COMPLEXITY_TRIGGER_CODES: Mapping[RetrievalComplexityCode, TriggerCode] = {
+    RetrievalComplexityCode.MULTI_FACT: TriggerCode.MULTI_HOP_COMPLEXITY,
+    RetrievalComplexityCode.MULTI_ENTITY: TriggerCode.MULTI_HOP_COMPLEXITY,
+    RetrievalComplexityCode.COMPARISON: TriggerCode.EXTERNAL_FACT_EXPLANATION_OR_COMPARISON,
+    RetrievalComplexityCode.RECOMMENDATION: TriggerCode.RECOMMENDATION_OR_EVALUATION,
+    RetrievalComplexityCode.MULTI_SOURCE_REQUIRED: TriggerCode.EXPLICIT_SOURCE_REQUEST,
+    RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED: TriggerCode.EXPLICIT_VERIFICATION,
+    RetrievalComplexityCode.AMBIGUOUS_ENTITY: TriggerCode.AMBIGUOUS_ENTITY,
+}
+
+
+def _retrieval_reason_codes(context: RetrievalContext) -> tuple[TriggerCode, ...]:
+    codes = [
+        _COMPLEXITY_TRIGGER_CODES[code]
+        for code in context.complexity_codes
+    ]
+    if (
+        context.source_requirement is SourceRequirement.INDEPENDENT_CORROBORATION
+        and TriggerCode.EXPLICIT_SOURCE_REQUEST not in codes
+        and TriggerCode.EXPLICIT_VERIFICATION not in codes
+    ):
+        codes.append(TriggerCode.EXPLICIT_SOURCE_REQUEST)
+    return _dedupe_codes(codes)
+
+
+def _skip_from_context(context: RetrievalContext) -> RetrievalDecision:
+    if context.skip_reason is None:
+        raise ValueError("skip context requires a skip_reason")
+    if context.skip_reason is SkipReason.USER_FORBID_WEB:
+        codes: tuple[TriggerCode, ...] = (TriggerCode.EXPLICIT_NO_WEB,)
+        if context.must_search:
+            codes = (*codes, TriggerCode.EXPLICIT_SEARCH)
+    else:
+        codes = _retrieval_reason_codes(context)
     return RetrievalDecision(
         route=SearchTier.SKIP,
-        skip_reason=reason,
-        forced_search=forced_search,
-        trigger_codes=trigger_codes,
+        skip_reason=context.skip_reason,
+        forced_search=context.must_search,
+        trigger_codes=codes,
         benefit_dimensions=frozenset(),
-        factuality=factuality,
-        external_fact_required=False,
+        factuality=context.factuality,
+        external_fact_required=context.external_fact_required,
         freshness=Freshness.NONE,
-        risk=RiskLevel.HIGH if high_consequence else RiskLevel.LOW,
-        actionability=(
-            Actionability.PERSONALIZED if high_consequence else Actionability.NONE
-        ),
-        potential_harm=(
-            PotentialHarm.HIGH if high_consequence else PotentialHarm.NONE
-        ),
+        risk=RiskLevel.LOW,
+        actionability=Actionability.NONE,
+        potential_harm=PotentialHarm.NONE,
         program_minimum_tier=None,
         model_recommended_tier=None,
-        final_reason_codes=trigger_codes,
+        final_reason_codes=codes,
+    )
+
+
+def _search_from_context(
+    context: RetrievalContext,
+    route: SearchTier,
+) -> RetrievalDecision:
+    reason_codes = _retrieval_reason_codes(context)
+    if not reason_codes:
+        reason_codes = (TriggerCode.FACTUAL_DEFAULT,)
+    benefit_dimensions = frozenset({BenefitDimension.ACCURACY})
+    if context.source_requirement is SourceRequirement.INDEPENDENT_CORROBORATION:
+        benefit_dimensions = frozenset(
+            {BenefitDimension.ACCURACY, BenefitDimension.VERIFIABILITY}
+        )
+    return RetrievalDecision(
+        route=route,
+        skip_reason=None,
+        forced_search=context.must_search,
+        trigger_codes=reason_codes,
+        benefit_dimensions=benefit_dimensions,
+        factuality=context.factuality,
+        external_fact_required=context.external_fact_required,
+        freshness=Freshness.NONE,
+        risk=RiskLevel.LOW,
+        actionability=Actionability.NONE,
+        potential_harm=PotentialHarm.NONE,
+        program_minimum_tier=route,
+        model_recommended_tier=None,
+        final_reason_codes=reason_codes,
     )
 
 
 class RetrievalBenefitRouter:
-    """Decide the closed route and program floor for one request."""
+    """Pure retrieval-context to route mapping; no LLM and no safety inputs."""
 
-    def __init__(self, advisor: Any, *, clock: Any = None) -> None:
-        self._advisor = advisor
-        self._clock = clock
-
-    def decide(self, request: RetrievalRequest) -> RetrievalDecision:
-        question = _question_text(request)
-
-        explicit_no_web = _detect_explicit_no_web(question)
-        explicit_search = _detect_explicit_search(question)
-        explicit_verification = _detect_explicit_verification(question)
-        explicit_source = _detect_explicit_source_request(question)
-        explicit_any = explicit_search or explicit_verification or explicit_source
-        explicit_codes = _explicit_trigger_codes(explicit_search, explicit_verification, explicit_source)
-        has_force_search = explicit_any or bool(request.force_search)
-
-        # Explicit no-web is the user's hard constraint. Any explicit search
-        # signal — including force_search from the /search command — turns this
-        # into the deterministic clarification conflict, never a forced SKIP.
-        if explicit_no_web:
-            conflict = explicit_any or has_force_search
-            high_consequence = (
-                _detect_personalized_high_consequence(question)
-                is TriggerCode.HIGH_CONSEQUENCE_ACTION
-            )
-            trigger_codes = [TriggerCode.EXPLICIT_NO_WEB]
-            if conflict:
-                trigger_codes.append(TriggerCode.EXPLICIT_SEARCH)
-            if high_consequence:
-                trigger_codes.append(TriggerCode.HIGH_CONSEQUENCE_ACTION)
-            return _skip_decision(
-                request,
-                SkipReason.USER_FORBID_WEB,
-                tuple(trigger_codes),
-                forced_search=has_force_search,
-                high_consequence=high_consequence,
-            )
-
-        raw = self._advisor.advise(request)
-        valid_advisor = _has_allowed_advisor_tier(raw)
-        classification = _validated_classification(raw) if valid_advisor else _Classification()
-
-        # Compute forced / dynamic / high-consequence / mixed floors BEFORE any
-        # closed-task skip, so a mixed request can never skip retrieval.
-        floors, floor_codes = _compute_floors(
-            question,
-            classification,
-            explicit_verification=explicit_verification,
-            explicit_source=explicit_source,
+    def decide(self, context: RetrievalContext) -> RetrievalDecision:
+        if not isinstance(context, RetrievalContext):
+            raise TypeError("context must be a RetrievalContext")
+        if context.skip_reason is SkipReason.USER_FORBID_WEB:
+            return _skip_from_context(context)
+        if context.skip_reason is not None and not context.must_search:
+            return _skip_from_context(context)
+        standard_reasons = {
+            RetrievalComplexityCode.MULTI_FACT,
+            RetrievalComplexityCode.MULTI_ENTITY,
+            RetrievalComplexityCode.COMPARISON,
+            RetrievalComplexityCode.RECOMMENDATION,
+            RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,
+            RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED,
+            RetrievalComplexityCode.AMBIGUOUS_ENTITY,
+        }
+        route = (
+            SearchTier.STANDARD
+            if standard_reasons.intersection(context.complexity_codes)
+            or context.source_requirement is SourceRequirement.INDEPENDENT_CORROBORATION
+            else SearchTier.LIGHT
         )
-        if not valid_advisor:
-            # Classifier uncertainty must not silently under-route a request
-            # that carries high-consequence or current-state domain signals.
-            conservative = _conservative_uncertain_floor(question)
-            floors = _max_tier(floors, conservative) if conservative is not None else floors
-            uncertain_codes = [*floor_codes, TriggerCode.CLASSIFIER_UNCERTAIN]
-            if _classify_safety_intent(question) == _SAFETY_ACTIONABLE:
-                uncertain_codes.append(TriggerCode.HIGH_CONSEQUENCE_ACTION)
-            floor_codes = _dedupe_codes(tuple(uncertain_codes))
-        floor = _operational_tier(floors) if floors is not None else SearchTier.LIGHT
-        if not floor_codes:
-            floor_codes = (TriggerCode.FACTUAL_DEFAULT,)
-        deterministic_high_consequence = (
-            TriggerCode.HIGH_CONSEQUENCE_ACTION in floor_codes
+        return _search_from_context(context, route)
+
+
+def _validated_request_classification(raw: Any) -> _RequestClassification:
+    if not isinstance(raw, dict) or set(raw) != _REQUEST_ANALYSIS_FIELDS:
+        return _RequestClassification()
+    try:
+        freshness = FreshnessContext(
+            raw["freshness_requirement"],
+            raw["as_of"],
+            raw["date_from"],
+            raw["date_to"],
+            raw["version_constraint"],
         )
-
-        # A closed-task skip is only accepted when the whole request carries no
-        # search trigger and no forced floor.
-        program_skip = _classify_closed_task(question)
-        if program_skip is not None and not has_force_search and not floors:
-            trigger_codes = _dedupe_codes((*explicit_codes, *classification.trigger_codes))
-            return _skip_decision(
-                request,
-                program_skip,
-                trigger_codes,
-                forced_search=False,
-            )
-
-        recommended = _operational_tier(classification.recommended_tier)
-        final_route = max_tier(floor, recommended) if recommended is not None else floor
-
-        trigger_codes = _dedupe_codes((*explicit_codes, *classification.trigger_codes, *floor_codes))
-        final_reason_codes = _dedupe_codes((*floor_codes, *classification.trigger_codes, *explicit_codes))
-        benefit_dimensions = classification.benefit_dimensions
-        if not benefit_dimensions:
-            benefit_dimensions = frozenset({BenefitDimension.ACCURACY})
-
-        return RetrievalDecision(
-            route=final_route,
-            skip_reason=None,
-            forced_search=has_force_search,
-            trigger_codes=trigger_codes,
-            benefit_dimensions=benefit_dimensions,
-            factuality=classification.factuality,
-            external_fact_required=classification.external_fact_required,
-            freshness=classification.freshness,
-            risk=classification.risk,
-            actionability=classification.actionability,
-            potential_harm=(
-                PotentialHarm.HIGH
-                if deterministic_high_consequence
-                else classification.potential_harm
-            ),
-            program_minimum_tier=floor,
-            model_recommended_tier=recommended,
-            final_reason_codes=final_reason_codes,
+        risk = RiskContext(
+            raw["high_consequence"],
+            raw["warning_required"],
+            raw["fail_closed"],
         )
+        return _RequestClassification(
+            factuality=raw["factuality"],
+            external_fact_required=raw["external_fact_required"],
+            complexity_codes=raw["complexity_codes"],
+            source_requirement=raw["source_requirement"],
+            freshness_requirement=freshness.requirement,
+            as_of=freshness.as_of,
+            date_from=freshness.date_from,
+            date_to=freshness.date_to,
+            version_constraint=freshness.version_constraint,
+            high_consequence=risk.high_consequence,
+            warning_required=risk.warning_required,
+            fail_closed=risk.fail_closed,
+        )
+    except (KeyError, TypeError, ValueError):
+        return _RequestClassification()
 
 
-def _compute_floors(
+_MULTI_SOURCE_MARKERS = (
+    "多个来源",
+    "多来源",
+    "两个来源",
+    "两 个来源",
+    "独立来源",
+    "independent sources",
+    "multiple sources",
+)
+_CROSS_VERIFICATION_MARKERS = (
+    "交叉核验",
+    "交叉验证",
+    "相互核验",
+    "互相核验",
+    "cross verification",
+)
+_RECOMMENDATION_MARKERS = (
+    "建议",
+    "推荐",
+    "是否应该",
+    "应不应该",
+    "应该买",
+    "选哪个",
+    "哪个好",
+    "哪个更适合",
+    "should i",
+)
+_MULTI_FACT_MARKERS = ("分别", "逐一", "一一", "同时说明")
+_VERSION_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9.])(?P<prefix>[vV]\s*)?(?P<token>\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?![A-Za-z0-9.])"
+)
+_PRODUCT_OR_LANGUAGE_TOKEN_BEFORE_VERSION = re.compile(
+    r"(?:[A-Z][A-Za-z0-9_-]{1,30}|[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)\s*$"
+)
+
+
+def _dedupe_complexity_codes(
+    codes: Sequence[RetrievalComplexityCode],
+) -> tuple[RetrievalComplexityCode, ...]:
+    seen: set[RetrievalComplexityCode] = set()
+    result: list[RetrievalComplexityCode] = []
+    for code in codes:
+        if code not in seen:
+            seen.add(code)
+            result.append(code)
+    return tuple(result)
+
+
+def _source_requirement_from_question(
     question: str,
-    classification: _Classification,
-    *,
-    explicit_verification: bool,
-    explicit_source: bool,
-) -> tuple[SearchTier | None, tuple[TriggerCode, ...]]:
-    """Return (forced_floor, reason_codes). None means no forced floor was found."""
-    floor: SearchTier | None = None
-    codes: list[TriggerCode] = []
+) -> tuple[SourceRequirement, tuple[RetrievalComplexityCode, ...]]:
+    lowered = question.casefold()
+    if any(marker in lowered for marker in _CROSS_VERIFICATION_MARKERS):
+        return (
+            SourceRequirement.INDEPENDENT_CORROBORATION,
+            (RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED,),
+        )
+    if any(marker in lowered for marker in _MULTI_SOURCE_MARKERS):
+        return (
+            SourceRequirement.INDEPENDENT_CORROBORATION,
+            (RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,),
+        )
+    return SourceRequirement.ANY_RELEVANT, ()
 
-    safety_intent = _classify_safety_intent(question)
-    if classification.freshness is Freshness.HIGH:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        codes.append(TriggerCode.FRESHNESS_MARKER)
 
-    current_state_codes = (
-        () if safety_intent == _SAFETY_STABLE else _detect_current_state(question)
+def _deterministic_complexity_codes(
+    question: str,
+    model_codes: Sequence[RetrievalComplexityCode],
+) -> tuple[RetrievalComplexityCode, ...]:
+    lowered = question.casefold()
+    source_requirement, source_codes = _source_requirement_from_question(question)
+    del source_requirement
+    codes = [
+        code
+        for code in model_codes
+        if code
+        not in {
+            RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,
+            RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED,
+        }
+    ]
+    if any(marker in lowered for marker in (*_COMPARISON_MARKERS, "比较", "比一比")):
+        codes.append(RetrievalComplexityCode.COMPARISON)
+    if any(marker in lowered for marker in _RECOMMENDATION_MARKERS):
+        codes.append(RetrievalComplexityCode.RECOMMENDATION)
+    if any(marker in lowered for marker in _MULTI_FACT_MARKERS):
+        codes.append(RetrievalComplexityCode.MULTI_FACT)
+    codes.extend(source_codes)
+    return _dedupe_complexity_codes(codes)
+
+
+def _extract_explicit_version_constraint(question: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", str(question or ""))
+    for match in _VERSION_TOKEN_PATTERN.finditer(normalized):
+        token = match.group("token")
+        prefix = match.group("prefix")
+        before = normalized[max(0, match.start() - 16):match.start()]
+        after = normalized[match.end():match.end() + 16]
+        has_version_label = bool(
+            re.search(r"(?:版本|version)\s*$", before, re.IGNORECASE)
+            or re.match(r"\s*(?:版本|version)\b", after, re.IGNORECASE)
+        )
+        has_adjacent_entity = bool(
+            _PRODUCT_OR_LANGUAGE_TOKEN_BEFORE_VERSION.search(before)
+        )
+        if prefix or has_version_label or has_adjacent_entity:
+            return token
+    return None
+
+
+def _requires_current_freshness(question: str) -> bool:
+    lowered = question.casefold()
+    return bool(_detect_current_state(question)) or any(
+        marker in lowered
+        for marker in ("今晚", "今夜", "明晚", "明天", "明日")
     )
-    if current_state_codes:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        codes.extend(current_state_codes)
 
-    high_consequence = _detect_personalized_high_consequence(question)
-    if high_consequence is not None:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        codes.append(high_consequence)
 
-    regulated = _detect_regulated_foundation(question)
-    if regulated is not None:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        codes.append(regulated)
-
-    external_compare = _detect_external_explanation_or_comparison(
-        question,
-        classification.external_fact_required,
+def _freshness_context(
+    question: str,
+    classification: _RequestClassification,
+) -> FreshnessContext:
+    version_constraint = _extract_explicit_version_constraint(question)
+    if version_constraint is not None:
+        return FreshnessContext(
+            FreshnessRequirement.VERSION,
+            None,
+            None,
+            None,
+            version_constraint,
+        )
+    if _requires_current_freshness(question):
+        return FreshnessContext(
+            FreshnessRequirement.CURRENT,
+            None,
+            None,
+            None,
+            None,
+        )
+    if classification.freshness_requirement is FreshnessRequirement.VERSION:
+        return FreshnessContext(
+            FreshnessRequirement.NOT_REQUIRED,
+            None,
+            None,
+            None,
+            None,
+        )
+    return FreshnessContext(
+        classification.freshness_requirement,
+        classification.as_of,
+        classification.date_from,
+        classification.date_to,
+        classification.version_constraint,
     )
-    if external_compare is not None:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        codes.append(external_compare)
-
-    if explicit_verification or explicit_source:
-        floor = _max_tier(floor, SearchTier.STANDARD)
-        if explicit_verification:
-            codes.append(TriggerCode.EXPLICIT_VERIFICATION)
-        if explicit_source:
-            codes.append(TriggerCode.EXPLICIT_SOURCE_REQUEST)
-
-    if floor is None:
-        return None, tuple(codes)
-    return floor, tuple(codes)
 
 
-def _max_tier(current: SearchTier | None, candidate: SearchTier) -> SearchTier:
-    if current is None:
-        return candidate
-    return current if _rank(current) >= _rank(candidate) else candidate
+def _risk_context(
+    question: str,
+    classification: _RequestClassification,
+) -> RiskContext:
+    deterministic_action = (
+        _detect_personalized_high_consequence(question)
+        is TriggerCode.HIGH_CONSEQUENCE_ACTION
+    )
+    lowered = question.casefold()
+    symptom_directed_medication = (
+        any(marker in lowered for marker in ("我的症状", "我症状", "我的病情"))
+        and any(marker in lowered for marker in ("服用", "吃药", "用药"))
+    )
+    high_consequence = (
+        deterministic_action
+        or symptom_directed_medication
+        or classification.high_consequence
+    )
+    return RiskContext(
+        high_consequence,
+        deterministic_action
+        or symptom_directed_medication
+        or classification.warning_required,
+        deterministic_action
+        or symptom_directed_medication
+        or classification.fail_closed,
+    )
+
+
+def _build_request_analysis(
+    request: RetrievalRequest,
+    classification: _RequestClassification,
+) -> RequestAnalysis:
+    question = _question_text(request)
+    explicit_search = _detect_explicit_search(question)
+    explicit_verification = _detect_explicit_verification(question)
+    explicit_source = _detect_explicit_source_request(question)
+    must_search = bool(request.force_search) or any(
+        (explicit_search, explicit_verification, explicit_source)
+    )
+    current_freshness = _requires_current_freshness(question)
+    if _detect_explicit_no_web(question):
+        skip_reason: SkipReason | None = SkipReason.USER_FORBID_WEB
+    else:
+        closed_task = _classify_closed_task(question)
+        skip_reason = (
+            closed_task
+            if closed_task is not None and not must_search and not current_freshness
+            else None
+        )
+
+    source_requirement, source_codes = _source_requirement_from_question(question)
+    codes = _deterministic_complexity_codes(question, classification.complexity_codes)
+    codes = _dedupe_complexity_codes((*codes, *source_codes))
+    if skip_reason is SkipReason.USER_FORBID_WEB:
+        factuality = Factuality.AMBIGUOUS
+        external_fact_required = False
+    elif skip_reason is not None:
+        factuality = Factuality.NON_FACTUAL
+        external_fact_required = False
+    else:
+        factuality = classification.factuality
+        external_fact_required = True
+    return RequestAnalysis(
+        retrieval=RetrievalContext(
+            must_search=must_search,
+            skip_reason=skip_reason,
+            factuality=factuality,
+            external_fact_required=external_fact_required,
+            complexity_codes=codes,
+            source_requirement=source_requirement,
+        ),
+        freshness=_freshness_context(question, classification),
+        risk=_risk_context(question, classification),
+    )
 
 
 def _operational_tier(tier: SearchTier | None) -> SearchTier | None:
     if tier is SearchTier.DEEP:
         return SearchTier.STANDARD
     return tier
-
-
-def _has_allowed_advisor_tier(raw: Any) -> bool:
-    if not isinstance(raw, dict) or not raw:
-        return False
-    if "recommended_tier" not in raw:
-        return True
-    return _parse_enum(raw["recommended_tier"], SearchTier) in {
-        SearchTier.LIGHT,
-        SearchTier.STANDARD,
-    }
-
-
-def _conservative_uncertain_floor(question: str) -> SearchTier | None:
-    """When the classifier fails, requests that touch high-consequence or
-    current-state domains must not be silently under-routed to light."""
-    lowered = question.casefold()
-    safety_intent = _classify_safety_intent(question)
-    if safety_intent == _SAFETY_ACTIONABLE:
-        return SearchTier.STANDARD
-    if safety_intent == _SAFETY_STABLE:
-        return SearchTier.STANDARD
-    if any(marker in lowered for marker in _HIGH_CONSEQUENCE_DOMAINS):
-        if any(phrase in lowered for phrase in _HIGH_CONSEQUENCE_ACTION_PHRASES):
-            return SearchTier.STANDARD
-        return SearchTier.STANDARD
-    if _detect_current_state(question):
-        return SearchTier.STANDARD
-    if any(marker in question for marker in _REGULATED_DOMAIN_FOUNDATION_WORDS):
-        return SearchTier.STANDARD
-    return None
-
-
-def _rank(tier: SearchTier) -> int:
-    return {SearchTier.SKIP: 0, SearchTier.LIGHT: 1, SearchTier.STANDARD: 2, SearchTier.DEEP: 3}[tier]

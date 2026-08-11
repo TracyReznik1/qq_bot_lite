@@ -36,7 +36,6 @@ from tests.search_fakes import (
     RecordingProvider,
     StaticEvidenceJudge,
     StaticPlannerModel,
-    StaticRouterAdvisor,
 )
 
 
@@ -53,32 +52,24 @@ def search_module():
 
 def router_payload(tier="light"):
     return {
-        "skip_candidate": None,
-        "benefit_dimensions": ["accuracy"],
         "factuality": "factual",
         "external_fact_required": True,
-        "freshness": "none",
-        "risk": "low",
-        "actionability": "none",
-        "potential_harm": "none",
-        "recommended_tier": tier,
-        "trigger_codes": ["factual_default"],
+        "complexity_codes": ["comparison"] if tier == "standard" else [],
+        "source_requirement": "any_relevant",
+        "freshness_requirement": "not_required",
+        "as_of": None,
+        "date_from": None,
+        "date_to": None,
+        "version_constraint": None,
+        "high_consequence": False,
+        "warning_required": False,
+        "fail_closed": False,
     }
 
 
 def skip_payload(reason="social_or_emotional"):
-    return {
-        "skip_candidate": {"reason": reason},
-        "benefit_dimensions": [],
-        "factuality": "non_factual",
-        "external_fact_required": False,
-        "freshness": "none",
-        "risk": "low",
-        "actionability": "none",
-        "potential_harm": "none",
-        "recommended_tier": None,
-        "trigger_codes": [],
-    }
+    del reason
+    return router_payload("light")
 
 
 class OrchestratorRequestIdTests(unittest.TestCase):
@@ -113,10 +104,38 @@ def request(question="什么是光合作用", force_search=False):
 
 
 def _make_router(payload):
-    """Wrap a static advisor in the real program router."""
+    """The production router is pure; payload belongs to the analyzer."""
+    del payload
     from src.search.router import RetrievalBenefitRouter
-    from tests.search_fakes import StaticRouterAdvisor
-    return RetrievalBenefitRouter(StaticRouterAdvisor(payload))
+    return RetrievalBenefitRouter()
+
+
+class _StaticRoutingLLM:
+    def __init__(self, payload):
+        self.content = payload if isinstance(payload, str) else json.dumps(payload)
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return SimpleNamespace(content=self.content)
+
+
+class _StaticRequestAnalyzer:
+    """A real one-shot analyzer over a deterministic test LLM response."""
+
+    def __init__(self, payload):
+        from src.search.router import LLMRequestAnalyzer
+        self._llm = _StaticRoutingLLM(payload)
+        self._analyzer = LLMRequestAnalyzer(self._llm)
+        self.calls = []
+
+    def analyze(self, retrieval_request):
+        self.calls.append(retrieval_request)
+        return self._analyzer.analyze(retrieval_request)
+
+
+def _make_request_analyzer(payload):
+    return _StaticRequestAnalyzer(payload)
 
 
 def _make_planner():
@@ -172,6 +191,42 @@ class _FakeExtractor:
         )
 
 
+class _RecordingRequestAnalyzer:
+    def __init__(self, analysis):
+        self.analysis = analysis
+        self.calls = []
+
+    def analyze(self, retrieval_request):
+        self.calls.append(retrieval_request)
+        return self.analysis
+
+
+def _task3_analysis(*, skip_reason=None, complexity_codes=()):
+    m = importlib.import_module("src.search.models")
+    return m.RequestAnalysis(
+        retrieval=m.RetrievalContext(
+            must_search=skip_reason is None,
+            skip_reason=skip_reason,
+            factuality=(
+                m.Factuality.NON_FACTUAL
+                if skip_reason is not None
+                else m.Factuality.FACTUAL
+            ),
+            external_fact_required=skip_reason is None,
+            complexity_codes=complexity_codes,
+            source_requirement=m.SourceRequirement.ANY_RELEVANT,
+        ),
+        freshness=m.FreshnessContext(
+            m.FreshnessRequirement.NOT_REQUIRED,
+            None,
+            None,
+            None,
+            None,
+        ),
+        risk=m.RiskContext(False, False, False),
+    )
+
+
 class _FakeProvider:
     def __init__(self, name="tavily", hits=()):
         self.name = name
@@ -212,6 +267,7 @@ class OrchestratorSkipTests(unittest.TestCase):
     def test_social_skip_returns_decision_without_provider(self):
         router = _make_router(skip_payload())
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(skip_payload()),
             router=router,
             planner=_make_planner(),
             judge=StaticEvidenceJudge({}),
@@ -232,6 +288,7 @@ class OrchestratorSkipTests(unittest.TestCase):
     def test_user_forbid_web_skip_has_zero_provider_eligibility(self):
         router = _make_router(skip_payload("user_forbid_web"))
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(skip_payload("user_forbid_web")),
             router=router,
             planner=_make_planner(),
             judge=StaticEvidenceJudge({}),
@@ -245,6 +302,181 @@ class OrchestratorSkipTests(unittest.TestCase):
         self.assertFalse(result.trace.provider_invocation_started)
 
 
+class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
+    """Task 3: one immutable analysis object crosses every return boundary."""
+
+    def setUp(self) -> None:
+        self.module = orchestrator_module()
+
+    def _run(self, analysis, question, *, providers, judge):
+        from src.search.router import RetrievalBenefitRouter
+
+        analyzer = _RecordingRequestAnalyzer(analysis)
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=analyzer,
+            router=RetrievalBenefitRouter(),
+            planner=_make_planner(),
+            judge=judge,
+            providers=providers,
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+        result = orchestrator.run(request(question))
+        self.assertEqual([request(question)], analyzer.calls)
+        self.assertIs(analysis, result.analysis)
+        return result
+
+    def test_analysis_identity_is_preserved_for_skip_success_partial_and_failure(self):
+        m = importlib.import_module("src.search.models")
+        skip = self._run(
+            _task3_analysis(skip_reason=m.SkipReason.SOCIAL_OR_EMOTIONAL),
+            "你好，今天心情有点差",
+            providers=(),
+            judge=StaticEvidenceJudge({}),
+        )
+        self.assertIs(skip.decision.route, SearchTier.SKIP)
+
+        success = self._run(
+            _task3_analysis(),
+            "什么是光合作用",
+            providers=(_FakeProvider(hits=[_hit()]),),
+            judge=_FakeJudge(),
+        )
+        self.assertIs(success.evidence.evidence_state, EvidenceState.SUFFICIENT)
+
+        class PartialJudge:
+            def judge(self, _question, candidates, *, required_topics=None, **_kwargs):
+                supported = tuple(required_topics or ())[:1]
+                return {
+                    f"C{index}": {
+                        "candidate_id": f"C{index}",
+                        "relevance": "direct",
+                        "source_relation": "independent",
+                        "publisher_entity_match": False,
+                        "ownership_basis": None,
+                        "publisher": None,
+                        "supported_topics": list(supported),
+                        "conflict_key": None,
+                        "conflict_value": None,
+                        "conflict_relation": None,
+                    }
+                    for index, _candidate in enumerate(candidates, 1)
+                }
+
+        partial = self._run(
+            _task3_analysis(
+                complexity_codes=(m.RetrievalComplexityCode.COMPARISON,),
+            ),
+            "比较 Rust 和 Go 的并发模型",
+            providers=(_FakeProvider(hits=[_hit()] * 3),),
+            judge=PartialJudge(),
+        )
+        self.assertIs(partial.evidence.evidence_state, EvidenceState.PARTIAL)
+
+        failure = self._run(
+            _task3_analysis(),
+            "什么是光合作用",
+            providers=(),
+            judge=StaticEvidenceJudge({}),
+        )
+        self.assertIs(
+            failure.failure_code,
+            SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+        )
+
+    def test_legacy_risk_and_freshness_metadata_do_not_reach_planner_or_budget(self):
+        m = importlib.import_module("src.search.models")
+        analysis = m.RequestAnalysis(
+            m.RetrievalContext(
+                must_search=False,
+                skip_reason=None,
+                factuality=m.Factuality.FACTUAL,
+                external_fact_required=True,
+                complexity_codes=(),
+                source_requirement=m.SourceRequirement.ANY_RELEVANT,
+            ),
+            m.FreshnessContext(m.FreshnessRequirement.CURRENT, None, None, None, None),
+            m.RiskContext(True, True, True),
+        )
+
+        class CapturingPlanner:
+            def __init__(self):
+                self.decision = None
+
+            def plan(self, retrieval_request, retrieval_decision, **kwargs):
+                self.decision = retrieval_decision
+                return _make_planner().plan(
+                    retrieval_request,
+                    retrieval_decision,
+                    **kwargs,
+                )
+
+        planner = CapturingPlanner()
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_RecordingRequestAnalyzer(analysis),
+            router=__import__("src.search.router", fromlist=["RetrievalBenefitRouter"]).RetrievalBenefitRouter(),
+            planner=planner,
+            judge=StaticEvidenceJudge({}),
+            providers=(),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+        result = orchestrator.run(request("FDA 是什么机构？"))
+
+        self.assertIs(planner.decision.freshness, Freshness.NONE)
+        self.assertIs(planner.decision.risk, RiskLevel.LOW)
+        self.assertIs(result.decision.route, SearchTier.LIGHT)
+        self.assertIs(result.decision.freshness, Freshness.HIGH)
+        self.assertIs(result.decision.risk, RiskLevel.HIGH)
+
+    def test_retrieval_deadline_starts_after_analysis_but_trace_keeps_analysis_time(self):
+        m = importlib.import_module("src.search.models")
+        clock = FakeClock()
+        analysis = _task3_analysis()
+
+        class DelayedAnalyzer:
+            def __init__(self):
+                self.calls = 0
+
+            def analyze(self, retrieval_request):
+                del retrieval_request
+                self.calls += 1
+                clock.advance(17)
+                return analysis
+
+        class CapturingPlanner:
+            def __init__(self):
+                self.deadline = None
+
+            def plan(self, retrieval_request, retrieval_decision, **kwargs):
+                self.deadline = kwargs["deadline"]
+                return _make_planner().plan(
+                    retrieval_request,
+                    retrieval_decision,
+                    **kwargs,
+                )
+
+        analyzer = DelayedAnalyzer()
+        planner = CapturingPlanner()
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=analyzer,
+            router=__import__("src.search.router", fromlist=["RetrievalBenefitRouter"]).RetrievalBenefitRouter(),
+            planner=planner,
+            judge=StaticEvidenceJudge({}),
+            providers=(),
+            extractor=_FakeExtractor(),
+            clock=clock,
+        )
+        result = orchestrator.run(request("什么是光合作用"))
+
+        self.assertEqual(1, analyzer.calls)
+        self.assertEqual(
+            m.DEFAULT_TIER_BUDGETS[SearchTier.LIGHT].hard_timeout_seconds,
+            planner.deadline - clock.monotonic(),
+        )
+        self.assertEqual(17_000, result.trace.route_latency_ms)
+
+
 class OrchestratorLightTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = orchestrator_module()
@@ -253,6 +485,7 @@ class OrchestratorLightTests(unittest.TestCase):
         provider = _FakeProvider(hits=[_hit()])
         judge = _FakeJudge()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=judge,
@@ -272,6 +505,7 @@ class OrchestratorLightTests(unittest.TestCase):
     def test_light_sufficient_evidence_seals(self):
         provider = _FakeProvider(hits=[_hit()])
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -303,10 +537,10 @@ class OrchestratorLightTests(unittest.TestCase):
 
         class LegacyDeepRouter:
             def __init__(self):
-                self.requests = []
+                self.contexts = []
 
-            def decide(self, retrieval_request):
-                self.requests.append(retrieval_request)
+            def decide(self, context):
+                self.contexts.append(context)
                 return legacy_decision
 
         class RecordingTrace:
@@ -337,7 +571,9 @@ class OrchestratorLightTests(unittest.TestCase):
 
         router = LegacyDeepRouter()
         planner = Planner()
+        analysis = _task3_analysis()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_RecordingRequestAnalyzer(analysis),
             router=router,
             planner=planner,
             judge=_FakeJudge(),
@@ -354,7 +590,7 @@ class OrchestratorLightTests(unittest.TestCase):
             ):
                 orchestrator.run(retrieval_request)
 
-        self.assertEqual(router.requests, [retrieval_request])
+        self.assertEqual(router.contexts, [analysis.retrieval])
         self.assertEqual(planner.calls, 0)
         self.assertEqual(len(RecordingTrace.instances), 1)
         self.assertIs(RecordingTrace.instances[0].route, SearchTier.LIGHT)
@@ -369,6 +605,7 @@ class OrchestratorStandardTests(unittest.TestCase):
         from src.search.planner import _derive_required_topics
         topics = _derive_required_topics(question)
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(judge_verdicts or {}, supported_topics=topics),
@@ -390,6 +627,7 @@ class OrchestratorStandardTests(unittest.TestCase):
         hits = [_hit()] * 3
         provider = _FakeProvider(hits=hits)
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -408,6 +646,7 @@ class OrchestratorStandardTests(unittest.TestCase):
         from src.search.models import ProviderHit
         provider = _FakeProvider(hits=[_hit()] * 3)
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -429,6 +668,7 @@ class OrchestratorFailureTests(unittest.TestCase):
 
     def test_no_provider_is_provider_not_configured(self):
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -460,6 +700,7 @@ class OrchestratorFailureTests(unittest.TestCase):
 
     def test_no_results_failure_seals_bundle_and_trace_from_same_state(self):
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -485,6 +726,7 @@ class OrchestratorFailureTests(unittest.TestCase):
                 raise AssertionError("unavailable adapter must not execute")
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -510,6 +752,7 @@ class OrchestratorFailureTests(unittest.TestCase):
                 return ProviderResult("tavily", ProviderStatus.ERROR, (), 1)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -544,6 +787,7 @@ class OrchestratorFailureTests(unittest.TestCase):
                 return EvidenceCandidate(hit, None, hit.snippet, None, "snippet", (), 0)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -607,6 +851,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 )
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -655,6 +900,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
 
         provider = QueuedProvider()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -734,6 +980,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         executor = RunningBeforeInvokeExecutor()
         provider = RecordingProvider()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -797,6 +1044,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -824,6 +1072,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return _make_planner().plan(*_args, **_kwargs)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=SlowPlanner(),
             judge=_FakeJudge(),
@@ -845,6 +1094,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return {"C1": {"relevance": "direct"}}
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=SlowJudge(),
@@ -865,6 +1115,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return _FakeExtractor().extract(*_args, **_kwargs)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -924,6 +1175,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return replace(base, initial_queries=queries)
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=FourQueryPlanner(),
             judge=_FakeJudge(),
@@ -980,6 +1232,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         budgets = dict(DEFAULT_TIER_BUDGETS)
         budgets[SearchTier.STANDARD] = short_standard
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(supported_topics=()),
@@ -1040,6 +1293,7 @@ class OrchestratorAccountingTests(unittest.TestCase):
 
         extractor = FailedFetchSnippetExtractor()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(supported_topics=("定义",)),
@@ -1085,6 +1339,7 @@ class OrchestratorAccountingTests(unittest.TestCase):
         topics = _derive_required_topics(question)
         extractor = RecordingExtractor()
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(supported_topics=()),
@@ -1113,6 +1368,7 @@ class OrchestratorTraceTests(unittest.TestCase):
 
     def test_skip_trace_has_complete_route_fields(self):
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(skip_payload()),
             router=_make_router(skip_payload()),
             planner=_make_planner(),
             judge=StaticEvidenceJudge({}),
@@ -1131,6 +1387,7 @@ class OrchestratorTraceTests(unittest.TestCase):
     def test_light_trace_distinguishes_start_attempt_sufficient(self):
         provider = _FakeProvider(hits=[_hit()])
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
@@ -1152,6 +1409,7 @@ class OrchestratorTraceTests(unittest.TestCase):
     def test_request_local_redaction_audit_flows_from_plan_and_repair_to_trace(self):
         provider = _FakeProvider(hits=[_hit()] * 3)
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
             judge=_FakeJudge(supported_topics=()),
@@ -1210,7 +1468,7 @@ class OrchestratorTraceTests(unittest.TestCase):
         )
 
         class Router:
-            def decide(self, _request):
+            def decide(self, _context):
                 clock.advance(0.007)
                 return d
 
@@ -1271,6 +1529,9 @@ class OrchestratorTraceTests(unittest.TestCase):
                 }
 
         orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_RecordingRequestAnalyzer(
+                _task3_analysis(complexity_codes=(m.RetrievalComplexityCode.COMPARISON,))
+            ),
             router=Router(), planner=Planner(), judge=Judge(),
             providers=(Provider(),), extractor=Extractor(), clock=clock,
         )

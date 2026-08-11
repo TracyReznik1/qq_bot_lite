@@ -5,6 +5,7 @@ import math
 import unittest
 from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal
+from datetime import date
 
 
 def models():
@@ -247,6 +248,27 @@ class SearchModelContractTests(unittest.TestCase):
             final_reason_codes=(m.TriggerCode.EXPLICIT_NO_WEB, m.TriggerCode.EXPLICIT_SEARCH),
         )
         self.assertTrue(conflict.requires_clarification)
+
+        # Task 3 carries the force/explicit-search conflict in RetrievalContext.
+        # Retained decision reason codes are diagnostic only and must not erase
+        # the clarification state when their legacy set is minimal.
+        minimal_conflict = m.RetrievalDecision(
+            route=m.SearchTier.SKIP,
+            skip_reason=m.SkipReason.USER_FORBID_WEB,
+            forced_search=True,
+            trigger_codes=(m.TriggerCode.EXPLICIT_NO_WEB,),
+            benefit_dimensions=frozenset(),
+            factuality=m.Factuality.AMBIGUOUS,
+            external_fact_required=False,
+            freshness=m.Freshness.NONE,
+            risk=m.RiskLevel.LOW,
+            actionability=m.Actionability.NONE,
+            potential_harm=m.PotentialHarm.NONE,
+            program_minimum_tier=None,
+            model_recommended_tier=None,
+            final_reason_codes=(m.TriggerCode.EXPLICIT_NO_WEB,),
+        )
+        self.assertTrue(minimal_conflict.requires_clarification)
 
     def test_decision_rejects_illegal_route_combinations_and_free_text_codes(self):
         m = models()
@@ -786,6 +808,141 @@ class SearchModelContractTests(unittest.TestCase):
             True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
             m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, (),
         )
+
+
+class RequestAnalysisContextContractTests(unittest.TestCase):
+    """Task 3 contexts are closed, immutable, and intentionally independent."""
+
+    @staticmethod
+    def _retrieval(m, **overrides):
+        values = {
+            "must_search": True,
+            "skip_reason": None,
+            "factuality": m.Factuality.FACTUAL,
+            "external_fact_required": True,
+            "complexity_codes": (),
+            "source_requirement": m.SourceRequirement.ANY_RELEVANT,
+        }
+        values.update(overrides)
+        return m.RetrievalContext(**values)
+
+    @staticmethod
+    def _freshness(m, **overrides):
+        values = {
+            "requirement": m.FreshnessRequirement.NOT_REQUIRED,
+            "as_of": None,
+            "date_from": None,
+            "date_to": None,
+            "version_constraint": None,
+        }
+        values.update(overrides)
+        return m.FreshnessContext(**values)
+
+    @staticmethod
+    def _risk(m, **overrides):
+        values = {
+            "high_consequence": False,
+            "warning_required": False,
+            "fail_closed": False,
+        }
+        values.update(overrides)
+        return m.RiskContext(**values)
+
+    def test_request_analysis_keeps_retrieval_freshness_and_risk_separate(self):
+        m = models()
+        analysis = m.RequestAnalysis(
+            retrieval=self._retrieval(m),
+            freshness=self._freshness(
+                m,
+                requirement=m.FreshnessRequirement.CURRENT,
+            ),
+            risk=self._risk(
+                m,
+                high_consequence=True,
+                warning_required=True,
+                fail_closed=True,
+            ),
+        )
+
+        self.assertEqual((), analysis.retrieval.complexity_codes)
+        self.assertTrue(analysis.risk.warning_required)
+        self.assertIs(
+            analysis.freshness.requirement,
+            m.FreshnessRequirement.CURRENT,
+        )
+        with self.assertRaises(FrozenInstanceError):
+            analysis.risk.warning_required = False
+
+    def test_context_contracts_normalize_collections_and_reject_unknown_values(self):
+        m = models()
+        codes = [m.RetrievalComplexityCode.COMPARISON]
+        retrieval = self._retrieval(m, complexity_codes=codes)
+        codes.append(m.RetrievalComplexityCode.RECOMMENDATION)
+
+        self.assertEqual(
+            (m.RetrievalComplexityCode.COMPARISON,),
+            retrieval.complexity_codes,
+        )
+        with self.assertRaises((TypeError, ValueError)):
+            self._retrieval(m, complexity_codes=("comparison",))
+        with self.assertRaises((TypeError, ValueError)):
+            self._retrieval(m, source_requirement="any_relevant")
+        with self.assertRaises((TypeError, ValueError)):
+            self._retrieval(m, must_search="yes")
+
+    def test_freshness_contract_closes_date_and_version_constraints(self):
+        m = models()
+        with self.assertRaises(ValueError):
+            self._freshness(m, as_of=date(2026, 8, 11))
+        with self.assertRaises(ValueError):
+            self._freshness(
+                m,
+                requirement=m.FreshnessRequirement.WINDOW,
+                date_from=date(2026, 8, 12),
+                date_to=date(2026, 8, 11),
+            )
+        with self.assertRaises(ValueError):
+            self._freshness(
+                m,
+                requirement=m.FreshnessRequirement.VERSION,
+                version_constraint=" ",
+            )
+        version = self._freshness(
+            m,
+            requirement=m.FreshnessRequirement.VERSION,
+            version_constraint="3.13",
+        )
+        self.assertEqual("3.13", version.version_constraint)
+
+    def test_risk_contract_requires_high_consequence_for_warning(self):
+        m = models()
+        with self.assertRaises(ValueError):
+            self._risk(m, warning_required=True)
+        with self.assertRaises((TypeError, ValueError)):
+            self._risk(m, high_consequence=1)
+
+    def test_pipeline_result_retains_supplied_analysis_identity(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        analysis = m.RequestAnalysis(
+            self._retrieval(m),
+            self._freshness(m),
+            self._risk(m),
+        )
+        evidence = replace(
+            fixtures.bundle(),
+            evidence_state=m.EvidenceState.PARTIAL,
+        )
+        result = m.SearchPipelineResult(
+            fixtures.decision(),
+            fixtures.plan(),
+            evidence,
+            m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT),
+            m.SearchFailureCode.PARTIAL_EVIDENCE,
+            analysis,
+        )
+
+        self.assertIs(analysis, result.analysis)
 
 
 if __name__ == "__main__":
