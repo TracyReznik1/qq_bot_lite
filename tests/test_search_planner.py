@@ -155,18 +155,21 @@ def supplemental_query(
     targets=("topic-1",),
     date_from=None,
     date_to=None,
-    include_domains=(),
-    exclude_domains=(),
+    include_domains=None,
+    exclude_domains=None,
 ):
-    return {
+    payload = {
         "purpose": purpose,
         "text": text,
         "target_topic_ids": list(targets),
         "date_from": date_from,
         "date_to": date_to,
-        "include_domains": list(include_domains),
-        "exclude_domains": list(exclude_domains),
     }
+    if include_domains is not None:
+        payload["include_domains"] = list(include_domains)
+    if exclude_domains is not None:
+        payload["exclude_domains"] = list(exclude_domains)
+    return payload
 
 
 class PlannerDirectQueryContractTests(unittest.TestCase):
@@ -314,6 +317,73 @@ class PlannerDirectQueryContractTests(unittest.TestCase):
         self.assertTrue(material_ids)
         self.assertEqual(material_ids, first.initial_queries[0].target_topic_ids)
         self.assertEqual(1, len(first.initial_queries))
+
+    def test_valid_payload_entities_are_derived_from_the_original_question(self):
+        plan = self._plan(StaticPlannerModel(strict_payload(
+            topics=(model_topic("并发模型"),),
+            supplements=(),
+        )))
+
+        self.assertEqual(PlanningStatus.NORMAL, plan.planning_status)
+        self.assertEqual(("Rust", "Go"), plan.entities)
+
+    def test_top_level_payload_extras_trigger_degraded_fallback(self):
+        for extra_key, extra_value in (
+            ("entities", ["model supplied entity"]),
+            ("initial_queries", [{"text": "model supplied direct"}]),
+        ):
+            with self.subTest(extra_key=extra_key):
+                payload = strict_payload(
+                    topics=(model_topic("并发模型"),),
+                    supplements=(),
+                )
+                payload[extra_key] = extra_value
+
+                plan = self._plan(StaticPlannerModel(payload))
+
+                self.assertEqual(PlanningStatus.DEGRADED, plan.planning_status)
+                self.assertEqual(("Rust", "Go"), plan.entities)
+                self.assertNotIn(
+                    "model supplied direct",
+                    tuple(query.text for query in plan.initial_queries),
+                )
+
+    def test_topic_row_extra_key_is_dropped(self):
+        invalid_topic = model_topic("模型额外主题")
+        invalid_topic["unexpected"] = "not allowed"
+        plan = self._plan(StaticPlannerModel(strict_payload(
+            topics=(invalid_topic, model_topic("有效主题")),
+            supplements=(supplemental_query(
+                "primary", "有效主题官方资料", targets=("topic-1",),
+            ),),
+        )))
+
+        self.assertEqual(PlanningStatus.DEGRADED, plan.planning_status)
+        self.assertEqual(("有效主题",), tuple(
+            topic.label for topic in plan.required_topics
+        ))
+        self.assertEqual(
+            ["比较 Rust 和 Go 的并发模型", "有效主题官方资料"],
+            [query.text for query in plan.initial_queries],
+        )
+
+    def test_supplement_domain_extras_are_dropped_without_domain_restrictions(self):
+        plan = self._plan(StaticPlannerModel(strict_payload(
+            topics=(model_topic("并发模型"),),
+            supplements=(supplemental_query(
+                "primary",
+                "并发模型官方资料",
+                include_domains=("example.com",),
+                exclude_domains=("blocked.example",),
+            ),),
+        )))
+
+        self.assertEqual(PlanningStatus.DEGRADED, plan.planning_status)
+        self.assertEqual(1, len(plan.initial_queries))
+        self.assertTrue(all(
+            not query.include_domains and not query.exclude_domains
+            for query in plan.initial_queries
+        ))
 
 
 class PlannerLightTests(unittest.TestCase):
@@ -587,21 +657,24 @@ class PlannerDomainValidationTests(unittest.TestCase):
         return plan_with_context(planner, request("什么是光合作用"), standard_decision())
 
     def test_rejects_urls_in_domain_lists(self):
-        plan = self._plan_with_domains(["https://example.com"], [])
-        self.assertEqual(plan.initial_queries[1].include_domains, ())
+        self.assertEqual(
+            (),
+            self.module.validate_domain_list(["https://example.com"]),
+        )
 
     def test_rejects_private_and_local_names(self):
-        plan = self._plan_with_domains(["127.0.0.1", "localhost", "example.com"], [])
-        self.assertNotIn("127.0.0.1", plan.initial_queries[1].include_domains)
-        self.assertNotIn("localhost", plan.initial_queries[1].include_domains)
-        self.assertIn("example.com", plan.initial_queries[1].include_domains)
+        domains = self.module.validate_domain_list(
+            ["127.0.0.1", "localhost", "example.com"]
+        )
+        self.assertNotIn("127.0.0.1", domains)
+        self.assertNotIn("localhost", domains)
+        self.assertIn("example.com", domains)
 
     def test_deduplicates_and_caps_domain_list(self):
-        plan = self._plan_with_domains(
+        domains = self.module.validate_domain_list(
             ["a.com", "a.com", "b.com", "c.com", "d.com", "e.com", "f.com"],
-            [],
         )
-        self.assertEqual(len(plan.initial_queries[1].include_domains), 5)
+        self.assertEqual(len(domains), 5)
 
 
 class PlannerDegradationTests(unittest.TestCase):

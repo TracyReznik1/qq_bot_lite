@@ -669,6 +669,8 @@ class SearchPlan:
         legacy_topic_labels = all(type(topic) is str for topic in raw_topics)
         if legacy_topic_labels:
             topic_labels = _strings(raw_topics, "required_topics")
+            if len(topic_labels) > 3:
+                raise ValueError("legacy required_topics cannot exceed three labels")
             if not topic_labels:
                 topic_labels = (
                     str(self.original_question or "").strip() or "用户问题",
@@ -763,11 +765,8 @@ class SearchPlan:
         expected_query_indexes = tuple(range(1, len(self.initial_queries) + 1))
         if tuple(query.query_index for query in self.initial_queries) != expected_query_indexes:
             raise ValueError("initial query indexes must be unique and sequential")
-        known_topic_ids = {topic.topic_id for topic in self.required_topics}
         direct = self.initial_queries[0]
-        if not direct.target_topic_ids or not material_topic_ids.issubset(
-            set(direct.target_topic_ids)
-        ) or not set(direct.target_topic_ids).issubset(known_topic_ids):
+        if set(direct.target_topic_ids) != material_topic_ids:
             raise ValueError("direct query must target every material topic")
         for query in self.initial_queries[1:]:
             target_topic_ids = set(query.target_topic_ids)

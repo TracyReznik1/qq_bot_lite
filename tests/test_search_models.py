@@ -1093,6 +1093,16 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
                     self._plan(m, **values)
 
         with self.assertRaises((TypeError, ValueError)):
+            self._plan(
+                m,
+                topics=(
+                    self._topic(m, "topic-1", "主主题"),
+                    self._topic(m, "topic-2", "非材料", material=False),
+                ),
+                queries=(self._query(m, targets=("topic-1", "topic-2")),),
+            )
+
+        with self.assertRaises((TypeError, ValueError)):
             self._query(m, query_index=0)
 
     def test_structured_plan_rejects_query_ids_outside_the_final_sealed_order(self):
@@ -1150,6 +1160,19 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
         empty_legacy = self._plan(m, topics=())
         self.assertEqual(1, len(empty_legacy.required_topics))
         self.assertTrue(empty_legacy.required_topics[0].material)
+
+        three_legacy = self._plan(
+            m,
+            topics=("legacy one", "legacy two", "legacy three"),
+            queries=(legacy_query,),
+        )
+        self.assertEqual(3, len(three_legacy.required_topics))
+        with self.assertRaises((TypeError, ValueError)):
+            self._plan(
+                m,
+                topics=("one", "two", "three", "four"),
+                queries=(legacy_query,),
+            )
 
         with self.assertRaises((TypeError, ValueError)):
             self._plan(m, topics=(self._topic(m),), queries=(legacy_query,))

@@ -353,6 +353,27 @@ Rules:
 - never put API keys, secrets, callback codes, QQ/group ids, or data URLs in a query
 """
 
+_PLANNER_PAYLOAD_KEYS = frozenset({
+    "supplemental_queries",
+    "required_topics",
+})
+_PLANNER_TOPIC_KEYS = frozenset({
+    "label",
+    "material",
+    "freshness_requirement",
+    "date_from",
+    "date_to",
+    "version_constraint",
+    "source_requirement",
+})
+_PLANNER_SUPPLEMENTAL_QUERY_KEYS = frozenset({
+    "purpose",
+    "text",
+    "target_topic_ids",
+    "date_from",
+    "date_to",
+})
+
 
 class SearchPlanner:
     """Plan bounded initial queries and the single optional repair query."""
@@ -430,7 +451,7 @@ class SearchPlanner:
                 _SOURCE_RELATION_INDEPENDENT,
             }
         )
-        if payload is None:
+        if payload is None or frozenset(payload) != _PLANNER_PAYLOAD_KEYS:
             required_topics = _fallback_required_topics(
                 original,
                 retrieval_context,
@@ -541,12 +562,11 @@ class SearchPlanner:
             payload,
             direct_degraded or topic_degraded or query_degraded,
         )
-        entities = _string_list(payload.get("entities"))
         return SearchPlan(
             decision=decision,
             original_question=original,
             planning_status=status,
-            entities=tuple(entities),
+            entities=_extract_entities(original),
             time_window=_time_window_for_context(effective_freshness),
             initial_queries=_assign_initial_query_ids(redacted_queries),
             required_topics=required_topics,
@@ -822,7 +842,7 @@ def _seal_required_topics(
 
 
 def _parse_model_topic(raw: Any, index: int) -> RequiredTopic | None:
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or frozenset(raw) != _PLANNER_TOPIC_KEYS:
         return None
     label = raw.get("label")
     material = raw.get("material")
@@ -887,7 +907,10 @@ def _model_supplemental_queries(
 def _parse_model_supplemental_query(
     raw: Any,
 ) -> tuple[SearchQuery | None, bool]:
-    if not isinstance(raw, dict):
+    if (
+        not isinstance(raw, dict)
+        or frozenset(raw) != _PLANNER_SUPPLEMENTAL_QUERY_KEYS
+    ):
         return None, True
     purpose = _parse_enum(raw.get("purpose"), QueryPurpose)
     text = raw.get("text")
@@ -912,8 +935,6 @@ def _parse_model_supplemental_query(
         text=_normalize_whitespace(text),
         date_from=date_from,
         date_to=date_to,
-        include_domains=validate_domain_list(raw.get("include_domains") or ()),
-        exclude_domains=validate_domain_list(raw.get("exclude_domains") or ()),
         target_topic_ids=target_topic_ids,
     ), False
 
