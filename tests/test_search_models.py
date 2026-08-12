@@ -1426,6 +1426,26 @@ class TopicAssessmentContractTests(unittest.TestCase):
                 missing_claim_topics=("unrelated legacy label",),
             )
 
+    def test_evidence_conflict_rejects_members_from_only_one_evidence(self):
+        m = models()
+        members = (
+            m.EvidenceConflictMember("E1", "draft", None, "contradicts"),
+            m.EvidenceConflictMember("E1", "published", None, "contradicts"),
+        )
+        with self.assertRaises(ValueError):
+            m.EvidenceConflict("conflict:status", "status", members)
+
+    def test_evidence_conflict_rejects_members_asserting_only_one_value(self):
+        m = models()
+        for values in (("published", "published"), ("1", " 1 ")):
+            with self.subTest(values=values):
+                members = (
+                    m.EvidenceConflictMember("E1", values[0], None, "contradicts"),
+                    m.EvidenceConflictMember("E2", values[1], None, "contradicts"),
+                )
+                with self.assertRaises(ValueError):
+                    m.EvidenceConflict("conflict:status", "status", members)
+
     def test_bundle_rejects_state_that_disagrees_with_evidence_priority(self):
         m = models()
         fixtures = SearchModelFixtures(m)

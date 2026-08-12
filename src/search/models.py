@@ -895,6 +895,10 @@ class EvidenceConflict:
         )
         if len(self.members) < 2:
             raise ValueError("a conflict requires at least two members")
+        if len({member.evidence_id for member in self.members}) < 2:
+            raise ValueError("a conflict requires at least two distinct evidence ids")
+        if len({str(member.value).strip() for member in self.members}) < 2:
+            raise ValueError("a conflict requires at least two distinct asserted values")
 
 
 @dataclass(frozen=True)
