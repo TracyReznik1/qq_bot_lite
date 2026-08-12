@@ -1504,8 +1504,8 @@ class OrchestratorAccountingTests(unittest.TestCase):
         self.assertEqual(result.trace.content_read_count, 4)
         self.assertEqual(extractor.query_ids[-1], "repair-1")
         self.assertEqual(
-            [query_id for query_id, _purpose in result.trace.executed_queries],
-            ["initial-1", "initial-2", "initial-3", "repair-1"],
+            [entry.query_index for entry in result.trace.executed_queries],
+            [1, 2, 3, 4],
         )
         self.assertEqual(result.evidence.retrieval_round_count, 2)
         self.assertTrue(result.evidence.repair_plan.triggered)
@@ -1609,9 +1609,11 @@ class OrchestratorTraceTests(unittest.TestCase):
         )
         initial_query = m.SearchQuery(
             "initial-1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "topic",
+            None, None, (), (), 1, ("topic-1",),
         )
         repair_query = m.SearchQuery(
             "repair-1", m.SearchRoundKind.REPAIR, m.QueryPurpose.REPAIR, "topic source",
+            None, None, (), (), 2, ("topic-1",),
         )
         search_plan = m.SearchPlan(
             d, "topic", m.PlanningStatus.NORMAL, (), None, (initial_query,),
@@ -1630,7 +1632,12 @@ class OrchestratorTraceTests(unittest.TestCase):
 
             def plan_repair(self, *_args, **_kwargs):
                 clock.advance(0.013)
-                return m.RepairPlan(True, ("missing_topic",), repair_query)
+                return m.RepairPlan(
+                    True,
+                    (m.RepairReasonCode.MISSING_TOPIC,),
+                    ("topic-1",),
+                    repair_query,
+                )
 
         class Provider:
             name = "tavily"
@@ -1708,8 +1715,8 @@ class OrchestratorTraceTests(unittest.TestCase):
         self.assertAlmostEqual(72, trace.adaptive_repair_latency_ms, delta=1)
         self.assertAlmostEqual(142, trace.retrieval_pipeline_latency_ms, delta=1)
         self.assertEqual(
-            ["initial-1", "repair-1"],
-            [row["query_id"] for row in trace.to_log_dict()["executed_queries"]],
+            [1, 2],
+            [row["query_index"] for row in trace.to_log_dict()["executed_queries"]],
         )
         json.dumps(trace.to_log_dict())
 
@@ -1791,6 +1798,325 @@ class OrchestratorProductionGraphTests(unittest.TestCase):
             [provider.name for provider in orchestrator._providers],
             ["ddgs", "tavily"],
         )
+
+
+class RepairBudgetAndStopTests(unittest.TestCase):
+    """Task 6: deterministic repair budgets, trace metadata, and the post-repair stop."""
+
+    def setUp(self) -> None:
+        self.module = orchestrator_module()
+
+    def _orchestrator(self, *, providers, judge, extractor=None, planner=None, clock=None):
+        return self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
+            router=_make_router(router_payload("standard")),
+            planner=planner if planner is not None else _make_planner(),
+            judge=judge,
+            providers=providers,
+            extractor=extractor if extractor is not None else _FakeExtractor(),
+            clock=clock if clock is not None else FakeClock(),
+        )
+
+    @staticmethod
+    def _per_query_provider():
+        from src.search.models import ProviderHit, ProviderResult
+
+        class PerQueryProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                hit = ProviderHit(
+                    "tavily",
+                    search_query.query_id,
+                    search_query.query_id,
+                    f"https://example.com/{search_query.query_id}",
+                    "正文",
+                    None,
+                    None,
+                    "正文",
+                    (),
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+
+        return PerQueryProvider()
+
+    def test_full_capacity_repair_uses_request_wide_query_indexes(self):
+        m = importlib.import_module("src.search.models")
+        from src.search.models import ProviderResult
+
+        class DdgsEmptyProvider:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, _query, **_kwargs):
+                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+
+        orchestrator = self._orchestrator(
+            providers=(DdgsEmptyProvider(), self._per_query_provider()),
+            judge=_FakeJudge(supported_topic_ids=()),
+        )
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+        trace = result.trace
+
+        indexes = [entry.query_index for entry in trace.executed_queries]
+        self.assertEqual([1, 2, 3, 4], sorted(set(indexes)))
+        self.assertLessEqual(trace.semantic_query_count, 4)
+        self.assertEqual(4, trace.semantic_query_count)
+        self.assertLessEqual(trace.initial_query_count, 3)
+        self.assertEqual(1, trace.repair_query_count)
+        self.assertLessEqual(trace.candidate_url_count, 8)
+        self.assertLessEqual(trace.content_read_count, 5)
+        self.assertLessEqual(trace.retrieval_round_count, 2)
+        # DDGS and Tavily attempts for query index 1 are one semantic query.
+        index_one_entries = [entry for entry in trace.executed_queries if entry.query_index == 1]
+        self.assertEqual(2, len(index_one_entries))
+        self.assertIs(trace.retrieval_stop_reason, m.RetrievalStopReason.POST_REPAIR_STOP)
+
+    def test_provider_fallback_does_not_increment_semantic_query_count(self):
+        from src.search.models import ProviderResult
+
+        class DdgsEmptyProvider:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, _query, **_kwargs):
+                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+
+        orchestrator = self._orchestrator(
+            providers=(DdgsEmptyProvider(), self._per_query_provider()),
+            judge=_FakeJudge(),
+        )
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+        self.assertEqual(result.trace.semantic_query_count, result.trace.initial_query_count)
+        self.assertGreater(result.trace.semantic_query_count, 0)
+        index_one_entries = [
+            entry for entry in result.trace.executed_queries if entry.query_index == 1
+        ]
+        self.assertEqual(2, len(index_one_entries))
+
+    def test_post_repair_stop_prevents_a_second_repair_dispatch(self):
+        m = importlib.import_module("src.search.models")
+
+        class CallCountingJudge(_FakeJudge):
+            def __init__(self):
+                super().__init__(supported_topic_ids=())
+                self.calls = 0
+
+            def judge(self, question, candidates, *, required_topics=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return _FakeJudge(supported_topic_ids=()).judge(
+                        question, candidates, required_topics=required_topics
+                    )
+                return _FakeJudge().judge(question, candidates, required_topics=required_topics)
+
+        judge = CallCountingJudge()
+        orchestrator = self._orchestrator(
+            providers=(self._per_query_provider(),),
+            judge=judge,
+        )
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+
+        self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.POST_REPAIR_STOP)
+        self.assertEqual(1, result.trace.repair_query_count)
+        self.assertEqual(2, result.evidence.retrieval_round_count)
+        self.assertEqual(2, judge.calls)
+        self.assertTrue(result.evidence.repair_plan.triggered)
+        self.assertTrue(result.trace.adaptive_repair_round_started)
+
+    def test_light_route_never_dispatches_repair(self):
+        m = importlib.import_module("src.search.models")
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topic_ids=()),
+            providers=(_FakeProvider(hits=[_hit()]),),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+        result = orchestrator.run(request("什么是光合作用"))
+        self.assertFalse(result.trace.adaptive_repair_round_started)
+        self.assertEqual(0, result.trace.repair_query_count)
+        self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.NO_REPAIR_BENEFIT)
+
+    def test_unreadable_candidates_produce_content_unreadable_repair(self):
+        m = importlib.import_module("src.search.models")
+
+        d = RetrievalDecision(
+            SearchTier.STANDARD, None, False, (), frozenset(), Factuality.FACTUAL,
+            True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
+            m.PotentialHarm.NONE, SearchTier.STANDARD, None, (),
+        )
+        topics = (
+            m.RequiredTopic("topic-1", "background", False, m.FreshnessRequirement.NOT_REQUIRED),
+            m.RequiredTopic("topic-2", "core", True, m.FreshnessRequirement.NOT_REQUIRED),
+        )
+        direct = m.SearchQuery(
+            "initial-1",
+            m.SearchRoundKind.INITIAL,
+            m.QueryPurpose.DIRECT,
+            "比较并发 API",
+            query_index=1,
+            target_topic_ids=("topic-2",),
+        )
+        search_plan = m.SearchPlan(
+            d, "比较并发 API", m.PlanningStatus.NORMAL, (), None, (direct,),
+            topics, frozenset({m.SourceRelation.PRIMARY, m.SourceRelation.INDEPENDENT}),
+            (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        )
+
+        class FixedPlanPlanner:
+            def __init__(self):
+                self._real = _make_planner()
+
+            def plan(self, *_args, **_kwargs):
+                return search_plan
+
+            def plan_repair(self, plan, gap, prior_fingerprints=()):
+                return self._real.plan_repair(plan, gap, prior_fingerprints=prior_fingerprints)
+
+        class UnreadableExtractor:
+            def extract(self, hit, _query, **_kwargs):
+                return m.EvidenceCandidate(
+                    hit,
+                    None,
+                    hit.snippet,
+                    m.ExcerptOrigin.PROVIDER_SNIPPET,
+                    "search_result_snippet_after_fetch_failure",
+                    (),
+                    1,
+                )
+
+        orchestrator = self._orchestrator(
+            providers=(self._per_query_provider(),),
+            judge=_FakeJudge(supported_topic_ids=()),
+            extractor=UnreadableExtractor(),
+            planner=FixedPlanPlanner(),
+        )
+        result = orchestrator.run(request("比较并发 API"))
+
+        self.assertTrue(result.trace.repair_used)
+        self.assertEqual(
+            (m.RepairReasonCode.CONTENT_UNREADABLE,),
+            result.evidence.repair_plan.reason_codes,
+        )
+        self.assertEqual(("topic-2",), result.evidence.repair_plan.target_topic_ids)
+        self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.POST_REPAIR_STOP)
+
+    def test_judge_hint_for_an_unknown_topic_does_not_repair(self):
+        m = importlib.import_module("src.search.models")
+
+        class HintingJudge(_FakeJudge):
+            def judge(self, question, candidates, *, required_topics=None):
+                result = super().judge(question, candidates, required_topics=required_topics)
+                result["gap_hints"] = (
+                    {"reason_code": "premise_mismatch", "target_topic_id": "topic-9"},
+                )
+                return result
+
+        orchestrator = self._orchestrator(
+            providers=(self._per_query_provider(),),
+            judge=HintingJudge(),
+        )
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+        self.assertFalse(result.evidence.repair_plan.triggered)
+        self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.EVIDENCE_SUFFICIENT)
+
+    def test_exhausted_candidate_and_read_budgets_block_repair(self):
+        m = importlib.import_module("src.search.models")
+
+        class ManyHitsProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                from src.search.models import ProviderHit, ProviderResult
+
+                hits = tuple(
+                    ProviderHit(
+                        "tavily",
+                        search_query.query_id,
+                        str(index),
+                        f"https://example.com/{search_query.query_id}/{index}",
+                        "正文",
+                        None,
+                        None,
+                        "正文",
+                        (),
+                    )
+                    for index in range(8)
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, hits, 1)
+
+        orchestrator = self._orchestrator(
+            providers=(ManyHitsProvider(),),
+            judge=_FakeJudge(supported_topic_ids=()),
+        )
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+
+        self.assertGreaterEqual(result.trace.candidate_url_count, 8)
+        self.assertGreaterEqual(result.trace.content_read_count, 5)
+        self.assertFalse(result.trace.repair_used)
+        self.assertFalse(result.evidence.repair_plan.triggered)
+        self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.BUDGET_EXHAUSTED)
+
+    def test_failed_fetch_provider_content_fallback_counts_one_read(self):
+        from src.search.models import EvidenceCandidate, ExcerptOrigin, ProviderHit, ProviderResult
+
+        class ProviderRawContentProvider:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                hit = ProviderHit(
+                    "tavily",
+                    search_query.query_id,
+                    "title",
+                    f"https://example.com/{search_query.query_id}",
+                    "正文",
+                    None,
+                    None,
+                    "可读正文",
+                    (),
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+
+        class FallbackExtractor:
+            def extract(self, hit, _query, **_kwargs):
+                return EvidenceCandidate(
+                    hit,
+                    None,
+                    hit.raw_content,
+                    ExcerptOrigin.PROVIDER_SNIPPET,
+                    "provider_raw_content",
+                    (),
+                    1,
+                )
+
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(ProviderRawContentProvider(),),
+            extractor=FallbackExtractor(),
+            clock=FakeClock(),
+        )
+        result = orchestrator.run(request("什么是光合作用"))
+        self.assertEqual(1, result.trace.content_read_count)
+        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
 
 
 if __name__ == "__main__":

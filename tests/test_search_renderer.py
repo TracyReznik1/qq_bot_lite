@@ -173,8 +173,8 @@ def bundle(
     )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(actual_missing, (), False, None, ()),
-        m.RepairPlan(False, (), None), 1, tuple(evidence), state,
+        m.EvidenceGapAnalysis(actual_missing, (), False, (), ()),
+        m.RepairPlan(False, (), (), None), 1, tuple(evidence), state,
         actual_missing, (), actual_conflict_groups, tuple(limitations),
         actual_structured_conflicts,
         topic_assessments=assessments,

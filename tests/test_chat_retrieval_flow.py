@@ -109,8 +109,8 @@ def bundle(evidence=(), state=EvidenceState.SUFFICIENT):
     )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(missing, (), False, None, ()),
-        m.RepairPlan(False, (), None), 1, tuple(evidence), state,
+        m.EvidenceGapAnalysis(missing, (), False, (), ()),
+        m.RepairPlan(False, (), (), None), 1, tuple(evidence), state,
         missing, (), (), (),
         topic_assessments=assessments,
         supported_topic_ids=supported_topic_ids,
@@ -571,8 +571,8 @@ class FailureFlowTests(unittest.TestCase):
         p = plan(SearchTier.STANDARD, required=("版本",))
         conflict_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1", "E2"),
-            m.EvidenceGapAnalysis((), (), False, None, ()),
-            m.RepairPlan(False, (), None), 1,
+            m.EvidenceGapAnalysis((), (), False, (), ()),
+            m.RepairPlan(False, (), (), None), 1,
             (
                 item("E1", "https://a.example.com", title="Source A"),
                 item("E2", "https://b.example.com", title="Source B"),
@@ -850,8 +850,8 @@ class PartialConflictFlowTests(unittest.TestCase):
         p = plan(SearchTier.STANDARD, required=("定义", "历史"))
         partial_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1",),
-            m.EvidenceGapAnalysis(("历史",), (), False, None, ()),
-            m.RepairPlan(False, (), None), 1, (item("E1", "https://a.example.com"),),
+            m.EvidenceGapAnalysis(("历史",), (), False, (), ()),
+            m.RepairPlan(False, (), (), None), 1, (item("E1", "https://a.example.com"),),
             m.EvidenceState.PARTIAL, ("历史",), (), (), (),
             topic_assessments=(
                 m.TopicAssessment(
@@ -880,8 +880,8 @@ class PartialConflictFlowTests(unittest.TestCase):
         p = plan(SearchTier.STANDARD, required=("版本",))
         conflict_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1", "E2"),
-            m.EvidenceGapAnalysis((), (), False, None, ()),
-            m.RepairPlan(False, (), None), 1,
+            m.EvidenceGapAnalysis((), (), False, (), ()),
+            m.RepairPlan(False, (), (), None), 1,
             (item("E1", "https://a.example.com", title="Source A"), item("E2", "https://b.example.com", title="Source B")),
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",), (),
             (

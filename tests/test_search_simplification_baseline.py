@@ -9,7 +9,7 @@ from src.search.models import (
     ProviderStatus,
     SearchTier,
 )
-from src.search.orchestrator import _repair_allowed
+from src.search.orchestrator import _repair_gates_pass
 from src.search.providers.base import ProviderRegistry
 from tests.test_search_providers import _provider_result, query
 
@@ -119,5 +119,5 @@ class SearchSimplificationBaselineTests(unittest.TestCase):
         tavily.search.assert_called_once()
 
     def test_repair_gate_is_a_program_function_not_an_llm_stage(self):
-        self.assertTrue(inspect.isfunction(_repair_allowed))
-        self.assertFalse(inspect.iscoroutinefunction(_repair_allowed))
+        self.assertTrue(inspect.isfunction(_repair_gates_pass))
+        self.assertFalse(inspect.iscoroutinefunction(_repair_gates_pass))

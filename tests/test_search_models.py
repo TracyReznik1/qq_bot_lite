@@ -53,7 +53,7 @@ class SearchModelFixtures:
         )
 
     def repair_plan(self):
-        return self.m.RepairPlan(False, (), None)
+        return self.m.RepairPlan(False, (), (), None)
 
     def hit(self):
         return self.m.ProviderHit(
@@ -71,7 +71,7 @@ class SearchModelFixtures:
         )
 
     def gap_analysis(self):
-        return self.m.EvidenceGapAnalysis((), (), False, None, ())
+        return self.m.EvidenceGapAnalysis((), (), False, (), ())
 
     def bundle(self):
         m = self.m
@@ -79,7 +79,7 @@ class SearchModelFixtures:
         topic = plan.required_topics[0]
         return m.EvidenceBundle(
             "req-1", self.decision(), plan, (), (),
-            m.EvidenceGapAnalysis((topic.label,), (), False, None, ()),
+            m.EvidenceGapAnalysis((topic.topic_id,), (), False, (), ()),
             self.repair_plan(), 1, (), m.EvidenceState.INSUFFICIENT,
             (topic.label,), (), (), (),
             topic_assessments=(
@@ -123,10 +123,13 @@ class SearchModelFixtures:
         trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT)
         if location == "request_id":
             trace.request_id = value
-        elif location == "adaptive_repair_query.query_id":
-            trace.adaptive_repair_query = (value, m.QueryPurpose.REPAIR)
-        elif location == "executed_queries[].query_id":
-            trace.executed_queries = ((value, m.QueryPurpose.DIRECT),)
+        elif location == "executed_queries[].provider":
+            trace.executed_queries = (
+                m.QueryTraceEntry(
+                    1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL,
+                    value, m.ProviderStatus.SUCCESS, 1,
+                ),
+            )
         elif location == "provider_attempts[].provider":
             attempt = m.ProviderAttempt("tavily", m.ProviderStatus.SUCCESS, 1, 1)
             # The final boundary must stay safe even if an upstream record is
@@ -141,10 +144,8 @@ class SearchModelFixtures:
     def logged_value(logged, location):
         if location == "request_id":
             return logged["request_id"]
-        if location == "adaptive_repair_query.query_id":
-            return logged["adaptive_repair_query"]["query_id"]
-        if location == "executed_queries[].query_id":
-            return logged["executed_queries"][0]["query_id"]
+        if location == "executed_queries[].provider":
+            return logged["executed_queries"][0]["provider"]
         if location == "provider_attempts[].provider":
             return logged["provider_attempts"][0]["provider"]
         raise AssertionError(f"unknown Trace location: {location}")
@@ -382,11 +383,10 @@ class SearchModelContractTests(unittest.TestCase):
             program_minimum_tier=m.SearchTier.STANDARD,
             final_tier=m.SearchTier.STANDARD,
             adaptive_repair_round_started=True,
-            adaptive_repair_query=("repair-1", m.QueryPurpose.REPAIR),
             executed_queries=(
-                ("initial-1", m.QueryPurpose.DIRECT),
-                ("initial-1", m.QueryPurpose.DIRECT),
-                ("repair-1", m.QueryPurpose.REPAIR),
+                m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "tavily", m.ProviderStatus.SUCCESS, 3),
+                m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "ddgs", m.ProviderStatus.EMPTY, 2),
+                m.QueryTraceEntry(4, m.QueryPurpose.REPAIR, m.SearchRoundKind.REPAIR, "tavily", m.ProviderStatus.SUCCESS, 5),
             ),
             provider_attempts=(m.ProviderAttempt("fake", m.ProviderStatus.SUCCESS, 1, 3),),
             evidence_state=m.EvidenceState.SUFFICIENT,
@@ -402,8 +402,8 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertTrue(logged["provider_attempted"])
         self.assertTrue(logged["sufficient_evidence"])
         self.assertEqual(
-            {"query_id": "repair-1", "purpose": "repair"},
-            logged["adaptive_repair_query"],
+            [1, 1, 4],
+            [row["query_index"] for row in logged["executed_queries"]],
         )
         self.assertEqual(["cq_control_code", "data_url"], logged.get("initial_query_redaction_codes"))
         self.assertEqual(["callback_secret"], logged.get("adaptive_repair_redaction_codes"))
@@ -414,24 +414,22 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertNotIn("raw query text", payload)
         json.dumps(logged)
 
-    def test_trace_serialization_is_total_for_deeply_malformed_query_metadata(self):
+    def test_trace_serialization_redacts_unknown_entry_provider(self):
         m = models()
         trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD)
         trace.executed_queries = (
-            ("initial-1", m.QueryPurpose.DIRECT),
-            (("repair-1", m.QueryPurpose.REPAIR),),
-            {"query_id": "private query text"},
+            m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "private provider", m.ProviderStatus.SUCCESS, 1),
+            m.QueryTraceEntry(2, m.QueryPurpose.REPAIR, m.SearchRoundKind.REPAIR, "tavily", m.ProviderStatus.SUCCESS, 1),
         )
-        trace.adaptive_repair_query = (("repair-1", m.QueryPurpose.REPAIR),)
 
         logged = trace.to_log_dict()
 
         self.assertEqual(
-            [{"query_id": "initial-1", "purpose": "direct"}],
-            logged["executed_queries"],
+            "[redacted]",
+            logged["executed_queries"][0]["provider"],
         )
-        self.assertIsNone(logged["adaptive_repair_query"])
-        self.assertEqual(1, logged["semantic_query_count"])
+        self.assertEqual("tavily", logged["executed_queries"][1]["provider"])
+        self.assertEqual(2, logged["semantic_query_count"])
         json.dumps(logged)
 
     def test_validation_failed_is_legal_for_a_sufficient_bundle(self):
@@ -469,7 +467,13 @@ class SearchModelContractTests(unittest.TestCase):
         query = fixtures.query()
         for build in (
             lambda: replace(fixtures.plan(), query_redaction_codes=("sk-1234567890abcdef",)),
-            lambda: m.RepairPlan(True, (), query, ("13800138000",)),
+            lambda: m.RepairPlan(
+                True,
+                (m.RepairReasonCode.MISSING_TOPIC,),
+                ("topic-2",),
+                query,
+                ("13800138000",),
+            ),
             lambda: m.SearchTrace(
                 "req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT,
                 initial_query_redaction_codes=("https://private.invalid",),
@@ -502,7 +506,7 @@ class SearchModelContractTests(unittest.TestCase):
         trace = m.SearchTrace(
             "req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD,
             None, (), None, False, None, None, False, 0, False, False,
-            ("repair-1", m.QueryPurpose.REPAIR), 1,
+            1,
         )
         self.assertEqual(1, trace.retrieval_round_count)
         self.assertEqual((), trace.initial_query_redaction_codes)
@@ -518,8 +522,8 @@ class SearchModelContractTests(unittest.TestCase):
             ),
             "EvidenceCandidate": ("hit", "document", "excerpt", "excerpt_origin", "extraction_status", "safety_flags", "content_reads_consumed"),
             "EvidenceGapAnalysis": (
-                "missing_claim_topics", "conflict_group_ids", "repair_eligible",
-                "repair_purpose", "repair_reason_codes",
+                "missing_topic_ids", "conflict_group_ids", "repair_eligible",
+                "repair_reason_codes", "repair_target_topic_ids",
             ),
             "Claim": ("claim_id", "block_id", "text", "material", "evidence_ids"),
             "AnswerBlock": ("block_id", "kind", "text", "claim_ids"),
@@ -537,14 +541,18 @@ class SearchModelContractTests(unittest.TestCase):
 
     def test_gap_analysis_enforces_authoritative_repair_shape(self):
         m = models()
-        self.assertEqual(
-            ("topic",),
-            m.EvidenceGapAnalysis(("topic",), [], True, "find source", ["missing"]).missing_claim_topics,
+        gap = m.EvidenceGapAnalysis(
+            ("topic-2",), (), True, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-2",),
         )
+        self.assertEqual(
+            ("topic-2",),
+            gap.missing_topic_ids,
+        )
+        self.assertEqual((m.RepairReasonCode.MISSING_TOPIC,), gap.repair_reason_codes)
         for values in (
-            (("topic",), (), True, "", ("missing",)),
-            (("topic",), (), True, "find source", ()),
-            (("topic",), (), False, "find source", ()),
+            (("topic-2",), (), True, (m.RepairReasonCode.MISSING_TOPIC,), ()),
+            (("topic-2",), (), False, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-2",)),
+            (("topic-2",), (), True, (), ("topic-2",)),
         ):
             with self.subTest(values=values):
                 with self.assertRaises(ValueError):
@@ -604,8 +612,7 @@ class SearchModelContractTests(unittest.TestCase):
         fixtures = SearchModelFixtures(m)
         locations = (
             "request_id",
-            "adaptive_repair_query.query_id",
-            "executed_queries[].query_id",
+            "executed_queries[].provider",
             "provider_attempts[].provider",
         )
         forbidden_probes = (
@@ -656,17 +663,18 @@ class SearchModelContractTests(unittest.TestCase):
             "0123456789abcdef0123456789abcdef",
             "123e4567-e89b-12d3-a456-426614174000",
         )
-        for location in locations[:3]:
+        for location in locations[:1]:
             for valid_id in valid_ids:
                 with self.subTest(location=location, valid_id=valid_id):
                     logged = fixtures.trace_with_value(location, valid_id).to_log_dict()
                     self.assertEqual(valid_id, fixtures.logged_value(logged, location))
                     json.dumps(logged)
         for provider in ("tavily", "ddgs"):
-            with self.subTest(location=locations[3], provider=provider):
-                logged = fixtures.trace_with_value(locations[3], provider).to_log_dict()
-                self.assertEqual(provider, fixtures.logged_value(logged, locations[3]))
-                json.dumps(logged)
+            for location in locations[1:]:
+                with self.subTest(location=location, provider=provider):
+                    logged = fixtures.trace_with_value(location, provider).to_log_dict()
+                    self.assertEqual(provider, fixtures.logged_value(logged, location))
+                    json.dumps(logged)
 
     def test_scalar_string_collection_fields_reject_all_21_scalar_inputs(self):
         m = models()
@@ -676,11 +684,11 @@ class SearchModelContractTests(unittest.TestCase):
             ("SearchPlan.entities", fixtures.plan(), "entities"),
             ("SearchPlan.required_topics", fixtures.plan(), "required_topics"),
             ("SearchPlan.query_redaction_codes", fixtures.plan(), "query_redaction_codes"),
-            ("RepairPlan.gap_codes", fixtures.repair_plan(), "gap_codes"),
+            ("RepairPlan.target_topic_ids", fixtures.repair_plan(), "target_topic_ids"),
             ("ProviderHit.quality_flags", fixtures.hit(), "quality_flags"),
             ("EvidenceItem.safety_flags", fixtures.evidence_item(), "safety_flags"),
             ("EvidenceItem.supported_topics", fixtures.evidence_item(), "supported_topics"),
-            ("EvidenceGapAnalysis.missing_claim_topics", fixtures.gap_analysis(), "missing_claim_topics"),
+            ("EvidenceGapAnalysis.missing_topic_ids", fixtures.gap_analysis(), "missing_topic_ids"),
             ("EvidenceBundle.initial_evidence_ids", fixtures.bundle(), "initial_evidence_ids"),
             ("EvidenceBundle.limitations", fixtures.bundle(), "limitations"),
             ("FetchedDocument.untrusted_content_flags", fixtures.document(), "untrusted_content_flags"),
@@ -1586,6 +1594,121 @@ class TopicAssessmentContractTests(unittest.TestCase):
                         supported_topic_ids=("topic-1",),
                         missing_topic_ids=(),
                     )
+
+
+class RepairContractTests(unittest.TestCase):
+    """Task 6: closed repair reasons, targets, stop reasons, and Trace metadata."""
+
+    def test_repair_reason_codes_are_closed(self):
+        m = models()
+        expected = {
+            "missing_topic",
+            "stale_evidence",
+            "source_conflict",
+            "entity_ambiguity",
+            "premise_mismatch",
+            "source_quality_gap",
+            "content_unreadable",
+        }
+        self.assertEqual(expected, {item.value for item in m.RepairReasonCode})
+        with self.assertRaises(ValueError):
+            m.RepairReasonCode("invented_reason")
+
+    def test_retrieval_stop_reasons_are_closed(self):
+        m = models()
+        expected = {
+            "evidence_sufficient",
+            "no_repair_benefit",
+            "budget_exhausted",
+            "post_repair_stop",
+        }
+        self.assertEqual(expected, {item.value for item in m.RetrievalStopReason})
+        with self.assertRaises(ValueError):
+            m.RetrievalStopReason("invented_stop")
+
+    def test_gap_analysis_closes_reason_codes_and_target_topic_ids(self):
+        m = models()
+        gap = m.EvidenceGapAnalysis(
+            ("topic-2",),
+            ("conflict:version",),
+            True,
+            (m.RepairReasonCode.MISSING_TOPIC,),
+            ("topic-2",),
+        )
+        self.assertEqual(("topic-2",), gap.missing_topic_ids)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+        self.assertIs(gap.repair_reason_codes[0], m.RepairReasonCode.MISSING_TOPIC)
+        with self.assertRaises((TypeError, ValueError)):
+            m.EvidenceGapAnalysis(("topic-2",), (), True, ("missing_topic",), ("topic-2",))
+        with self.assertRaises(ValueError):
+            m.EvidenceGapAnalysis((), (), False, (), ("topic-2",))
+        with self.assertRaises(ValueError):
+            m.EvidenceGapAnalysis(("topic-2",), (), True, (m.RepairReasonCode.MISSING_TOPIC,), ())
+
+    def test_repair_plan_requires_reason_and_target_only_when_triggered(self):
+        m = models()
+        query = SearchModelFixtures(m).query()
+        with self.assertRaises(ValueError):
+            m.RepairPlan(True, (), ("topic-2",), query)
+        with self.assertRaises(ValueError):
+            m.RepairPlan(True, (m.RepairReasonCode.MISSING_TOPIC,), (), query)
+        with self.assertRaises(ValueError):
+            m.RepairPlan(False, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-2",), None)
+        valid = m.RepairPlan(True, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-2",), query)
+        self.assertTrue(valid.triggered)
+
+    def test_query_trace_entry_is_closed_metadata(self):
+        m = models()
+        entry = m.QueryTraceEntry(
+            1,
+            m.QueryPurpose.DIRECT,
+            m.SearchRoundKind.INITIAL,
+            "ddgs",
+            m.ProviderStatus.SUCCESS,
+            12.5,
+        )
+        self.assertEqual(1, entry.query_index)
+        with self.assertRaises(ValueError):
+            m.QueryTraceEntry(
+                0, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL,
+                "ddgs", m.ProviderStatus.SUCCESS, 12.5,
+            )
+        with self.assertRaises((TypeError, ValueError)):
+            m.QueryTraceEntry(
+                1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL,
+                "ddgs", "success", 12.5,
+            )
+
+    def test_trace_counts_unique_indexes_across_provider_fallback(self):
+        m = models()
+        trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD)
+        trace.executed_queries = (
+            m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "ddgs", m.ProviderStatus.EMPTY, 5),
+            m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "tavily", m.ProviderStatus.SUCCESS, 9),
+            m.QueryTraceEntry(4, m.QueryPurpose.REPAIR, m.SearchRoundKind.REPAIR, "tavily", m.ProviderStatus.SUCCESS, 7),
+        )
+        self.assertEqual(2, trace.semantic_query_count)
+        self.assertEqual(1, trace.repair_query_count)
+        logged = trace.to_log_dict()
+        self.assertEqual(2, logged["semantic_query_count"])
+        self.assertEqual(1, logged["repair_query_count"])
+        self.assertEqual([1, 1, 4], [row["query_index"] for row in logged["executed_queries"]])
+
+    def test_trace_stop_reason_is_logged(self):
+        m = models()
+        trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD)
+        trace.retrieval_stop_reason = m.RetrievalStopReason.POST_REPAIR_STOP
+        self.assertEqual("post_repair_stop", trace.to_log_dict()["retrieval_stop_reason"])
+
+    def test_trace_rejects_raw_query_values(self):
+        m = models()
+        with self.assertRaises(TypeError):
+            m.SearchTrace(
+                "req-1",
+                m.RequestSource.CHAT,
+                m.SearchTier.STANDARD,
+                executed_queries=(("initial-1", m.QueryPurpose.DIRECT),),
+            )
 
 
 if __name__ == "__main__":

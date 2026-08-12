@@ -23,6 +23,7 @@ from src.search.models import (
     FreshnessRequirement,
     PlanningStatus,
     QueryPurpose,
+    RepairReasonCode,
     RequiredTopic,
     RepairPlan,
     RequestSource,
@@ -42,6 +43,16 @@ _SOURCE_RELATION_INDEPENDENT = SourceRelation.INDEPENDENT
 
 QUERY_TEXT_MAX_CHARS = 500
 DOMAIN_LIST_CAP = 5
+
+_REPAIR_REASON_PHRASES: Mapping[RepairReasonCode, str] = {
+    RepairReasonCode.MISSING_TOPIC: "补充检索",
+    RepairReasonCode.STALE_EVIDENCE: "最新证据",
+    RepairReasonCode.SOURCE_CONFLICT: "冲突核实",
+    RepairReasonCode.ENTITY_AMBIGUITY: "实体消歧",
+    RepairReasonCode.PREMISE_MISMATCH: "前提核对",
+    RepairReasonCode.SOURCE_QUALITY_GAP: "独立来源",
+    RepairReasonCode.CONTENT_UNREADABLE: "可读来源",
+}
 
 _HARD_SECRET_PATTERNS = (
     re.compile(r"\b[A-Za-z0-9_-]{20,}\b"),
@@ -579,54 +590,37 @@ class SearchPlanner:
         self,
         plan: SearchPlan,
         gap: EvidenceGapAnalysis,
-        *,
-        repair_already_planned: bool = False,
+        prior_fingerprints: Sequence[str] = (),
     ) -> RepairPlan:
-        if repair_already_planned:
-            return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
-        if plan.decision.route is SearchTier.LIGHT:
-            return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
-        if not gap.repair_eligible:
-            return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
-        if not gap.repair_reason_codes:
-            return RepairPlan(triggered=False, gap_codes=(), repair_query=None)
-
-        material_topic_labels = {
-            topic.label for topic in plan.required_topics if topic.material
-        }
-        missing_topics = tuple(
-            topic
-            for topic in gap.missing_claim_topics
-            if topic in material_topic_labels
+        if not gap.repair_eligible or not gap.repair_target_topic_ids:
+            return RepairPlan(False, (), (), None)
+        target = _topic_by_id(plan, gap.repair_target_topic_ids[0])
+        if target is None:
+            return RepairPlan(False, (), (), None)
+        text = _repair_text(plan.original_question, target, gap.repair_reason_codes)
+        cleaned, codes, _degraded = self._clean_repair_text(
+            text,
+            plan.original_question,
         )
-        if (
-            gap.missing_claim_topics
-            and not missing_topics
-            and not gap.conflict_group_ids
-        ):
-            return RepairPlan(
-                triggered=False,
-                gap_codes=gap.repair_reason_codes,
-                repair_query=None,
-            )
-        topic = missing_topics[0] if missing_topics else "证据缺口"
-        repair_text = f"{topic} {_short_original(plan.original_question)}"
-        repaired, codes, degraded = self._clean_repair_text(repair_text, plan.original_question, plan.decision)
-        fingerprints = {_query_fingerprint(query.text) for query in plan.initial_queries}
-        if _query_fingerprint(repaired) in fingerprints:
-            return RepairPlan(triggered=False, gap_codes=gap.repair_reason_codes, repair_query=None)
+        if _query_fingerprint(cleaned) in set(prior_fingerprints):
+            return RepairPlan(False, (), (), None)
 
         repair_query = SearchQuery(
             query_id="repair-1",
+            query_index=len(plan.initial_queries) + 1,
             round_kind=SearchRoundKind.REPAIR,
             purpose=QueryPurpose.REPAIR,
-            text=repaired,
-            date_from=plan.time_window[0] if plan.time_window is not None else None,
-            date_to=plan.time_window[1] if plan.time_window is not None else None,
+            text=cleaned,
+            target_topic_ids=(target.topic_id,),
+            date_from=target.date_from,
+            date_to=target.date_to,
+            include_domains=(),
+            exclude_domains=(),
         )
         return RepairPlan(
             triggered=True,
-            gap_codes=gap.repair_reason_codes,
+            reason_codes=gap.repair_reason_codes,
+            target_topic_ids=gap.repair_target_topic_ids,
             repair_query=repair_query,
             query_redaction_codes=codes,
         )
@@ -657,9 +651,7 @@ class SearchPlanner:
         self,
         text: str,
         original_question: str,
-        decision: RetrievalDecision,
     ) -> tuple[str, tuple[str, ...], bool]:
-        del decision
         redacted = redact_query_text(text)
         personal = _clean_personal_identifiers(redacted.text, original_question)
         cleaned = _cap_query_text(personal.text)
@@ -1049,6 +1041,27 @@ def _material_topic_ids(
     topics: Sequence[RequiredTopic],
 ) -> tuple[str, ...]:
     return tuple(topic.topic_id for topic in topics if topic.material)
+
+
+def _topic_by_id(plan: SearchPlan, topic_id: str) -> RequiredTopic | None:
+    for topic in plan.required_topics:
+        if topic.material and topic.topic_id == topic_id:
+            return topic
+    return None
+
+
+def _repair_text(
+    original_question: str,
+    target: RequiredTopic,
+    reason_codes: Sequence[RepairReasonCode],
+) -> str:
+    """Keep the original entity/version/region/scope anchor and add a closed
+    reason-specific target phrase without discarding direct-query constraints."""
+    phrase = _REPAIR_REASON_PHRASES.get(
+        reason_codes[0] if reason_codes else RepairReasonCode.MISSING_TOPIC,
+        _REPAIR_REASON_PHRASES[RepairReasonCode.MISSING_TOPIC],
+    )
+    return f"{target.label} {phrase} {_short_original(original_question)}"
 
 
 def _time_window_for_context(

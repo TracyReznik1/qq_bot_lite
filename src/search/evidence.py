@@ -25,9 +25,9 @@ from src.search.models import (
     FreshnessEligibility,
     FreshnessRequirement,
     ProviderAttempt,
+    RepairReasonCode,
     RequiredTopic,
     SearchPlan,
-    SearchTier,
     SourceRelation,
     SourceRequirement,
     TopicAssessment,
@@ -60,7 +60,10 @@ Return exactly this JSON object:
     "conflict_relation": null or "contradicts|claims_supersession"
     }
   },
-  "gap_hints": []
+  "gap_hints": [
+    {"reason_code": "entity_ambiguity|premise_mismatch",
+     "target_topic_id": "an exact topic_id that the candidates did not support"}
+  ]
 }
 }
 
@@ -76,6 +79,9 @@ Rules:
 - all fields shown above are required and no additional fields are allowed
 - conflict_key, conflict_value, and conflict_relation must either all be null or
   all contain a coherent explicit conflict record
+- gap_hints is optional and may only use reason_code entity_ambiguity or
+  premise_mismatch; every target_topic_id must be a supplied topic_id whose
+  claim the candidates could not support
 """
 
 _VERDICT_KEYS = frozenset(
@@ -198,9 +204,7 @@ def _parse_judge_output(
     candidates = payload.get("candidates")
     if not isinstance(candidates, dict) or set(candidates) != set(candidate_ids):
         return {}
-    if payload.get("gap_hints") != []:
-        return {}
-    return {
+    parsed = {
         candidate_id: candidates[candidate_id]
         for candidate_id in candidate_ids
         if _parse_verdict(
@@ -209,6 +213,66 @@ def _parse_judge_output(
             allowed_topic_ids=allowed_topic_ids,
         )
     }
+    hints = _parse_gap_hints(payload.get("gap_hints"), allowed_topic_ids)
+    if hints:
+        parsed[_GAP_HINTS_KEY] = hints
+    return parsed
+
+
+def _parse_gap_hints(
+    raw: Any,
+    allowed_topic_ids: frozenset[str],
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list):
+        return ()
+    hints: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"reason_code", "target_topic_id"}:
+            continue
+        reason_code = item.get("reason_code")
+        target_topic_id = item.get("target_topic_id")
+        if (
+            reason_code not in _GAP_HINT_REASONS
+            or target_topic_id not in allowed_topic_ids
+        ):
+            continue
+        pair = (reason_code, target_topic_id)
+        if pair not in seen:
+            seen.add(pair)
+            hints.append(pair)
+    return tuple(hints)
+
+
+def _normalize_gap_hints(value: Any) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, dict):
+        value = (value,)
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        return ()
+    hints: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in value:
+        if isinstance(raw, dict):
+            pair = (raw.get("reason_code"), raw.get("target_topic_id"))
+        elif isinstance(raw, (tuple, list)) and len(raw) == 2:
+            pair = (raw[0], raw[1])
+        else:
+            continue
+        reason_code, target_topic_id = pair
+        if (
+            not isinstance(reason_code, str)
+            or not isinstance(target_topic_id, str)
+            or not reason_code.strip()
+            or not target_topic_id.strip()
+        ):
+            continue
+        normalized = (reason_code.strip(), target_topic_id.strip())
+        if normalized not in seen:
+            seen.add(normalized)
+            hints.append(normalized)
+    return tuple(hints)
 
 
 def _parse_verdict(
@@ -377,6 +441,7 @@ class EvidenceAssembler:
             f"C{index}": candidate for index, candidate in enumerate(candidates, 1)
         }
         judged = self._judge_output(plan, indexed, timeout_seconds=timeout_seconds)
+        gap_hints = _normalize_gap_hints(judged.get(_GAP_HINTS_KEY))
         allowed_topic_ids = frozenset(
             topic.topic_id for topic in plan.required_topics
         )
@@ -463,6 +528,7 @@ class EvidenceAssembler:
             plan,
             ordered,
             judged_freshness_by_canonical,
+            gap_hints=gap_hints,
         )
         return bundle
 
@@ -470,24 +536,25 @@ class EvidenceAssembler:
         self,
         plan: SearchPlan,
         bundle: EvidenceBundle,
+        *,
+        content_unreadable_topic_ids: Sequence[str] = (),
     ) -> EvidenceGapAnalysis:
-        missing = tuple(bundle.missing_claim_topics)
-        repairable = bool(missing) or bool(bundle.conflict_groups)
-        reason_codes: tuple[str, ...] = ()
-        if missing:
-            reason_codes = ("missing_topic",)
-        elif bundle.conflict_groups:
-            reason_codes = ("source_conflict",)
-        eligible = repairable and bundle.decision.route in {
-            SearchTier.STANDARD,
-            SearchTier.DEEP,
-        }
-        return EvidenceGapAnalysis(
-            missing_claim_topics=missing,
-            conflict_group_ids=bundle.conflict_groups,
-            repair_eligible=eligible,
-            repair_purpose=("fill missing topic" if missing else "resolve conflict") if eligible else None,
-            repair_reason_codes=reason_codes,
+        unreadable = tuple(
+            dict.fromkeys(
+                topic_id
+                for topic_id in content_unreadable_topic_ids
+                if isinstance(topic_id, str) and topic_id.strip()
+            )
+        )
+        return _aggregate_gap(
+            plan,
+            bundle.evidence_items,
+            bundle.topic_assessments,
+            bundle.supported_topic_ids,
+            bundle.missing_topic_ids,
+            bundle.conflicts,
+            bundle.gap_hints,
+            content_unreadable_topic_ids=unreadable,
         )
 
     # ── helpers ─────────────────────────────────────────────────────
@@ -523,6 +590,8 @@ class EvidenceAssembler:
         judged_freshness_by_canonical: Mapping[
             str, Mapping[str, FreshnessEligibility]
         ],
+        *,
+        gap_hints: Sequence[tuple[str, str]] = (),
     ) -> EvidenceBundle:
         assessments, eligible_evidence_ids_by_topic = _assess_material_topics(
             plan,
@@ -577,14 +646,24 @@ class EvidenceAssembler:
         if weaknesses:
             limitations.append("weak_source_topics")
 
+        gap = _aggregate_gap(
+            plan,
+            items,
+            assessments,
+            supported_topic_ids,
+            missing_topic_ids,
+            conflicts,
+            _normalize_gap_hints(gap_hints),
+        )
+
         return EvidenceBundle(
             request_id=f"req-{abs(hash(plan.original_question)) % 100000}",
             decision=plan.decision,
             plan=plan,
             attempts=(),
             initial_evidence_ids=tuple(item.evidence_id for item in items),
-            gap_analysis=EvidenceGapAnalysis((), (), False, None, ()),
-            repair_plan=__import__("src.search.models", fromlist=["RepairPlan"]).RepairPlan(False, (), None),
+            gap_analysis=gap,
+            repair_plan=__import__("src.search.models", fromlist=["RepairPlan"]).RepairPlan(False, (), (), None),
             retrieval_round_count=1,
             evidence_items=tuple(items),
             evidence_state=state,
@@ -596,6 +675,7 @@ class EvidenceAssembler:
             topic_assessments=assessments,
             supported_topic_ids=supported_topic_ids,
             missing_topic_ids=missing_topic_ids,
+            gap_hints=_normalize_gap_hints(gap_hints),
         )
 
 
@@ -621,6 +701,25 @@ def _citable(candidate: EvidenceCandidate, plan: SearchPlan) -> bool:
 
 _VERSION_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9.])(?:[vV]\s*)?\d{1,4}\.\d{1,4}(?:\.\d{1,4})?(?![A-Za-z0-9.])"
+)
+
+_GAP_HINTS_KEY = "gap_hints"
+
+_GAP_HINT_REASONS = frozenset(
+    {
+        RepairReasonCode.ENTITY_AMBIGUITY.value,
+        RepairReasonCode.PREMISE_MISMATCH.value,
+    }
+)
+
+_REASON_DECLARATION_ORDER = (
+    RepairReasonCode.MISSING_TOPIC,
+    RepairReasonCode.STALE_EVIDENCE,
+    RepairReasonCode.SOURCE_CONFLICT,
+    RepairReasonCode.ENTITY_AMBIGUITY,
+    RepairReasonCode.PREMISE_MISMATCH,
+    RepairReasonCode.SOURCE_QUALITY_GAP,
+    RepairReasonCode.CONTENT_UNREADABLE,
 )
 
 
@@ -896,6 +995,128 @@ def _detect_conflicts(
     )
 
 
+def _topic_has_evidence(items: Sequence[EvidenceItem], topic: RequiredTopic) -> bool:
+    return any(topic.label in item.supported_topics for item in items)
+
+
+def _conflict_topic_ids(
+    plan: SearchPlan,
+    items: Sequence[EvidenceItem],
+    conflicts: Sequence[EvidenceConflict],
+) -> frozenset[str]:
+    label_to_topic_ids: dict[str, set[str]] = {}
+    for topic in _material_topics(plan):
+        label_to_topic_ids.setdefault(topic.label, set()).add(topic.topic_id)
+    item_by_id = {item.evidence_id: item for item in items}
+    topic_ids: set[str] = set()
+    for conflict in conflicts:
+        for member in conflict.members:
+            item = item_by_id.get(member.evidence_id)
+            if item is None:
+                continue
+            for label in item.supported_topics:
+                topic_ids.update(label_to_topic_ids.get(label, ()))
+    return frozenset(topic_ids)
+
+
+def _aggregate_gap(
+    plan: SearchPlan,
+    items: Sequence[EvidenceItem],
+    assessments: Sequence[TopicAssessment],
+    supported_topic_ids: Sequence[str],
+    missing_topic_ids: Sequence[str],
+    conflicts: Sequence[EvidenceConflict],
+    gap_hints: Sequence[tuple[str, str]],
+    *,
+    content_unreadable_topic_ids: Sequence[str] = (),
+) -> EvidenceGapAnalysis:
+    """Assign exactly one most-specific reason per material topic.
+
+    The producer/target table is closed: source_conflict and stale_evidence come
+    from Evidence assembly, entity/premise hints only from the strict Judge
+    ``gap_hints``, source_quality_gap from unmet independent corroboration, and
+    content_unreadable from the Orchestrator's Reader results.  Every other
+    unsupported material topic falls back to missing_topic.
+    """
+    material_topics = _material_topics(plan)
+    topic_by_id = {topic.topic_id: topic for topic in material_topics}
+    assessment_by_id = {assessment.topic_id: assessment for assessment in assessments}
+    reason_by_topic: dict[str, RepairReasonCode] = {}
+
+    conflicting_topic_ids = _conflict_topic_ids(plan, items, conflicts)
+    for topic_id in conflicting_topic_ids:
+        if topic_id in topic_by_id:
+            reason_by_topic[topic_id] = RepairReasonCode.SOURCE_CONFLICT
+
+    for topic in material_topics:
+        if topic.topic_id in reason_by_topic:
+            continue
+        assessment = assessment_by_id.get(topic.topic_id)
+        if assessment is None:
+            continue
+        if (
+            topic.freshness_requirement is not FreshnessRequirement.NOT_REQUIRED
+            and assessment.freshness
+            in {FreshnessEligibility.STALE, FreshnessEligibility.UNKNOWN}
+            and _topic_has_evidence(items, topic)
+        ):
+            reason_by_topic[topic.topic_id] = RepairReasonCode.STALE_EVIDENCE
+
+    for topic in material_topics:
+        if topic.topic_id in reason_by_topic:
+            continue
+        if (
+            topic.source_requirement is SourceRequirement.INDEPENDENT_CORROBORATION
+            and topic.topic_id not in supported_topic_ids
+            and _topic_has_evidence(items, topic)
+        ):
+            reason_by_topic[topic.topic_id] = RepairReasonCode.SOURCE_QUALITY_GAP
+
+    for topic_id in content_unreadable_topic_ids:
+        if topic_id not in topic_by_id or topic_id in supported_topic_ids:
+            continue
+        reason_by_topic[topic_id] = RepairReasonCode.CONTENT_UNREADABLE
+
+    hint_targets: dict[RepairReasonCode, list[str]] = {
+        RepairReasonCode.ENTITY_AMBIGUITY: [],
+        RepairReasonCode.PREMISE_MISMATCH: [],
+    }
+    for reason_code, target_topic_id in _normalize_gap_hints(gap_hints):
+        reason = _parse_enum(reason_code, RepairReasonCode)
+        if reason not in hint_targets:
+            continue
+        if (
+            target_topic_id not in topic_by_id
+            or target_topic_id in supported_topic_ids
+            or target_topic_id not in missing_topic_ids
+        ):
+            continue
+        hint_targets[reason].append(target_topic_id)
+    for reason, topic_ids in hint_targets.items():
+        for topic_id in topic_ids:
+            if topic_id not in reason_by_topic:
+                reason_by_topic[topic_id] = reason
+
+    for topic_id in missing_topic_ids:
+        if topic_id in topic_by_id and topic_id not in reason_by_topic:
+            reason_by_topic[topic_id] = RepairReasonCode.MISSING_TOPIC
+
+    target_topic_ids = tuple(
+        topic.topic_id for topic in material_topics if topic.topic_id in reason_by_topic
+    )
+    reason_codes = tuple(
+        reason
+        for reason in _REASON_DECLARATION_ORDER
+        if reason in reason_by_topic.values()
+    )
+    eligible = bool(target_topic_ids)
+    return EvidenceGapAnalysis(
+        missing_topic_ids=tuple(missing_topic_ids),
+        conflict_group_ids=tuple(conflict.conflict_id for conflict in conflicts),
+        repair_eligible=eligible,
+        repair_reason_codes=reason_codes if eligible else (),
+        repair_target_topic_ids=target_topic_ids if eligible else (),
+    )
 def _judge_topics(plan: SearchPlan) -> tuple[dict[str, str], ...]:
     return tuple(
         {"topic_id": topic.topic_id, "label": topic.label}

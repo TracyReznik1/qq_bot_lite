@@ -19,6 +19,7 @@ from src.search.models import (
     DEFAULT_TIER_BUDGETS,
     EvidenceBundle,
     EvidenceState,
+    ExcerptOrigin,
     Freshness,
     FreshnessRequirement,
     PlanningStatus,
@@ -27,21 +28,24 @@ from src.search.models import (
     ProviderResult,
     ProviderStatus,
     QueryPurpose,
+    QueryTraceEntry,
     RequestAnalysis,
     RepairPlan,
     RequestSource,
+    RetrievalStopReason,
     RetrievalRequest,
     RiskLevel,
     SearchFailureCode,
     SearchPipelineResult,
     SearchPlan,
     SearchQuery,
+    SearchRoundKind,
     SearchTier,
     SearchTrace,
     SkipReason,
     TriggerCode,
 )
-from src.search.planner import SearchPlanner
+from src.search.planner import SearchPlanner, _query_fingerprint
 from src.search.providers import (
     DDGSSearchProvider,
     ProviderRegistry,
@@ -258,9 +262,10 @@ class SearchOrchestrator:
             )
 
         content_started = self._monotonic()
-        candidates, candidate_keys, reads = self._extract_candidates(
+        candidates, candidate_keys, reads, unreadable_query_ids = self._extract_candidates(
             plan, provider_results, budget, deadline, trace,
         )
+        unreadable_topic_ids = _unreadable_topic_ids(plan, unreadable_query_ids)
         trace.initial_content_read_latency_ms = self._elapsed_ms(content_started)
         trace.content_read_total_latency_ms = trace.initial_content_read_latency_ms
         trace.candidate_url_count = len(candidate_keys)
@@ -311,30 +316,47 @@ class SearchOrchestrator:
             )
 
         gap_started = self._monotonic()
-        gap = self._assembler().analyze_gap(plan, bundle)
+        gap = self._assembler().analyze_gap(
+            plan,
+            bundle,
+            content_unreadable_topic_ids=unreadable_topic_ids,
+        )
         trace.gap_analysis_latency_ms = self._elapsed_ms(gap_started)
         initial_canonical_urls = {
             item.canonical_url for item in bundle.evidence_items if item.canonical_url
         }
-        repair = RepairPlan(False, gap.repair_reason_codes, None)
+        repair = RepairPlan(False, (), (), None)
 
-        repair_already_planned = False
-        if _repair_allowed(plan, retrieval_decision) and gap.repair_eligible and not self._expired(deadline):
+        route_standard = retrieval_decision.route is SearchTier.STANDARD
+        gates_pass = _repair_gates_pass(
+            route_standard=route_standard,
+            repair_used=trace.repair_used,
+            semantic_query_count=trace.semantic_query_count,
+            candidate_url_count=trace.candidate_url_count,
+            content_read_count=trace.content_read_count,
+            retrieval_round_count=trace.retrieval_round_count,
+            remaining_seconds=self._remaining(deadline),
+            budget=budget,
+        )
+        repair_dispatched = False
+        if gates_pass and gap.repair_eligible:
             repair_started = self._monotonic()
+            prior_fingerprints = tuple(
+                _query_fingerprint(query.text) for query in plan.initial_queries
+            )
             repair_completed, planned_repair = self._call_until_deadline(
                 self._invoke_repair_planner,
                 deadline,
                 plan,
                 gap,
-                repair_already_planned,
+                prior_fingerprints,
                 deadline,
             )
             if repair_completed and isinstance(planned_repair, RepairPlan):
                 repair = planned_repair
             if repair.triggered and repair.repair_query is not None:
-                repair_already_planned = True
+                repair_dispatched = True
                 trace.adaptive_repair_round_started = True
-                trace.adaptive_repair_query = repair.repair_query
                 trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
                 trace.retrieval_round_count = 2
                 repair_provider_started = self._monotonic()
@@ -349,7 +371,7 @@ class SearchOrchestrator:
                 trace.provider_search_total_latency_ms += self._elapsed_ms(
                     repair_provider_started
                 )
-                repair_candidates, repair_keys, more_reads = self._extract_candidates(
+                repair_candidates, repair_keys, more_reads, _repair_unreadable = self._extract_candidates(
                     plan,
                     repair_result,
                     budget,
@@ -378,6 +400,8 @@ class SearchOrchestrator:
                 trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_evidence_started)
                 trace.evidence_state = bundle.evidence_state
                 trace.repair_used = True
+                # A second gap never triggers another dispatch.
+                trace.retrieval_stop_reason = RetrievalStopReason.POST_REPAIR_STOP
             trace.adaptive_repair_latency_ms = self._elapsed_ms(repair_started)
 
         if self._expired(deadline):
@@ -393,7 +417,22 @@ class SearchOrchestrator:
                 analysis=analysis,
             )
 
-        final_gap = self._assembler().analyze_gap(plan, bundle)
+        if not repair_dispatched:
+            final_gap = self._assembler().analyze_gap(
+                plan,
+                bundle,
+                content_unreadable_topic_ids=unreadable_topic_ids,
+            )
+            trace.retrieval_stop_reason = _repair_stop_reason(
+                bundle,
+                gap,
+                repair,
+                gates_pass,
+                route_standard,
+            )
+        else:
+            # Post-repair state: never call analyze_gap again for dispatch.
+            final_gap = bundle.gap_analysis
         bundle = self._finalize_bundle(
             bundle,
             trace,
@@ -426,11 +465,12 @@ class SearchOrchestrator:
         budget_cap = min(budget.max_initial_queries, len(plan.initial_queries))
         queries = plan.initial_queries[:budget_cap]
         results = self._dispatch_queries(queries, decision, deadline, trace)
-        initial_query_ids = {query.query_id for query in queries}
-        trace.initial_query_count = sum(
-            1
-            for query_id, _purpose in trace.executed_queries
-            if query_id in initial_query_ids
+        trace.initial_query_count = len(
+            {
+                entry.query_index
+                for entry in trace.executed_queries
+                if entry.round_kind is SearchRoundKind.INITIAL
+            }
         )
         return results
 
@@ -446,7 +486,7 @@ class SearchOrchestrator:
         query = repair.repair_query
         if query is None:
             return []
-        result = self._dispatch_queries((query,), decision, deadline, trace, mark_repair=True)
+        result = self._dispatch_queries((query,), decision, deadline, trace)
         return result
 
     def _dispatch_queries(
@@ -455,10 +495,7 @@ class SearchOrchestrator:
         decision: RetrievalDecision,
         deadline: float,
         trace: SearchTrace,
-        *,
-        mark_repair: bool = False,
     ) -> list[ProviderResult]:
-        del mark_repair
         results: list[ProviderResult] = []
         if not queries:
             return results
@@ -556,7 +593,7 @@ class SearchOrchestrator:
         additional_queries: Sequence[SearchQuery] = (),
         existing_candidate_keys: set[str] | None = None,
         existing_read_count: int = 0,
-    ) -> tuple[list[Any], set[str], int]:
+    ) -> tuple[list[Any], set[str], int, set[str]]:
         hits: list[Any] = []
         for result in results:
             if result.status is ProviderStatus.SUCCESS:
@@ -574,10 +611,12 @@ class SearchOrchestrator:
             unique_hits.append(hit)
 
         candidates: list[Any] = []
+        attempted_query_ids: set[str] = set()
+        readable_query_ids: set[str] = set()
         remaining_read_budget = max(budget.max_content_reads - existing_read_count, 0)
         read_hits = unique_hits[:remaining_read_budget]
         if not read_hits:
-            return candidates, new_keys, 0
+            return candidates, new_keys, 0, set()
         executor = ThreadPoolExecutor(
             max_workers=min(len(read_hits), 4),
             thread_name_prefix="search-reader",
@@ -588,6 +627,7 @@ class SearchOrchestrator:
                 remaining = self._remaining(deadline)
                 if remaining <= 0:
                     break
+                attempted_query_ids.add(str(hit.query_id or ""))
                 future = executor.submit(
                     self._extractor.extract,
                     hit,
@@ -605,6 +645,8 @@ class SearchOrchestrator:
                         continue
                     if candidate is not None and candidate.excerpt:
                         candidates.append(candidate)
+                        if _readable_candidate(candidate):
+                            readable_query_ids.add(str(candidate.hit.query_id or ""))
             except FuturesTimeoutError:
                 trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
                 for future in futures:
@@ -613,7 +655,12 @@ class SearchOrchestrator:
             executor.shutdown(wait=False, cancel_futures=True)
         reads_attempted = len(futures)
         trace.content_read_count = existing_read_count + reads_attempted
-        return candidates, new_keys, reads_attempted
+        unreadable_query_ids = {
+            query_id
+            for query_id in attempted_query_ids
+            if query_id and query_id not in readable_query_ids
+        }
+        return candidates, new_keys, reads_attempted, unreadable_query_ids
 
     def _invoke_planner(
         self,
@@ -637,14 +684,14 @@ class SearchOrchestrator:
         self,
         plan: SearchPlan,
         gap: Any,
-        repair_already_planned: bool,
+        prior_fingerprints: Sequence[str],
         deadline: float,
     ) -> RepairPlan:
         return _call_with_supported_kwargs(
             self._planner.plan_repair,
             plan,
             gap,
-            repair_already_planned=repair_already_planned,
+            prior_fingerprints=prior_fingerprints,
             deadline=deadline,
             timeout_seconds=self._remaining(deadline),
         )
@@ -700,10 +747,17 @@ class SearchOrchestrator:
     ) -> None:
         if not attempts:
             return
-        executed = (query.query_id, query.purpose)
-        if executed not in trace.executed_queries:
-            trace.executed_queries = (*trace.executed_queries, executed)
         for attempt in attempts:
+            entry = QueryTraceEntry(
+                query_index=query.query_index,
+                purpose=query.purpose,
+                round_kind=query.round_kind,
+                provider=attempt.provider,
+                status=attempt.status,
+                latency_ms=attempt.latency_ms,
+            )
+            if entry not in trace.executed_queries:
+                trace.executed_queries = (*trace.executed_queries, entry)
             trace.provider_attempts = (*trace.provider_attempts, attempt)
             if attempt.invocation_started:
                 trace.provider_invocation_started = True
@@ -850,6 +904,8 @@ class SearchOrchestrator:
         repair: RepairPlan | None = None,
         initial_canonical_urls: set[str] | None = None,
     ) -> SearchPipelineResult:
+        if trace.retrieval_stop_reason is None:
+            trace.retrieval_stop_reason = RetrievalStopReason.BUDGET_EXHAUSTED
         return self._failure_result(
             decision,
             plan,
@@ -925,9 +981,86 @@ def _call_with_supported_kwargs(method: Callable[..., Any], *args: Any, **kwargs
     return method(*args, **supported)
 
 
-def _repair_allowed(plan: SearchPlan, decision: Any) -> bool:
-    del plan
-    return decision.route in {SearchTier.STANDARD, SearchTier.DEEP}
+def _readable_candidate(candidate: Any) -> bool:
+    """A candidate is a readable-content acquisition only when the page or
+    document was actually read; provider snippets and fetch failures are not."""
+    if candidate is None:
+        return False
+    return (
+        getattr(candidate, "excerpt_origin", None)
+        in {ExcerptOrigin.PAGE_EXTRACT, ExcerptOrigin.DOCUMENT_EXTRACT}
+        or getattr(candidate, "extraction_status", None) == "provider_raw_content"
+    )
+
+
+def _unreadable_topic_ids(
+    plan: SearchPlan,
+    unreadable_query_ids: Sequence[str],
+    *,
+    additional_queries: Sequence[SearchQuery] = (),
+) -> tuple[str, ...]:
+    """Map Reader-failed queries to their material target topic IDs."""
+    if not unreadable_query_ids:
+        return ()
+    material_ids = {
+        topic.topic_id for topic in plan.required_topics if topic.material
+    }
+    queries = {
+        query.query_id: query
+        for query in (*plan.initial_queries, *additional_queries)
+    }
+    topic_ids: list[str] = []
+    for query_id in unreadable_query_ids:
+        query = queries.get(query_id)
+        if query is None:
+            continue
+        for topic_id in query.target_topic_ids:
+            if topic_id in material_ids and topic_id not in topic_ids:
+                topic_ids.append(topic_id)
+    return tuple(topic_ids)
+
+
+def _repair_gates_pass(
+    *,
+    route_standard: bool,
+    repair_used: bool,
+    semantic_query_count: int,
+    candidate_url_count: int,
+    content_read_count: int,
+    retrieval_round_count: int,
+    remaining_seconds: float,
+    budget: Any,
+) -> bool:
+    """Deterministic, program-only pre-repair budget gate."""
+    return (
+        route_standard
+        and not repair_used
+        and semantic_query_count < budget.max_total_queries
+        and candidate_url_count < budget.max_candidate_urls
+        and content_read_count < budget.max_content_reads
+        and retrieval_round_count < budget.max_retrieval_rounds
+        and remaining_seconds > 0
+    )
+
+
+def _repair_stop_reason(
+    bundle: EvidenceBundle,
+    gap: Any,
+    repair: RepairPlan,
+    gates_pass: bool,
+    route_standard: bool,
+) -> RetrievalStopReason:
+    if bundle.evidence_state is EvidenceState.SUFFICIENT:
+        return RetrievalStopReason.EVIDENCE_SUFFICIENT
+    if not gap.repair_eligible:
+        return RetrievalStopReason.NO_REPAIR_BENEFIT
+    if not route_standard:
+        return RetrievalStopReason.NO_REPAIR_BENEFIT
+    if not gates_pass:
+        return RetrievalStopReason.BUDGET_EXHAUSTED
+    if not repair.triggered:
+        return RetrievalStopReason.NO_REPAIR_BENEFIT
+    return RetrievalStopReason.BUDGET_EXHAUSTED
 
 
 def _query_for_hit(
@@ -998,8 +1131,8 @@ def _empty_bundle(
         plan=plan,
         attempts=tuple(attempts),
         initial_evidence_ids=(),
-        gap_analysis=EvidenceGapAnalysis(missing, (), False, None, ()),
-        repair_plan=RepairPlan(False, (), None),
+        gap_analysis=EvidenceGapAnalysis(missing_topic_ids, (), False, (), ()),
+        repair_plan=RepairPlan(False, (), (), None),
         retrieval_round_count=retrieval_round_count,
         evidence_items=(),
         evidence_state=EvidenceState.INSUFFICIENT,

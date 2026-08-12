@@ -15,6 +15,7 @@ from src.search.models import (
     FreshnessRequirement,
     PlanningStatus,
     QueryPurpose,
+    RepairReasonCode,
     RequiredTopic,
     RequestSource,
     RetrievalDecision,
@@ -132,14 +133,13 @@ def deep_decision():
     return decision(SearchTier.DEEP)
 
 
-def gap(missing=(), conflict=(), eligible=True):
-    return EvidenceGapAnalysis(
-        tuple(missing),
-        tuple(conflict),
-        eligible,
-        "fill the gap" if eligible else None,
-        ("missing_topic",) if eligible else (),
-    )
+def gap(missing=(), conflict=(), eligible=True, reason=RepairReasonCode.MISSING_TOPIC):
+    missing = tuple(missing)
+    conflict = tuple(conflict)
+    if not eligible:
+        return EvidenceGapAnalysis((), (), False, (), ())
+    targets = missing if missing else conflict
+    return EvidenceGapAnalysis(missing, conflict, True, (reason,), targets)
 
 
 def strict_payload(*, supplements=(), topics=()):
@@ -451,12 +451,19 @@ class PlannerLightTests(unittest.TestCase):
         plan_with_context(planner, request("什么是光合作用"), light_decision())
         self.assertEqual(model.calls, [])
 
-    def test_light_cannot_repair(self):
+    def test_light_repair_planning_is_delegated_to_orchestrator_gates(self):
         planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("什么是光合作用"), light_decision())
-        repair = planner.plan_repair(plan, gap(missing=("x",)))
-        self.assertFalse(repair.triggered)
-        self.assertIsNone(repair.repair_query)
+        plan = plan_with_context(
+            planner,
+            request("什么是光合作用"),
+            light_decision(),
+            material_topic_label="光合作用",
+        )
+        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
+        # The planner is route-agnostic; only the orchestrator closes the
+        # standard-only gate before any dispatch.
+        self.assertTrue(repair.triggered)
+        self.assertIsNotNone(repair.repair_query)
 
 
 class PlannerStandardTests(unittest.TestCase):
@@ -511,12 +518,14 @@ class PlannerStandardTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="内存安全",
         )
-        repair = planner.plan_repair(plan, gap(missing=("内存安全",)))
+        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
         self.assertTrue(repair.triggered)
         self.assertIsNotNone(repair.repair_query)
         self.assertIs(repair.repair_query.round_kind, SearchRoundKind.REPAIR)
         self.assertIs(repair.repair_query.purpose, QueryPurpose.REPAIR)
-        self.assertEqual(repair.repair_query.text, "内存安全 Rust 和 Go 并发模型")
+        self.assertEqual(repair.repair_query.target_topic_ids, ("topic-1",))
+        self.assertEqual(repair.repair_query.query_index, len(plan.initial_queries) + 1)
+        self.assertEqual(repair.repair_query.text, "内存安全 补充检索 Rust 和 Go 并发模型")
         self.assertEqual(plan.budget.max_total_queries, 4)
 
     def test_standard_rejects_duplicate_repair(self):
@@ -527,11 +536,15 @@ class PlannerStandardTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="x",
         )
-        first = planner.plan_repair(plan, gap(missing=("x",)))
+        first = planner.plan_repair(plan, gap(missing=("topic-1",)))
         self.assertTrue(first.triggered)
-        # A second repair for the same request is refused via the
-        # repair_already_planned flag (no cross-request instance state).
-        second = planner.plan_repair(plan, gap(missing=("x",)), repair_already_planned=True)
+        # A second repair for the same request is refused when the planned text
+        # fingerprint is already in the request-local prior set.
+        second = planner.plan_repair(
+            plan,
+            gap(missing=("topic-1",)),
+            prior_fingerprints=(self.module._query_fingerprint(first.repair_query.text),),
+        )
         self.assertFalse(second.triggered)
         self.assertIsNone(second.repair_query)
 
@@ -549,7 +562,7 @@ class PlannerStandardTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="内存",
         )
-        first = planner.plan_repair(plan_a, gap(missing=("内存",)))
+        first = planner.plan_repair(plan_a, gap(missing=("topic-1",)))
         self.assertTrue(first.triggered)
         # An unrelated request must be able to plan its own repair.
         plan_b = plan_with_context(
@@ -558,7 +571,7 @@ class PlannerStandardTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="机制",
         )
-        second = planner.plan_repair(plan_b, gap(missing=("机制",)))
+        second = planner.plan_repair(plan_b, gap(missing=("topic-1",)))
         self.assertTrue(second.triggered)
 
 
@@ -598,7 +611,7 @@ class PlannerDeepTests(unittest.TestCase):
             deep_decision(),
             material_topic_label="事件细节",
         )
-        repair = planner.plan_repair(plan, gap(missing=("事件细节",)))
+        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
         self.assertTrue(repair.triggered)
         self.assertEqual(plan.budget.max_total_queries, 6)
         self.assertEqual(plan.budget.max_repair_queries, 1)
@@ -693,7 +706,7 @@ class PlannerRedactionTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="13800138000 是什么号码",
         )
-        repair = planner.plan_repair(plan, gap(missing=("13800138000 是什么号码",)))
+        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
         self.assertTrue(repair.triggered)
         self.assertNotIn("13800138000", repair.repair_query.text)
 
@@ -705,7 +718,7 @@ class PlannerRedactionTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="回调签名 abcdef123456 如何处理",
         )
-        repair = planner.plan_repair(plan, gap(missing=("回调签名 abcdef123456 如何处理",)))
+        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
         self.assertTrue(repair.triggered)
         self.assertNotIn("abcdef123456", repair.repair_query.text)
         self.assertIn("callback_secret", repair.query_redaction_codes)
@@ -716,7 +729,7 @@ class PlannerRedactionTests(unittest.TestCase):
             standard_decision(),
             material_topic_label="证据缺口",
         )
-        unrelated_repair = planner.plan_repair(unrelated_plan, gap(missing=("证据缺口",)))
+        unrelated_repair = planner.plan_repair(unrelated_plan, gap(missing=("topic-1",)))
         self.assertNotIn("callback_secret", unrelated_repair.query_redaction_codes)
 
 
@@ -944,9 +957,20 @@ class PlannerDegradationTests(unittest.TestCase):
         )
         orchestrator = importlib.import_module("src.search.orchestrator")
         self.assertEqual(time_bounded, orchestrator._query_for_hit(plan, hit))
+        m = importlib.import_module("src.search.models")
         trace = SearchTrace(
             "req-ids", RequestSource.CHAT, SearchTier.DEEP,
-            executed_queries=tuple(plan.initial_queries),
+            executed_queries=tuple(
+                m.QueryTraceEntry(
+                    query.query_index,
+                    query.purpose,
+                    query.round_kind,
+                    "tavily",
+                    m.ProviderStatus.SUCCESS,
+                    1,
+                )
+                for query in plan.initial_queries
+            ),
         )
         self.assertEqual(len(plan.initial_queries), trace.to_log_dict()["semantic_query_count"])
 
@@ -1061,6 +1085,95 @@ class PlannerQueryCapTests(unittest.TestCase):
         plan = plan_with_context(planner, request("什么是光合作用"), standard_decision())
         for query in plan.initial_queries:
             self.assertLessEqual(len(query.text), 500)
+
+
+class RepairUnificationTests(unittest.TestCase):
+    """Task 6: one constraint-preserving repair query per closed reason."""
+
+    def setUp(self) -> None:
+        self.module = planner_module()
+
+    def _material_plan(self):
+        m = importlib.import_module("src.search.models")
+        d = decision(SearchTier.STANDARD)
+        topics = (
+            RequiredTopic("topic-1", "background", False, FreshnessRequirement.NOT_REQUIRED),
+            RequiredTopic("topic-2", "core", True, FreshnessRequirement.NOT_REQUIRED),
+        )
+        direct = m.SearchQuery(
+            "initial-1",
+            SearchRoundKind.INITIAL,
+            QueryPurpose.DIRECT,
+            "比较 Rust 和 Go 并发 API",
+            query_index=1,
+            target_topic_ids=("topic-2",),
+        )
+        return m.SearchPlan(
+            d,
+            "比较 Rust 和 Go 并发 API",
+            PlanningStatus.NORMAL,
+            (),
+            None,
+            (direct,),
+            topics,
+            frozenset({m.SourceRelation.PRIMARY, m.SourceRelation.INDEPENDENT}),
+            (),
+            m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        )
+
+    def test_each_repair_reason_creates_exactly_one_targeted_repair_query(self):
+        m = importlib.import_module("src.search.models")
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        cases = (
+            (m.RepairReasonCode.MISSING_TOPIC, "topic-2"),
+            (m.RepairReasonCode.STALE_EVIDENCE, "topic-2"),
+            (m.RepairReasonCode.SOURCE_CONFLICT, "topic-2"),
+            (m.RepairReasonCode.ENTITY_AMBIGUITY, "topic-2"),
+            (m.RepairReasonCode.PREMISE_MISMATCH, "topic-2"),
+            (m.RepairReasonCode.SOURCE_QUALITY_GAP, "topic-2"),
+            (m.RepairReasonCode.CONTENT_UNREADABLE, "topic-2"),
+        )
+        for reason, topic_id in cases:
+            with self.subTest(reason=reason):
+                plan = self._material_plan()
+                gap = m.EvidenceGapAnalysis((topic_id,), (), True, (reason,), (topic_id,))
+                repair = planner.plan_repair(plan, gap)
+                self.assertTrue(repair.triggered)
+                self.assertIsNotNone(repair.repair_query)
+                self.assertEqual((topic_id,), repair.repair_query.target_topic_ids)
+                self.assertIs(repair.repair_query.round_kind, SearchRoundKind.REPAIR)
+                self.assertIs(repair.repair_query.purpose, QueryPurpose.REPAIR)
+                self.assertEqual(2, repair.repair_query.query_index)
+                self.assertIn("core", repair.repair_query.text)
+                self.assertIn("并发", repair.repair_query.text)
+
+    def test_no_target_or_unknown_target_never_triggers(self):
+        m = importlib.import_module("src.search.models")
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan = self._material_plan()
+        empty = m.EvidenceGapAnalysis((), (), False, (), ())
+        self.assertFalse(planner.plan_repair(plan, empty).triggered)
+        unknown = m.EvidenceGapAnalysis(
+            ("topic-9",), (), True, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-9",),
+        )
+        self.assertFalse(planner.plan_repair(plan, unknown).triggered)
+
+    def test_prior_fingerprint_suppresses_the_duplicate_repair(self):
+        m = importlib.import_module("src.search.models")
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
+        plan = self._material_plan()
+        gap = m.EvidenceGapAnalysis(
+            ("topic-2",), (), True, (m.RepairReasonCode.MISSING_TOPIC,), ("topic-2",),
+        )
+        first = planner.plan_repair(plan, gap)
+        self.assertTrue(first.triggered)
+        duplicate = planner.plan_repair(
+            plan,
+            gap,
+            prior_fingerprints=(self.module._query_fingerprint(first.repair_query.text),),
+        )
+        self.assertFalse(duplicate.triggered)
+        self.assertIsNone(duplicate.repair_query)
 
 
 if __name__ == "__main__":

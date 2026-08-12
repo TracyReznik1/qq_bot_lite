@@ -24,6 +24,7 @@ from src.search.models import (
     PlanningStatus,
     ProviderHit,
     QueryPurpose,
+    RepairReasonCode,
     RequiredTopic,
     RequestSource,
     RetrievalDecision,
@@ -553,7 +554,7 @@ class MaterialTopicEvidenceTests(unittest.TestCase):
 
         self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertEqual((), bundle.missing_claim_topics)
-        self.assertEqual((), gap.missing_claim_topics)
+        self.assertEqual((), gap.missing_topic_ids)
 
     def test_missing_material_topic_drives_repair_without_background(self):
         search_plan = material_topic_plan()
@@ -567,7 +568,8 @@ class MaterialTopicEvidenceTests(unittest.TestCase):
         repair = planner.plan_repair(search_plan, gap)
 
         self.assertEqual(("core",), bundle.missing_claim_topics)
-        self.assertEqual(("core",), gap.missing_claim_topics)
+        self.assertEqual(("topic-2",), gap.missing_topic_ids)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
         self.assertTrue(repair.triggered)
         self.assertIn("core", repair.repair_query.text)
         self.assertNotIn("background", repair.repair_query.text)
@@ -607,7 +609,7 @@ class MaterialTopicEvidenceTests(unittest.TestCase):
     def test_repair_ignores_a_nonmaterial_only_missing_topic(self):
         search_plan = material_topic_plan()
         gap = EvidenceGapAnalysis(
-            ("background",), (), True, "fill missing topic", ("missing_topic",),
+            ("topic-1",), (), True, (RepairReasonCode.MISSING_TOPIC,), ("topic-1",),
         )
 
         repair = importlib.import_module("src.search.planner").SearchPlanner(
@@ -631,7 +633,7 @@ class MaterialTopicEvidenceTests(unittest.TestCase):
             ),
         )
         gap = EvidenceGapAnalysis(
-            ("shared",), (), True, "fill missing topic", ("missing_topic",),
+            ("topic-2",), (), True, (RepairReasonCode.MISSING_TOPIC,), ("topic-2",),
         )
 
         repair = importlib.import_module("src.search.planner").SearchPlanner(
@@ -1857,9 +1859,10 @@ class EvidenceGapTests(unittest.TestCase):
         assembler = self.module.EvidenceAssembler(judge)
         bundle = assembler.assemble(plan(required_topics=("定义", "历史")), (candidate(),))
         gap = assembler.analyze_gap(plan(required_topics=("定义", "历史")), bundle)
-        self.assertIn("历史", gap.missing_claim_topics)
+        self.assertEqual(("topic-2",), gap.missing_topic_ids)
+        self.assertEqual((RepairReasonCode.MISSING_TOPIC,), gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
         self.assertTrue(gap.repair_eligible)
-        self.assertEqual(gap.repair_purpose, "fill missing topic")
 
     def test_empty_gap_is_not_repairable(self):
         judge = StaticEvidenceJudge({"C1": judge_ok("C1", supported=("定义",))})
@@ -1867,7 +1870,189 @@ class EvidenceGapTests(unittest.TestCase):
         bundle = assembler.assemble(plan(required_topics=("定义",)), (candidate(),))
         gap = assembler.analyze_gap(plan(required_topics=("定义",)), bundle)
         self.assertFalse(gap.repair_eligible)
-        self.assertEqual(gap.missing_claim_topics, ())
+        self.assertEqual(gap.missing_topic_ids, ())
+
+
+class JudgeGapHintTests(unittest.TestCase):
+    """Task 6: only closed entity/premise hints may enter the gap analysis."""
+
+    def setUp(self) -> None:
+        self.module = evidence_module()
+
+    def test_closed_hints_survive_for_unsupported_material_topics(self):
+        m = importlib.import_module("src.search.models")
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok("C1", supported=()),
+                "gap_hints": ({"reason_code": "entity_ambiguity", "target_topic_id": "topic-2"},),
+            }
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        search_plan = material_topic_plan()
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertIn(m.RepairReasonCode.ENTITY_AMBIGUITY, gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+        self.assertTrue(gap.repair_eligible)
+
+    def test_unknown_hint_reason_or_topic_is_discarded(self):
+        m = importlib.import_module("src.search.models")
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok("C1", supported=()),
+                "gap_hints": (
+                    {"reason_code": "missing_topic", "target_topic_id": "topic-2"},
+                    {"reason_code": "premise_mismatch", "target_topic_id": "topic-9"},
+                    {"reason_code": "premise_mismatch", "target_topic_id": "topic-2"},
+                ),
+            }
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        search_plan = material_topic_plan()
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertIn(m.RepairReasonCode.PREMISE_MISMATCH, gap.repair_reason_codes)
+        self.assertNotIn(m.RepairReasonCode.ENTITY_AMBIGUITY, gap.repair_reason_codes)
+        self.assertNotIn(m.RepairReasonCode.MISSING_TOPIC, gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+
+    def test_hint_for_a_supported_topic_is_discarded(self):
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok("C1", supported=("core",)),
+                "gap_hints": ({"reason_code": "entity_ambiguity", "target_topic_id": "topic-2"},),
+            }
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        search_plan = material_topic_plan()
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertFalse(gap.repair_eligible)
+        self.assertEqual((), gap.repair_reason_codes)
+
+    def test_judge_parser_accepts_closed_gap_hints(self):
+        class Response:
+            content = json.dumps(
+                {
+                    "candidates": {"C1": judge_ok("C1", supported=())},
+                    "gap_hints": [
+                        {"reason_code": "entity_ambiguity", "target_topic_id": "topic-2"}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+        class FakeLLM:
+            def chat(self, *_args, **_kwargs):
+                return Response()
+
+        judge = self.module.LLMEvidenceJudge(FakeLLM())
+        parsed = judge.judge(
+            "比较并发 API",
+            (candidate(),),
+            required_topics=(
+                {"topic_id": "topic-1", "label": "background"},
+                {"topic_id": "topic-2", "label": "core"},
+            ),
+        )
+        self.assertEqual((("entity_ambiguity", "topic-2"),), parsed["gap_hints"])
+
+
+class GapAggregationTests(unittest.TestCase):
+    """Task 6: every reason comes from its closed producer/target rule."""
+
+    def setUp(self) -> None:
+        self.module = evidence_module()
+
+    def test_missing_material_topic_targets_its_topic_id(self):
+        m = importlib.import_module("src.search.models")
+        search_plan = material_topic_plan()
+        assembler = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=())})
+        )
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertEqual((m.RepairReasonCode.MISSING_TOPIC,), gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+        self.assertEqual(("topic-2",), gap.missing_topic_ids)
+        self.assertTrue(gap.repair_eligible)
+
+    def test_stale_freshness_targets_stale_evidence(self):
+        m = importlib.import_module("src.search.models")
+        stale_topic = topic(
+            "topic-2",
+            "core",
+            FreshnessRequirement.CURRENT,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        )
+        search_plan = replace(
+            material_topic_plan(),
+            required_topics=(material_topic_plan().required_topics[0], stale_topic),
+        )
+        judge = StaticEvidenceJudge(
+            {"C1": judge_ok("C1", supported=("core",), freshness_by_topic={"topic-2": "stale"})}
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertIn(m.RepairReasonCode.STALE_EVIDENCE, gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+
+    def test_material_conflict_targets_source_conflict(self):
+        m = importlib.import_module("src.search.models")
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok("C1", supported=("core",), conflict_key="version", conflict_value="1"),
+                "C2": judge_ok("C2", supported=("core",), conflict_key="version", conflict_value="2"),
+            }
+        )
+        assembler = self.module.EvidenceAssembler(judge)
+        search_plan = material_topic_plan()
+        bundle = assembler.assemble(
+            search_plan,
+            (candidate(url="https://one.example"), candidate(url="https://two.example")),
+        )
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertEqual((m.RepairReasonCode.SOURCE_CONFLICT,), gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+        self.assertEqual(("conflict:version",), gap.conflict_group_ids)
+
+    def test_unmet_independent_corroboration_targets_source_quality_gap(self):
+        m = importlib.import_module("src.search.models")
+        independent = topic(
+            "topic-2",
+            "core",
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.INDEPENDENT_CORROBORATION,
+        )
+        search_plan = replace(
+            material_topic_plan(),
+            required_topics=(material_topic_plan().required_topics[0], independent),
+        )
+        assembler = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=("core",))})
+        )
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(search_plan, bundle)
+        self.assertEqual((m.RepairReasonCode.SOURCE_QUALITY_GAP,), gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+
+    def test_content_unreadable_reader_result_is_merged(self):
+        m = importlib.import_module("src.search.models")
+        search_plan = material_topic_plan()
+        assembler = self.module.EvidenceAssembler(
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=())})
+        )
+        bundle = assembler.assemble(search_plan, (candidate(),))
+        gap = assembler.analyze_gap(
+            search_plan,
+            bundle,
+            content_unreadable_topic_ids=("topic-2",),
+        )
+        self.assertEqual((m.RepairReasonCode.CONTENT_UNREADABLE,), gap.repair_reason_codes)
+        self.assertEqual(("topic-2",), gap.repair_target_topic_ids)
+        self.assertTrue(gap.repair_eligible)
 
 
 if __name__ == "__main__":

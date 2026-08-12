@@ -216,6 +216,23 @@ class SearchFailureCode(StrEnum):
     USER_FORBID_WEB = "user_forbid_web"
 
 
+class RepairReasonCode(StrEnum):
+    MISSING_TOPIC = "missing_topic"
+    STALE_EVIDENCE = "stale_evidence"
+    SOURCE_CONFLICT = "source_conflict"
+    ENTITY_AMBIGUITY = "entity_ambiguity"
+    PREMISE_MISMATCH = "premise_mismatch"
+    SOURCE_QUALITY_GAP = "source_quality_gap"
+    CONTENT_UNREADABLE = "content_unreadable"
+
+
+class RetrievalStopReason(StrEnum):
+    EVIDENCE_SUFFICIENT = "evidence_sufficient"
+    NO_REPAIR_BENEFIT = "no_repair_benefit"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    POST_REPAIR_STOP = "post_repair_stop"
+
+
 PROVIDER_STATUS_FAILURE_CODES: Mapping[ProviderStatus, SearchFailureCode | None] = MappingProxyType(
     {
         ProviderStatus.SUCCESS: None,
@@ -272,6 +289,31 @@ def _strings(values: Any, field_name: str) -> tuple[str, ...]:
     return result
 
 
+def _gap_hint_pairs(values: Any) -> tuple[tuple[str, str], ...]:
+    if values is None:
+        return ()
+    if isinstance(values, dict):
+        values = (values,)
+    if not isinstance(values, (tuple, list, set, frozenset)):
+        raise TypeError("gap_hints must be a collection of reason/topic pairs")
+    pairs: list[tuple[str, str]] = []
+    for raw in values:
+        if isinstance(raw, dict):
+            raw = (raw.get("reason_code"), raw.get("target_topic_id"))
+        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
+            raise TypeError("gap_hints must contain reason/topic pairs")
+        reason_code, target_topic_id = raw
+        if (
+            type(reason_code) is not str
+            or type(target_topic_id) is not str
+            or not reason_code.strip()
+            or not target_topic_id.strip()
+        ):
+            raise ValueError("gap_hints must contain non-blank reason/topic pairs")
+        pairs.append((reason_code.strip(), target_topic_id.strip()))
+    return tuple(dict.fromkeys(pairs))
+
+
 def _redaction_codes(values: Any, field_name: str) -> tuple[RedactionCode, ...]:
     if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, (tuple, list, set, frozenset)):
         raise TypeError(f"{field_name} must be a collection of RedactionCode values")
@@ -279,6 +321,14 @@ def _redaction_codes(values: Any, field_name: str) -> tuple[RedactionCode, ...]:
         return tuple(RedactionCode(value) for value in values)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must contain only recognized redaction codes") from exc
+
+
+def _repair_reason_codes(values: Any, field_name: str) -> tuple[RepairReasonCode, ...]:
+    if isinstance(values, (str, bytes, Mapping)) or not isinstance(values, (tuple, list, set, frozenset)):
+        raise TypeError(f"{field_name} must be a collection of RepairReasonCode values")
+    codes = _tuple(values)
+    _require_enum_values(codes, RepairReasonCode, field_name)
+    return codes
 
 
 def _safe_redaction_codes(values: Any) -> tuple[RedactionCode, ...]:
@@ -795,18 +845,27 @@ class SearchPlan:
 @dataclass(frozen=True)
 class RepairPlan:
     triggered: bool
-    gap_codes: tuple[str, ...]
+    reason_codes: tuple[RepairReasonCode, ...]
+    target_topic_ids: tuple[str, ...]
     repair_query: SearchQuery | None
     query_redaction_codes: tuple[RedactionCode, ...] = ()
 
     def __post_init__(self) -> None:
         _normalize_fields(
             self,
-            gap_codes=_strings(self.gap_codes, "gap_codes"),
+            reason_codes=_repair_reason_codes(self.reason_codes, "reason_codes"),
+            target_topic_ids=_strings(self.target_topic_ids, "target_topic_ids"),
             query_redaction_codes=_redaction_codes(self.query_redaction_codes, "query_redaction_codes"),
         )
+        if type(self.triggered) is not bool:
+            raise TypeError("triggered must be a boolean")
         if self.triggered != (self.repair_query is not None):
             raise ValueError("repair_query must be present exactly when repair is triggered")
+        if self.triggered:
+            if not (self.reason_codes and self.target_topic_ids):
+                raise ValueError("triggered repair requires non-empty reason codes and target topic ids")
+        elif self.reason_codes or self.target_topic_ids:
+            raise ValueError("untriggered repair cannot carry reason codes or target topic ids")
 
 
 @dataclass(frozen=True)
@@ -903,18 +962,27 @@ class EvidenceConflict:
 
 @dataclass(frozen=True)
 class EvidenceGapAnalysis:
-    missing_claim_topics: tuple[str, ...]
+    missing_topic_ids: tuple[str, ...]
     conflict_group_ids: tuple[str, ...]
     repair_eligible: bool
-    repair_purpose: str | None
-    repair_reason_codes: tuple[str, ...]
+    repair_reason_codes: tuple[RepairReasonCode, ...]
+    repair_target_topic_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), conflict_group_ids=_strings(self.conflict_group_ids, "conflict_group_ids"), repair_reason_codes=_strings(self.repair_reason_codes, "repair_reason_codes"))
-        if self.repair_eligible and (not self.repair_purpose or not self.repair_reason_codes):
-            raise ValueError("eligible repair requires a purpose and reason code")
-        if not self.repair_eligible and self.repair_purpose is not None:
-            raise ValueError("ineligible repair cannot have a repair purpose")
+        _normalize_fields(
+            self,
+            missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"),
+            conflict_group_ids=_strings(self.conflict_group_ids, "conflict_group_ids"),
+            repair_reason_codes=_repair_reason_codes(self.repair_reason_codes, "repair_reason_codes"),
+            repair_target_topic_ids=_strings(self.repair_target_topic_ids, "repair_target_topic_ids"),
+        )
+        if type(self.repair_eligible) is not bool:
+            raise TypeError("repair_eligible must be a boolean")
+        if self.repair_eligible:
+            if not (self.repair_reason_codes and self.repair_target_topic_ids):
+                raise ValueError("eligible repair requires non-empty reason codes and target topic ids")
+        elif self.repair_reason_codes or self.repair_target_topic_ids:
+            raise ValueError("ineligible repair cannot carry reason codes or target topic ids")
 
 
 @dataclass(frozen=True)
@@ -962,13 +1030,14 @@ class EvidenceBundle:
     topic_assessments: tuple[TopicAssessment, ...] = field(kw_only=True)
     supported_topic_ids: tuple[str, ...] = field(kw_only=True)
     missing_topic_ids: tuple[str, ...] = field(kw_only=True)
+    gap_hints: tuple[tuple[str, str], ...] = field(kw_only=True, default=())
 
     def __post_init__(self) -> None:
         _require_record(self.decision, RetrievalDecision, "decision")
         _require_record(self.plan, SearchPlan, "plan")
         _require_record(self.gap_analysis, EvidenceGapAnalysis, "gap_analysis")
         _require_record(self.repair_plan, RepairPlan, "repair_plan")
-        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"), topic_assessments=_records(self.topic_assessments, TopicAssessment, "topic_assessments"), supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"), missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"))
+        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"), topic_assessments=_records(self.topic_assessments, TopicAssessment, "topic_assessments"), supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"), missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"), gap_hints=_gap_hint_pairs(self.gap_hints))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
         material_topic_ids = tuple(
             topic.topic_id for topic in self.plan.required_topics if topic.material
@@ -1221,6 +1290,29 @@ class RenderedReply:
         _normalize_fields(self, chunks=_strings(self.chunks, "chunks"), used_evidence_ids=_strings(self.used_evidence_ids, "used_evidence_ids"), shown_source_urls=_strings(self.shown_source_urls, "shown_source_urls"), degradation_disclosures=_strings(self.degradation_disclosures, "degradation_disclosures"))
 
 
+@dataclass(frozen=True)
+class QueryTraceEntry:
+    """Body-free metadata for one provider attempt of one semantic query."""
+
+    query_index: int
+    purpose: QueryPurpose
+    round_kind: SearchRoundKind
+    provider: str
+    status: ProviderStatus
+    latency_ms: int | float
+
+    def __post_init__(self) -> None:
+        if type(self.query_index) is not int or self.query_index <= 0:
+            raise ValueError("query_index must be a positive integer")
+        _require_enum(self.purpose, QueryPurpose, "purpose")
+        _require_enum(self.round_kind, SearchRoundKind, "round_kind")
+        _require_enum(self.status, ProviderStatus, "status")
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("provider must be a non-blank string")
+        _require_number(self.latency_ms, "latency_ms")
+        _normalize_fields(self, provider=self.provider.strip())
+
+
 @dataclass
 class SearchTrace:
     request_id: str
@@ -1236,9 +1328,8 @@ class SearchTrace:
     initial_query_count: int = 0
     initial_round_started: bool = False
     adaptive_repair_round_started: bool = False
-    adaptive_repair_query: SearchQuery | tuple[str, QueryPurpose] | None = None
     retrieval_round_count: int = 0
-    executed_queries: tuple[SearchQuery | tuple[str, QueryPurpose], ...] = ()
+    executed_queries: tuple[QueryTraceEntry, ...] = ()
     provider_configured: bool = False
     provider_attempts: tuple[ProviderAttempt, ...] = ()
     provider_invocation_started: bool = False
@@ -1271,6 +1362,7 @@ class SearchTrace:
     content_read_count: int = 0
     initial_query_redaction_codes: tuple[RedactionCode, ...] = ()
     adaptive_repair_redaction_codes: tuple[RedactionCode, ...] = ()
+    retrieval_stop_reason: RetrievalStopReason | None = None
     response_started_at: float | None = field(default=None, repr=False, compare=False)
     response_finished_at: float | None = field(default=None, repr=False, compare=False)
     finalized: bool = field(default=False, init=False, repr=False, compare=False)
@@ -1278,6 +1370,11 @@ class SearchTrace:
     def __post_init__(self) -> None:
         self.trigger_codes = _tuple(self.trigger_codes)
         self.executed_queries = _tuple(self.executed_queries)
+        if any(
+            not isinstance(entry, QueryTraceEntry)
+            for entry in self.executed_queries
+        ):
+            raise TypeError("executed_queries must contain QueryTraceEntry values")
         self.provider_attempts = _tuple(self.provider_attempts)
         self.provider_failures = _tuple(self.provider_failures)
         self.initial_query_redaction_codes = _redaction_codes(
@@ -1289,13 +1386,42 @@ class SearchTrace:
         for attempt in self.provider_attempts:
             if not isinstance(attempt, ProviderAttempt):
                 raise TypeError("provider_attempts must contain ProviderAttempt values")
+        if self.retrieval_stop_reason is not None:
+            _require_enum(
+                self.retrieval_stop_reason,
+                RetrievalStopReason,
+                "retrieval_stop_reason",
+            )
+
+    @property
+    def semantic_query_count(self) -> int:
+        return len({entry.query_index for entry in self.executed_queries})
+
+    @property
+    def repair_query_count(self) -> int:
+        return len(
+            {
+                entry.query_index
+                for entry in self.executed_queries
+                if entry.round_kind is SearchRoundKind.REPAIR
+            }
+        )
 
     def to_log_dict(self) -> dict[str, Any]:
-        adaptive_repair = _query_metadata(self.adaptive_repair_query)
         executed_metadata = tuple(
-            metadata
-            for query in self.executed_queries
-            if (metadata := _query_metadata(query)) is not None
+            {
+                "query_index": entry.query_index,
+                "purpose": entry.purpose,
+                "round_kind": entry.round_kind,
+                "provider": (
+                    entry.provider
+                    if entry.provider in {"tavily", "ddgs"}
+                    else "[redacted]"
+                ),
+                "status": entry.status,
+                "latency_ms": entry.latency_ms,
+            }
+            for entry in self.executed_queries
         )
         values = {
             "request_id": _safe_log_identifier(self.request_id),
@@ -1311,11 +1437,11 @@ class SearchTrace:
             "initial_query_count": self.initial_query_count,
             "initial_round_started": self.initial_round_started,
             "adaptive_repair_round_started": self.adaptive_repair_round_started,
-            "adaptive_repair_query": adaptive_repair,
             "initial_query_redaction_codes": _safe_redaction_codes(self.initial_query_redaction_codes),
             "adaptive_repair_redaction_codes": _safe_redaction_codes(self.adaptive_repair_redaction_codes),
             "retrieval_round_count": self.retrieval_round_count,
             "executed_queries": executed_metadata,
+            "retrieval_stop_reason": self.retrieval_stop_reason,
             "provider_configured": self.provider_configured,
             "provider_attempts": [_attempt_metadata(attempt) for attempt in self.provider_attempts],
             "provider_invocation_started": self.provider_invocation_started,
@@ -1345,8 +1471,8 @@ class SearchTrace:
             "qq_render_latency_ms": self.qq_render_latency_ms,
             "retrieval_pipeline_latency_ms": self.retrieval_pipeline_latency_ms,
             "total_response_latency_ms": self.total_response_latency_ms,
-            "semantic_query_count": len({item["query_id"] for item in executed_metadata}),
-            "repair_query_count": int(self.adaptive_repair_round_started),
+            "semantic_query_count": self.semantic_query_count,
+            "repair_query_count": self.repair_query_count,
             "content_read_count": self.content_read_count,
             "provider_attempted": self.provider_invocation_started,
             "sufficient_evidence": self.evidence_state is EvidenceState.SUFFICIENT,
@@ -1404,19 +1530,6 @@ class SearchPipelineResult:
             allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}
         if self.failure_code not in allowed:
             raise ValueError("failure_code must match evidence state")
-
-
-def _query_metadata(query: Any) -> dict[str, str] | None:
-    if query is None:
-        return None
-    if isinstance(query, SearchQuery):
-        return {"query_id": _safe_log_identifier(query.query_id), "purpose": query.purpose.value}
-    if not isinstance(query, tuple) or len(query) != 2:
-        return None
-    query_id, purpose = query
-    if not isinstance(query_id, str) or not isinstance(purpose, QueryPurpose):
-        return None
-    return {"query_id": _safe_log_identifier(query_id), "purpose": purpose.value}
 
 
 def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
