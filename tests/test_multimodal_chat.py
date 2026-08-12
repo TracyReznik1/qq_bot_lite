@@ -3,6 +3,7 @@ from unittest import mock
 
 import src.chat.chat_service as chat_service
 from src.services.llm_types import ChatResponse
+from tests.search_fakes import make_analysis
 
 
 class MultimodalChatTests(unittest.TestCase):
@@ -45,6 +46,7 @@ class MultimodalChatTests(unittest.TestCase):
         )
         orchestrator = mock.Mock(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+            analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
         ))
         with (
             mock.patch.object(chat_service, "_ensure_history_loaded"),

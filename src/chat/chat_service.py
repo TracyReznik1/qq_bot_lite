@@ -13,6 +13,7 @@ from src.memory.models import MemoryContext
 from src.config import config
 from src.search import get_search_orchestrator, reset_search_orchestrator
 from src.search.models import (
+    AnswerGenerationMode,
     EvidenceState,
     RequestSource,
     RetrievalRequest,
@@ -21,7 +22,8 @@ from src.search.models import (
     SearchTier,
     SkipReason,
 )
-from src.search.renderer import _is_high_consequence, render_search_reply, render_plain_reply
+from src.search.policy import decide_answer_state
+from src.search.renderer import render_search_reply, render_plain_reply
 from src.services.llm_client import get_llm_client
 from src.services.llm_types import ChatResponse
 from src.utils.storage import read_json, safe_id, write_json
@@ -360,19 +362,19 @@ def generate_reply(
     final_result = result
     reply: str | None = None
     try:
-        if result.decision.route is SearchTier.SKIP:
-            reply, final_result = _handle_skip(mem_ctx, text, images, result)
-        elif result.evidence is not None and result.evidence.evidence_items and result.failure_code in {
-            SearchFailureCode.PARTIAL_EVIDENCE,
-            SearchFailureCode.SOURCE_CONFLICT,
-            None,
-        }:
-            # Partial/conflicting bundles remain grounded in their admitted Evidence.
+        answer_state = decide_answer_state(
+            result.analysis,
+            result.evidence,
+            result.failure_code,
+        )
+        if answer_state.generation_mode is AnswerGenerationMode.PLAIN:
+            reply, final_result = _handle_plain(mem_ctx, text, images, result)
+        elif answer_state.generation_mode is AnswerGenerationMode.GROUNDED:
             reply, final_result = _grounded_generation(mem_ctx, text, images, result)
-        elif result.evidence is None or result.failure_code is not None:
-            reply, final_result = _handle_failure(mem_ctx, text, images, result)
         else:
-            reply, final_result = _grounded_generation(mem_ctx, text, images, result)
+            reply, final_result = _handle_fixed(
+                mem_ctx, text, images, result, answer_state
+            )
         return reply
     finally:
         finalize_search_trace(final_result, history_text)
@@ -385,25 +387,7 @@ def generate_reply(
             append_history(session_key, stored_user_text, reply)
 
 
-def _handle_skip(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
-    reason = result.decision.skip_reason
-    if reason is SkipReason.USER_FORBID_WEB:
-        # Stable knowledge may answer with a fixed no-web disclosure.
-        if (
-            result.decision.requires_clarification
-            or _is_high_consequence(result)
-        ):
-            rendered = render_search_reply(result, None, qq_limit=_qq_limit())
-            return rendered.text, result
-        messages = _build_messages(mem_ctx, text, images, evidence_payload="", include_memories=False)
-        response = _generate_answer(result.trace, messages, temperature=0.5)
-        rendered = render_search_reply(
-            result, None,
-            knowledge_fallback_text=response.content,
-            qq_limit=_qq_limit(),
-        )
-        return rendered.text, result
-
+def _handle_plain(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
     # Ordinary closed tasks: normal answer call, no search tool, no citations.
     messages = _build_messages(mem_ctx, text, images, evidence_payload="", include_memories=True)
     response = _generate_answer(result.trace, messages, temperature=0.75)
@@ -415,20 +399,37 @@ def _handle_skip(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResu
     return rendered.text, result
 
 
-def _handle_failure(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
-    decision = result.decision
-    if decision.route is SearchTier.DEEP:
+def _handle_fixed(
+    mem_ctx,
+    text,
+    images,
+    result,
+    answer_state,
+) -> tuple[str, SearchPipelineResult]:
+    is_no_web = bool(
+        result.decision.skip_reason is SkipReason.USER_FORBID_WEB
+    )
+    if is_no_web and not (
+        result.decision.requires_clarification or answer_state.warning_codes
+    ):
+        # Stable knowledge may answer for a low-risk no-web request.
+        messages = _build_messages(
+            mem_ctx, text, images, evidence_payload="", include_memories=False
+        )
+        response = _generate_answer(result.trace, messages, temperature=0.5)
+        rendered = render_search_reply(
+            result, None,
+            knowledge_fallback_text=response.content,
+            qq_limit=_qq_limit(),
+        )
+        return rendered.text, result
+
+    if result.decision.route is SearchTier.SKIP:
         rendered = render_search_reply(result, None, qq_limit=_qq_limit())
         return rendered.text, result
 
-    # Stable knowledge fallback without retrieved-memory facts.
-    messages = _build_messages(mem_ctx, text, images, evidence_payload="", include_memories=False)
-    response = _generate_answer(result.trace, messages, temperature=0.5)
-    rendered = render_search_reply(
-        result, None,
-        knowledge_fallback_text=response.content,
-        qq_limit=_qq_limit(),
-    )
+    # External-fact failure: never invent facts from the ordinary model.
+    rendered = render_search_reply(result, None, qq_limit=_qq_limit())
     return rendered.text, result
 
 

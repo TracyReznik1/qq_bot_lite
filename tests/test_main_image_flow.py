@@ -10,6 +10,7 @@ import src.chat.chat_service as chat_service
 import src.main as main
 from src.commands import CommandResult
 from src.services.llm_types import ChatResponse
+from tests.search_fakes import make_analysis
 
 
 IMAGE_URL = "https://img.example/a.png?token=temporary-secret"
@@ -50,6 +51,7 @@ def _skip_orchestrator():
     )
     return SimpleNamespace(run=lambda req: SearchPipelineResult(
         skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+        analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
     ))
 
 

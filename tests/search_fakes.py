@@ -6,8 +6,44 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.search.models import ProviderReadiness, ProviderStatus
+from src.search.models import (
+    Factuality,
+    FreshnessContext,
+    FreshnessRequirement,
+    ProviderReadiness,
+    ProviderStatus,
+    RequestAnalysis,
+    RetrievalContext,
+    RiskContext,
+    SourceRequirement,
+)
 from src.services.llm_types import ChatResponse
+
+
+def make_analysis(
+    *,
+    skip_reason=None,
+    high_consequence=False,
+    fail_closed=False,
+    freshness=FreshnessRequirement.NOT_REQUIRED,
+):
+    """Build a minimal RequestAnalysis for tests that mock the orchestrator."""
+    return RequestAnalysis(
+        RetrievalContext(
+            must_search=skip_reason is None,
+            skip_reason=skip_reason,
+            factuality=(
+                Factuality.NON_FACTUAL
+                if skip_reason is not None
+                else Factuality.FACTUAL
+            ),
+            external_fact_required=skip_reason is None,
+            complexity_codes=(),
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        ),
+        FreshnessContext(freshness, None, None, None, None),
+        RiskContext(high_consequence, high_consequence, fail_closed),
+    )
 
 
 @dataclass

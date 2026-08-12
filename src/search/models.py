@@ -233,6 +233,45 @@ class RetrievalStopReason(StrEnum):
     POST_REPAIR_STOP = "post_repair_stop"
 
 
+class AnswerCertainty(StrEnum):
+    VERIFIED = "verified"
+    LIMITED = "limited"
+    CONFLICTING = "conflicting"
+    UNVERIFIED = "unverified"
+
+
+class AnswerGenerationMode(StrEnum):
+    PLAIN = "plain"
+    GROUNDED = "grounded"
+    FIXED = "fixed"
+
+
+class AllowedClaimScope(StrEnum):
+    ALL_SUPPORTED = "all_supported"
+    SUPPORTED_SUBSET = "supported_subset"
+    SUPPORTED_SUBSET_WITH_CONFLICTS = "supported_subset_with_conflicts"
+    CONFLICT_DESCRIPTION_ONLY = "conflict_description_only"
+    NO_EXTERNAL_FACTUAL_CLAIMS = "no_external_factual_claims"
+
+
+class DisclosureCode(StrEnum):
+    ONLINE_VERIFICATION_FAILED = "online_verification_failed"
+    PARTIAL_EVIDENCE = "partial_evidence"
+    SOURCE_CONFLICT = "source_conflict"
+    VALIDATION_UNAVAILABLE = "validation_unavailable"
+    VALIDATION_FAILED = "validation_failed"
+    USER_FORBID_WEB = "user_forbid_web"
+
+
+class WarningCode(StrEnum):
+    HIGH_CONSEQUENCE = "high_consequence"
+
+
+class ValidatorRequirement(StrEnum):
+    NORMAL = "normal"
+    FAIL_CLOSED = "fail_closed"
+
+
 PROVIDER_STATUS_FAILURE_CODES: Mapping[ProviderStatus, SearchFailureCode | None] = MappingProxyType(
     {
         ProviderStatus.SUCCESS: None,
@@ -1478,6 +1517,39 @@ class SearchTrace:
             "sufficient_evidence": self.evidence_state is EvidenceState.SUFFICIENT,
         }
         return _json_safe(values)
+
+
+@dataclass(frozen=True)
+class AnswerState:
+    """Closed, transient answer/render policy over immutable search state.
+
+    This is a pure chat-dispatch output: it never enters retrieval decisions and
+    is not consumed by Router, Planner, Evidence, Validator semantics or Renderer
+    beyond what Task 8/9 wire explicitly.
+    """
+
+    evidence_state: EvidenceState | None
+    generation_mode: AnswerGenerationMode
+    certainty: AnswerCertainty
+    allowed_claim_scope: AllowedClaimScope
+    disclosure_codes: tuple[DisclosureCode, ...]
+    warning_codes: tuple[WarningCode, ...]
+    validator_requirement: ValidatorRequirement
+
+    def __post_init__(self) -> None:
+        if self.evidence_state is not None:
+            _require_enum(self.evidence_state, EvidenceState, "evidence_state")
+        _require_enum(self.generation_mode, AnswerGenerationMode, "generation_mode")
+        _require_enum(self.certainty, AnswerCertainty, "certainty")
+        _require_enum(self.allowed_claim_scope, AllowedClaimScope, "allowed_claim_scope")
+        _require_enum(self.validator_requirement, ValidatorRequirement, "validator_requirement")
+        _normalize_fields(
+            self,
+            disclosure_codes=_tuple(self.disclosure_codes),
+            warning_codes=_tuple(self.warning_codes),
+        )
+        _require_enum_values(self.disclosure_codes, DisclosureCode, "disclosure_codes")
+        _require_enum_values(self.warning_codes, WarningCode, "warning_codes")
 
 
 @dataclass(frozen=True)

@@ -44,6 +44,32 @@ def models():
     return __import__("src.search.models", fromlist=["RetrievalRequest"])
 
 
+def analysis(skip_reason=None, high_consequence=False, fail_closed=False):
+    m = models()
+    return m.RequestAnalysis(
+        m.RetrievalContext(
+            must_search=skip_reason is None,
+            skip_reason=skip_reason,
+            factuality=(
+                Factuality.NON_FACTUAL
+                if skip_reason is not None
+                else Factuality.FACTUAL
+            ),
+            external_fact_required=skip_reason is None,
+            complexity_codes=(),
+            source_requirement=m.SourceRequirement.ANY_RELEVANT,
+        ),
+        m.FreshnessContext(
+            m.FreshnessRequirement.NOT_REQUIRED,
+            None,
+            None,
+            None,
+            None,
+        ),
+        m.RiskContext(high_consequence, high_consequence, fail_closed),
+    )
+
+
 def decision(route=SearchTier.LIGHT):
     m = models()
     return m.RetrievalDecision(
@@ -126,12 +152,26 @@ def search_result(route=SearchTier.LIGHT, evidence=None, failure=None, skip_reas
             Factuality.NON_FACTUAL, False, Freshness.NONE, RiskLevel.LOW,
             m.Actionability.NONE, m.PotentialHarm.NONE, None, None, (),
         )
-        return m.SearchPipelineResult(d, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), failure)
+        return m.SearchPipelineResult(
+            d,
+            None,
+            None,
+            SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP),
+            failure,
+            analysis=analysis(skip_reason=skip_reason),
+        )
     d = decision(route)
     p = plan(route)
     if evidence is None and failure is not None and failure is not m.SearchFailureCode.PROVIDER_NOT_CONFIGURED:
         evidence = bundle((), state=EvidenceState.INSUFFICIENT)
-    return m.SearchPipelineResult(d, p, evidence, SearchTrace("req-1", RequestSource.CHAT, route), failure)
+    return m.SearchPipelineResult(
+        d,
+        p,
+        evidence,
+        SearchTrace("req-1", RequestSource.CHAT, route),
+        failure,
+        analysis=analysis(),
+    )
 
 
 def no_web_result(*, potential_harm, trigger_codes=()):
@@ -152,12 +192,20 @@ def no_web_result(*, potential_harm, trigger_codes=()):
         None,
         tuple(trigger_codes),
     )
+    high_consequence = (
+        potential_harm is m.PotentialHarm.HIGH
+        or TriggerCode.HIGH_CONSEQUENCE_ACTION in trigger_codes
+    )
     return m.SearchPipelineResult(
         d,
         None,
         None,
         SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP),
         SearchFailureCode.USER_FORBID_WEB,
+        analysis=analysis(
+            skip_reason=SkipReason.USER_FORBID_WEB,
+            high_consequence=high_consequence,
+        ),
     )
 
 
@@ -471,8 +519,8 @@ class FailureFlowTests(unittest.TestCase):
     def test_stable_failure_uses_fixed_disclosure_and_no_memory(self):
         result = search_result(SearchTier.LIGHT, failure=models().SearchFailureCode.NO_RESULTS)
         reply, llm_chat = self._run(result)
-        self.assertIn("在线检索未完成", reply)
-        self.assertEqual(1, llm_chat.call_count)
+        self.assertIn("无法完成在线核验", reply)
+        self.assertEqual(0, llm_chat.call_count)
 
     def test_dynamic_low_risk_failure_does_not_use_memory_or_risk_warning(self):
         result = search_result(

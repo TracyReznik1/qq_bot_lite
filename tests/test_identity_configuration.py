@@ -10,6 +10,7 @@ import src.commands.search as search_command
 from src.config import BASE_DIR, Config
 from src.persona import Persona
 from src.services.llm_types import ChatResponse
+from tests.search_fakes import make_analysis
 
 
 class CapturingLlm:
@@ -83,6 +84,7 @@ class IdentityConfigurationTests(unittest.TestCase):
             )
             chat_service._search_orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
                 skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+                analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
             ))
             try:
                 reply = chat_service.generate_reply("identity:test", "你好")
@@ -118,6 +120,7 @@ class IdentityConfigurationTests(unittest.TestCase):
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
             failed, empty_plan, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.LIGHT),
             SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            analysis=make_analysis(),
         ))
         with (
             patch.object(search_command, "normalize_search_query", return_value="测试"),
@@ -155,6 +158,7 @@ class IdentityConfigurationTests(unittest.TestCase):
         )
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+            analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
         ))
         with (
             patch.object(search_command, "normalize_search_query", return_value="测试"),
@@ -185,6 +189,7 @@ class IdentityConfigurationTests(unittest.TestCase):
         )
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
+            analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
         ))
         with (
             patch.object(chat_service, "llm", fake_llm),
