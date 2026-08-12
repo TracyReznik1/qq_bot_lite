@@ -528,7 +528,7 @@ class SearchModelContractTests(unittest.TestCase):
             "Claim": ("claim_id", "block_id", "text", "material", "evidence_ids"),
             "AnswerBlock": ("block_id", "kind", "text", "claim_ids"),
             "GroundedDraft": ("answer_blocks", "claims", "limitations", "conflict_summary", "used_knowledge_fallback"),
-            "ValidationReport": ("draft", "retained_blocks", "retained_claims", "removed_block_ids", "claim_labels", "limitations"),
+    "ValidationReport": ("draft", "retained_blocks", "retained_claims", "removed_block_ids", "claim_labels", "limitations", "status", "effective_certainty", "effective_claim_scope"),
             "RenderedReply": ("text", "chunks", "used_evidence_ids", "shown_source_urls", "degradation_disclosures"),
         }
         public = importlib.import_module("src.search").__all__

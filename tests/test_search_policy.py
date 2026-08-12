@@ -12,13 +12,15 @@ from src.search.models import (
     DisclosureCode,
     EvidenceState,
     FreshnessRequirement,
+    RenderOutcome,
     SearchFailureCode,
     SkipReason,
+    ValidatorStatus,
     ValidatorRequirement,
     WarningCode,
 )
-from src.search.policy import decide_answer_state
-from tests.test_chat_retrieval_flow import models
+from src.search.policy import build_render_state, decide_answer_state
+from tests.test_chat_retrieval_flow import item, models
 
 
 def _evidence(state):
@@ -170,6 +172,39 @@ class AnswerStateSkipAndFailureTests(unittest.TestCase):
             (DisclosureCode.ONLINE_VERIFICATION_FAILED,),
             answer.disclosure_codes,
         )
+
+
+class BuildRenderStateTests(unittest.TestCase):
+    def test_citations_and_sources_derive_from_retained_claims(self):
+        m = models()
+        block = m.AnswerBlock("B1", "factual", "版本是3.2", ("C1",))
+        claim = m.Claim("C1", "B1", "版本是3.2", True, ("E1", "E2"))
+        validation = SimpleNamespace(
+            retained_blocks=(block,),
+            retained_claims=(claim,),
+            effective_claim_scope=AllowedClaimScope.ALL_SUPPORTED,
+            status=ValidatorStatus.PASSED,
+        )
+        evidence = SimpleNamespace(
+            evidence_items=(
+                item(eid="E1"),
+                item(eid="E2"),
+                item(eid="E3"),
+            ),
+            conflicts=(),
+        )
+        answer = decide_answer_state(
+            make_analysis(),
+            _evidence(EvidenceState.SUFFICIENT),
+            None,
+        )
+        state = build_render_state(answer, validation, evidence)
+        self.assertEqual({"E1": 1, "E2": 2}, dict(state.citation_map))
+        self.assertEqual(
+            ("E1", "E2"),
+            tuple(source.evidence_id for source in state.used_sources),
+        )
+        self.assertIs(state.outcome, RenderOutcome.ANSWER)
 
 
 if __name__ == "__main__":

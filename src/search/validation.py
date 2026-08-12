@@ -10,14 +10,18 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from src.search.models import (
+    AllowedClaimScope,
+    AnswerCertainty,
     AnswerBlock,
+    AnswerState,
     Claim,
     EvidenceBundle,
     EvidenceState,
     GroundedDraft,
-    SearchTier,
     SupportLabel,
     ValidationReport,
+    ValidatorRequirement,
+    ValidatorStatus,
 )
 
 _FENCE_PATTERN = re.compile(
@@ -581,7 +585,7 @@ class SemanticVerificationUnavailable(RuntimeError):
 def validate_and_filter(
     draft: GroundedDraft,
     bundle: EvidenceBundle,
-    decision: Any,
+    answer_state: AnswerState,
     *,
     claim_discoverer: Any,
     semantic_verifier: Any,
@@ -613,10 +617,10 @@ def validate_and_filter(
             _semantic_verify(draft, bundle, semantic_verifier, report)
         except SemanticVerificationUnavailable:
             verifier_unavailable = True
-            _apply_verifier_unavailable(draft, bundle, decision, report)
+            _apply_verifier_unavailable(draft, bundle, answer_state, report)
         except Exception:
             verifier_unavailable = True
-            _apply_verifier_unavailable(draft, bundle, decision, report)
+            _apply_verifier_unavailable(draft, bundle, answer_state, report)
 
         # non_factual blocks may omit claims only when discovery finds no factual span
         for block in draft.answer_blocks:
@@ -645,6 +649,26 @@ def validate_and_filter(
                 if report.labels.get(claim.claim_id) is SupportLabel.SUPPORTED
             )
 
+        status = ValidatorStatus.PASSED
+        if removed_block_ids:
+            status = ValidatorStatus.FILTERED
+        if verifier_unavailable:
+            status = ValidatorStatus.UNAVAILABLE
+
+        effective_certainty = answer_state.certainty
+        effective_claim_scope = answer_state.allowed_claim_scope
+        if status in {ValidatorStatus.FILTERED, ValidatorStatus.UNAVAILABLE}:
+            effective_certainty = _min_certainty(
+                effective_certainty,
+                AnswerCertainty.LIMITED,
+            )
+        if not any(
+            block.kind in {"factual", "inference"}
+            for block in retained_blocks
+        ):
+            effective_certainty = AnswerCertainty.UNVERIFIED
+            effective_claim_scope = AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS
+
         return ValidationReport(
             draft=draft,
             retained_blocks=retained_blocks,
@@ -652,6 +676,9 @@ def validate_and_filter(
             removed_block_ids=removed_block_ids,
             claim_labels=dict(report.labels),
             limitations=tuple(limitations),
+            status=status,
+            effective_certainty=effective_certainty,
+            effective_claim_scope=effective_claim_scope,
         )
     finally:
         if trace is not None:
@@ -731,15 +758,14 @@ def _apply_discovered_spans(
 def _apply_verifier_unavailable(
     draft: GroundedDraft,
     bundle: EvidenceBundle,
-    decision: Any,
+    answer_state: AnswerState,
     report: _StructuralReport,
 ) -> None:
     del draft, bundle
-    route = getattr(decision, "route", None)
-    # Deep dynamic/high-consequence output becomes non-definitive: remove every
-    # factual/inference block. Lower tiers keep structurally mapped blocks but the
-    # report carries a fixed "semantic verification unavailable" disclosure.
-    if route is SearchTier.DEEP:
+    # Fail-closed output becomes non-definitive: remove every factual/inference
+    # block. Normal requests keep structurally mapped blocks but mark them as
+    # unmapped so the fixed "semantic verification unavailable" disclosure shows.
+    if answer_state.validator_requirement is ValidatorRequirement.FAIL_CLOSED:
         for block in list(report.kept_blocks):
             if block.kind in {"factual", "inference"}:
                 _remove_block(report, block.block_id)
@@ -747,6 +773,31 @@ def _apply_verifier_unavailable(
         for block in report.kept_blocks:
             for claim_id in block.claim_ids:
                 report.labels[claim_id] = SupportLabel.UNMAPPED
+
+
+_CERTAINTY_RANK = {
+    AnswerCertainty.UNVERIFIED: 0,
+    AnswerCertainty.CONFLICTING: 1,
+    AnswerCertainty.LIMITED: 1,
+    AnswerCertainty.VERIFIED: 2,
+}
+
+
+def _min_certainty(
+    left: AnswerCertainty,
+    right: AnswerCertainty,
+) -> AnswerCertainty:
+    """Return the lower of two certainties without ever raising certainty."""
+    if _CERTAINTY_RANK[left] <= _CERTAINTY_RANK[right]:
+        return left
+    return right
+
+
+def sanitize_visible_block_text(text: str) -> str:
+    """Remove program-owned status/warning atoms from model prose."""
+    from src.search.renderer import _strip_program_owned_search_disclosures
+
+    return _strip_program_owned_search_disclosures(text).strip()
 
 
 def _dedupe(items: Sequence[str]) -> list[str]:

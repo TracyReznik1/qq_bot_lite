@@ -272,7 +272,9 @@ def _generate_answer(trace, messages, *, temperature: float) -> ChatResponse:
         )
 
 
-def _grounded_generation(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
+def _grounded_generation(
+    mem_ctx, text, images, result, answer_state
+) -> tuple[str, SearchPipelineResult]:
     evidence_payload = _build_evidence_payload(result)
     messages = _build_messages(mem_ctx, text, images, evidence_payload=evidence_payload, include_memories=True)
     response = _generate_answer(result.trace, messages, temperature=0.2)
@@ -290,7 +292,7 @@ def _grounded_generation(mem_ctx, text, images, result) -> tuple[str, SearchPipe
         0.0,
     )
     try:
-        report = _validate_draft(draft, result)
+        report = _validate_draft(draft, result, answer_state)
     except Exception:
         logger.debug("grounded draft validation failed", exc_info=True)
         return _handle_draft_failure(mem_ctx, text, images, result, response.content)
@@ -370,7 +372,9 @@ def generate_reply(
         if answer_state.generation_mode is AnswerGenerationMode.PLAIN:
             reply, final_result = _handle_plain(mem_ctx, text, images, result)
         elif answer_state.generation_mode is AnswerGenerationMode.GROUNDED:
-            reply, final_result = _grounded_generation(mem_ctx, text, images, result)
+            reply, final_result = _grounded_generation(
+                mem_ctx, text, images, result, answer_state
+            )
         else:
             reply, final_result = _handle_fixed(
                 mem_ctx, text, images, result, answer_state
@@ -438,13 +442,13 @@ def _parse_draft(content: str):
     return parse_grounded_draft(content)
 
 
-def _validate_draft(draft, result):
+def _validate_draft(draft, result, answer_state):
     from src.search.validation import LLMClaimDiscoverer, validate_and_filter
     verifier = _Verifier()
     return validate_and_filter(
         draft,
         result.evidence,
-        result.decision,
+        answer_state,
         claim_discoverer=LLMClaimDiscoverer(llm),
         semantic_verifier=verifier,
         trace=result.trace,

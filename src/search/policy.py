@@ -9,6 +9,8 @@ renderer.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from src.search.models import (
     AllowedClaimScope,
     AnswerCertainty,
@@ -18,12 +20,17 @@ from src.search.models import (
     EvidenceBundle,
     EvidenceState,
     FreshnessRequirement,
+    RenderOutcome,
+    RenderState,
     RequestAnalysis,
     SearchFailureCode,
     SkipReason,
+    ValidationReport,
     ValidatorRequirement,
+    ValidatorStatus,
     WarningCode,
 )
+from src.search.validation import sanitize_visible_block_text
 
 
 _CLOSED_TASK_SKIP_REASONS = frozenset(
@@ -168,3 +175,69 @@ def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCod
     if failure_code is SearchFailureCode.VALIDATION_FAILED:
         return DisclosureCode.VALIDATION_FAILED
     return DisclosureCode.ONLINE_VERIFICATION_FAILED
+
+
+def build_render_state(
+    answer_state: AnswerState,
+    validation: ValidationReport,
+    evidence: EvidenceBundle | None,
+) -> RenderState:
+    """Build a deterministic render view from policy, validation and evidence."""
+    scope = validation.effective_claim_scope
+    visible_blocks = tuple(
+        replace(block, text=sanitize_visible_block_text(block.text))
+        for block in validation.retained_blocks
+    )
+    visible_claims = validation.retained_claims
+
+    cited_ids: list[str] = []
+    for claim in visible_claims:
+        for evidence_id in claim.evidence_ids:
+            if evidence_id and evidence_id not in cited_ids:
+                cited_ids.append(evidence_id)
+    citation_map = {
+        evidence_id: index for index, evidence_id in enumerate(cited_ids, 1)
+    }
+
+    items = evidence.evidence_items if evidence is not None else ()
+    item_by_id = {item.evidence_id: item for item in items}
+    used_sources = tuple(
+        item_by_id[evidence_id]
+        for evidence_id in cited_ids
+        if evidence_id in item_by_id and item_by_id[evidence_id].citable
+    )
+    conflicts = evidence.conflicts if evidence is not None else ()
+    conflict_groups = tuple(
+        conflict
+        for conflict in conflicts
+        if any(member.evidence_id in citation_map for member in conflict.members)
+    )
+
+    return RenderState(
+        outcome=_render_outcome(scope, validation.status),
+        visible_blocks=visible_blocks,
+        visible_claims=visible_claims,
+        citation_map=citation_map,
+        used_sources=used_sources,
+        conflict_groups=conflict_groups,
+        disclosure_codes=answer_state.disclosure_codes,
+        warning_codes=answer_state.warning_codes,
+    )
+
+
+def _render_outcome(
+    scope: AllowedClaimScope,
+    status: ValidatorStatus,
+) -> RenderOutcome:
+    if status is ValidatorStatus.MALFORMED:
+        return RenderOutcome.VALIDATION_FAILURE
+    if scope is AllowedClaimScope.ALL_SUPPORTED:
+        return RenderOutcome.ANSWER
+    if scope is AllowedClaimScope.SUPPORTED_SUBSET:
+        return RenderOutcome.PARTIAL
+    if scope in {
+        AllowedClaimScope.SUPPORTED_SUBSET_WITH_CONFLICTS,
+        AllowedClaimScope.CONFLICT_DESCRIPTION_ONLY,
+    }:
+        return RenderOutcome.CONFLICT
+    return RenderOutcome.FAILURE

@@ -52,6 +52,21 @@ def decision(tier=SearchTier.STANDARD):
     )
 
 
+def answer_state(fail_closed=False):
+    m = models()
+    return m.AnswerState(
+        None,
+        m.AnswerGenerationMode.GROUNDED,
+        m.AnswerCertainty.VERIFIED,
+        m.AllowedClaimScope.ALL_SUPPORTED,
+        (),
+        (),
+        m.ValidatorRequirement.FAIL_CLOSED
+        if fail_closed
+        else m.ValidatorRequirement.NORMAL,
+    )
+
+
 def query():
     return SearchQuery("q1", SearchRoundKind.INITIAL, __import__("src.search.models", fromlist=["QueryPurpose"]).QueryPurpose.DIRECT, "q")
 
@@ -196,7 +211,7 @@ class StructuralValidationTests(unittest.TestCase):
         return self.module.validate_and_filter(
             draft,
             b,
-            decision(decision_tier),
+            answer_state(fail_closed=decision_tier is SearchTier.DEEP),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -271,7 +286,7 @@ class StructuralValidationTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = self.module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"unsupported"}),
         )
@@ -297,7 +312,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer(["版本是9.9"]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -317,7 +332,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"C1": "supported"}),
         )
@@ -333,7 +348,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer(["发布日期是明天"]),
             semantic_verifier=StaticSemanticVerifier({"C1": "supported"}),
         )
@@ -350,7 +365,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer((
                 module.DiscoveredClaimSpan("B1", "发布日期是明天", True, True, None),
             )),
@@ -367,7 +382,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -383,7 +398,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"C1": "supported"}),
         )
@@ -406,7 +421,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -421,7 +436,7 @@ class ClaimDiscoveryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -439,7 +454,7 @@ class ModelMemoryTests(unittest.TestCase):
         )
         b = bundle((item(),), state=EvidenceState.SUFFICIENT)
         report = module.validate_and_filter(
-            d, b, decision(),
+            d, b, answer_state(),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"unsupported"}),
         )
@@ -530,7 +545,7 @@ class NoSearchAccessTests(unittest.TestCase):
             with self.subTest(outcome=type(outcome).__name__):
                 with self.assertRaises(RuntimeError):
                     module.validate_and_filter(
-                        d, b, decision(SearchTier.DEEP),
+                        d, b, answer_state(fail_closed=True),
                         claim_discoverer=module.LLMClaimDiscoverer(BrokenLLM(outcome)),
                         semantic_verifier=StaticSemanticVerifier({}),
                     )
@@ -551,7 +566,7 @@ class NoSearchAccessTests(unittest.TestCase):
 
         with self.assertRaises(module.ClaimDiscoveryUnavailable):
             module.validate_and_filter(
-                d, bundle((item(),)), decision(SearchTier.DEEP),
+                d, bundle((item(),)), answer_state(fail_closed=True),
                 claim_discoverer=DelayedFailingDiscoverer(),
                 semantic_verifier=StaticSemanticVerifier({}),
                 trace=trace,
@@ -595,7 +610,7 @@ class NoSearchAccessTests(unittest.TestCase):
                 llm = EmptyLLM()
                 with self.assertRaises(RuntimeError):
                     module.validate_and_filter(
-                        d, b, decision(SearchTier.DEEP),
+                        d, b, answer_state(fail_closed=True),
                         claim_discoverer=module.LLMClaimDiscoverer(llm),
                         semantic_verifier=StaticSemanticVerifier({}),
                     )
@@ -655,7 +670,7 @@ class VerifierFailureTests(unittest.TestCase):
                 raise RuntimeError("boom")
 
         report = module.validate_and_filter(
-            d, b, decision(SearchTier.DEEP),
+            d, b, answer_state(fail_closed=True),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=FailingVerifier(),
         )

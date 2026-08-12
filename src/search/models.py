@@ -272,6 +272,21 @@ class ValidatorRequirement(StrEnum):
     FAIL_CLOSED = "fail_closed"
 
 
+class ValidatorStatus(StrEnum):
+    PASSED = "passed"
+    FILTERED = "filtered"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+
+
+class RenderOutcome(StrEnum):
+    ANSWER = "answer"
+    PARTIAL = "partial"
+    CONFLICT = "conflict"
+    FAILURE = "failure"
+    VALIDATION_FAILURE = "validation_failure"
+
+
 PROVIDER_STATUS_FAILURE_CODES: Mapping[ProviderStatus, SearchFailureCode | None] = MappingProxyType(
     {
         ProviderStatus.SUCCESS: None,
@@ -1304,9 +1319,15 @@ class ValidationReport:
     removed_block_ids: tuple[str, ...]
     claim_labels: Mapping[str, SupportLabel]
     limitations: tuple[str, ...]
+    status: ValidatorStatus = ValidatorStatus.PASSED
+    effective_certainty: AnswerCertainty = AnswerCertainty.VERIFIED
+    effective_claim_scope: AllowedClaimScope = AllowedClaimScope.ALL_SUPPORTED
 
     def __post_init__(self) -> None:
         _require_record(self.draft, GroundedDraft, "draft")
+        _require_enum(self.status, ValidatorStatus, "status")
+        _require_enum(self.effective_certainty, AnswerCertainty, "effective_certainty")
+        _require_enum(self.effective_claim_scope, AllowedClaimScope, "effective_claim_scope")
         labels = dict(self.claim_labels)
         if any(type(key) is not str or not isinstance(value, SupportLabel) for key, value in labels.items()):
             raise TypeError("claim_labels must map strings to SupportLabel")
@@ -1315,6 +1336,39 @@ class ValidationReport:
         overlap = retained_ids.intersection(self.removed_block_ids)
         if overlap:
             raise ValueError("retained and removed block sets must be disjoint")
+
+
+@dataclass(frozen=True)
+class RenderState:
+    outcome: RenderOutcome
+    visible_blocks: tuple[AnswerBlock, ...]
+    visible_claims: tuple[Claim, ...]
+    citation_map: Mapping[str, int]
+    used_sources: tuple[EvidenceItem, ...]
+    conflict_groups: tuple[EvidenceConflict, ...]
+    disclosure_codes: tuple[DisclosureCode, ...]
+    warning_codes: tuple[WarningCode, ...]
+
+    def __post_init__(self) -> None:
+        _require_enum(self.outcome, RenderOutcome, "outcome")
+        citation_map = dict(self.citation_map)
+        if any(
+            type(key) is not str or type(value) is not int or value <= 0
+            for key, value in citation_map.items()
+        ):
+            raise TypeError("citation_map must map strings to positive integers")
+        _normalize_fields(
+            self,
+            visible_blocks=_records(self.visible_blocks, AnswerBlock, "visible_blocks"),
+            visible_claims=_records(self.visible_claims, Claim, "visible_claims"),
+            citation_map=MappingProxyType(citation_map),
+            used_sources=_records(self.used_sources, EvidenceItem, "used_sources"),
+            conflict_groups=_records(self.conflict_groups, EvidenceConflict, "conflict_groups"),
+            disclosure_codes=_tuple(self.disclosure_codes),
+            warning_codes=_tuple(self.warning_codes),
+        )
+        _require_enum_values(self.disclosure_codes, DisclosureCode, "disclosure_codes")
+        _require_enum_values(self.warning_codes, WarningCode, "warning_codes")
 
 
 @dataclass(frozen=True)
