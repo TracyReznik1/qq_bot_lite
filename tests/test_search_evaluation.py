@@ -200,6 +200,8 @@ def _raw_trace_row(case_id, route="light", **overrides):
         "supported_topic_ids": ["topic-1"] if searched else [],
         "missing_topic_ids": [],
         "topic_freshness": ([{"topic_id": "topic-1", "freshness": "not_required"}] if searched else []),
+        "judge_anomaly_codes": [],
+        "judge_anomaly_count": 0,
         "answer_generation_mode": "grounded" if searched else "plain",
         "answer_certainty": "verified" if searched else "unverified",
         "answer_claim_scope": "all_supported" if searched else "no_external_factual_claims",
@@ -786,6 +788,7 @@ class TraceAcceptanceContractTests(unittest.TestCase):
                 "must_search", "retrieval_reason_codes",
                 "repair_reason_codes", "repair_target_topic_ids",
                 "supported_topic_ids", "missing_topic_ids", "topic_freshness",
+                "judge_anomaly_codes", "judge_anomaly_count",
                 "answer_certainty", "answer_claim_scope",
                 "answer_disclosure_codes", "answer_warning_codes",
                 "validator_status", "validator_retained_claim_count",
@@ -893,6 +896,33 @@ class TraceAcceptanceContractTests(unittest.TestCase):
         trace = _raw_trace_row("topic-freshness")
         trace["topic_freshness"] = [{"topic_id": "当前价格", "freshness": "satisfied"}]
         self.assertIn("invalid topic_id", "\n".join(tool._validate_trace(trace, 1)))
+
+    def test_trace_accepts_only_closed_bounded_judge_anomaly_metadata(self):
+        tool = evaluate_tool()
+        trace = _runtime_trace_row()
+        trace["judge_anomaly_codes"] = ["missing_candidate", "unknown_candidate"]
+        trace["judge_anomaly_count"] = 3
+        self.assertEqual([], tool._validate_trace(trace, 1))
+
+        trace["judge_anomaly_codes"] = ["C99"]
+        self.assertIn("judge_anomaly_codes", "\n".join(tool._validate_trace(trace, 1)))
+        trace["judge_anomaly_codes"] = ["missing_candidate"]
+        trace["judge_anomaly_count"] = 9
+        self.assertIn("judge_anomaly_count", "\n".join(tool._validate_trace(trace, 1)))
+
+    def test_trace_rejects_duplicate_judge_anomaly_codes(self):
+        tool = evaluate_tool()
+        trace = _runtime_trace_row()
+        trace["judge_anomaly_codes"] = [
+            "missing_candidate",
+            "missing_candidate",
+        ]
+        trace["judge_anomaly_count"] = 2
+
+        self.assertIn(
+            "duplicate judge_anomaly_codes",
+            "\n".join(tool._validate_trace(trace, 1)),
+        )
 
     def test_external_case_id_labels_control_d_factual_not_embedded_trace_label(self):
         tool = evaluate_tool()

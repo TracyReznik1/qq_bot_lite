@@ -24,6 +24,7 @@ from src.search.models import (
     Freshness,
     FreshnessEligibility,
     FreshnessRequirement,
+    JudgeAnomalyCode,
     ProviderAttempt,
     RepairReasonCode,
     RequiredTopic,
@@ -68,6 +69,8 @@ Return exactly this JSON object:
 }
 
 Rules:
+- return exactly one candidate judgement for every supplied candidate_id
+- do not omit, merge, duplicate, rename, or invent candidate_id values
 - relevance is the admission gate; an irrelevant page cannot be rescued by
   a primary-looking domain
 - primary requires the page publisher to actually be the query entity
@@ -99,6 +102,51 @@ _VERDICT_KEYS = frozenset(
         "conflict_relation",
     }
 )
+
+
+class _DuplicateAwareDict(dict[str, Any]):
+    """JSON object preserving whether a key appeared more than once."""
+
+    def __init__(self, pairs: Sequence[tuple[str, Any]]) -> None:
+        super().__init__()
+        duplicate_keys: list[str] = []
+        for key, value in pairs:
+            if key in self:
+                duplicate_keys.append(key)
+            self[key] = value
+        self.duplicate_keys = frozenset(duplicate_keys)
+
+
+class _JudgeParseResult(dict[str, Any]):
+    """Verdicts plus private, body-free parse diagnostics for assembly."""
+
+    def __init__(
+        self,
+        *args: Any,
+        anomaly_codes: Sequence[JudgeAnomalyCode] = (),
+        anomaly_count: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.judge_anomaly_codes = tuple(anomaly_codes)
+        self.judge_anomaly_count = anomaly_count
+
+
+def _judge_parse_result(
+    rows: Mapping[str, Any] | None = None,
+    *,
+    anomaly_codes: Sequence[JudgeAnomalyCode] = (),
+    anomaly_count: int = 0,
+) -> _JudgeParseResult:
+    return _JudgeParseResult(
+        rows or {},
+        anomaly_codes=anomaly_codes,
+        anomaly_count=anomaly_count,
+    )
+
+
+def _has_duplicate_keys(value: Any) -> bool:
+    return isinstance(value, _DuplicateAwareDict) and bool(value.duplicate_keys)
 
 
 class LLMEvidenceJudge:
@@ -188,35 +236,69 @@ def _parse_judge_output(
     *,
     candidate_ids: tuple[str, ...],
     allowed_topic_ids: frozenset[str],
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, Any]:
     text = str(content or "").strip()
     if not text:
-        return {}
+        return _judge_parse_result()
     fenced = _FENCE_PATTERN.fullmatch(text)
     if fenced is not None:
         text = fenced.group("body").strip()
     try:
-        payload = json.loads(text)
+        payload = json.loads(text, object_pairs_hook=_DuplicateAwareDict)
     except (json.JSONDecodeError, ValueError):
-        return {}
-    if not isinstance(payload, dict) or set(payload) != {"candidates", "gap_hints"}:
-        return {}
+        return _judge_parse_result()
+    if (
+        not isinstance(payload, dict)
+        or _has_duplicate_keys(payload)
+        or set(payload) != {"candidates", "gap_hints"}
+    ):
+        return _judge_parse_result()
     candidates = payload.get("candidates")
-    if not isinstance(candidates, dict) or set(candidates) != set(candidate_ids):
-        return {}
-    parsed = {
-        candidate_id: candidates[candidate_id]
-        for candidate_id in candidate_ids
+    if not isinstance(candidates, dict):
+        return _judge_parse_result()
+    expected_ids = frozenset(candidate_ids)
+    anomaly_codes: list[JudgeAnomalyCode] = []
+    anomaly_count = 0
+
+    def record_anomaly(code: JudgeAnomalyCode, count: int = 1) -> None:
+        nonlocal anomaly_count
+        anomaly_count += count
+        if code not in anomaly_codes:
+            anomaly_codes.append(code)
+
+    duplicate_ids = (
+        candidates.duplicate_keys
+        if isinstance(candidates, _DuplicateAwareDict)
+        else frozenset()
+    )
+    parsed: dict[str, Any] = {}
+    for candidate_id in candidate_ids:
+        if candidate_id in duplicate_ids:
+            record_anomaly(JudgeAnomalyCode.DUPLICATE_CANDIDATE)
+            continue
+        if candidate_id not in candidates:
+            record_anomaly(JudgeAnomalyCode.MISSING_CANDIDATE)
+            continue
+        raw = candidates[candidate_id]
         if _parse_verdict(
-            candidates[candidate_id],
+            raw,
             candidate_id=candidate_id,
             allowed_topic_ids=allowed_topic_ids,
-        )
-    }
+        ):
+            parsed[candidate_id] = raw
+        else:
+            record_anomaly(JudgeAnomalyCode.MALFORMED_CANDIDATE)
+    for candidate_id in candidates:
+        if candidate_id not in expected_ids:
+            record_anomaly(JudgeAnomalyCode.UNKNOWN_CANDIDATE)
     hints = _parse_gap_hints(payload.get("gap_hints"), allowed_topic_ids)
     if hints:
         parsed[_GAP_HINTS_KEY] = hints
-    return parsed
+    return _JudgeParseResult(
+        parsed,
+        anomaly_codes=anomaly_codes,
+        anomaly_count=min(anomaly_count, 8),
+    )
 
 
 def _parse_gap_hints(
@@ -228,7 +310,11 @@ def _parse_gap_hints(
     hints: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for item in raw:
-        if not isinstance(item, dict) or set(item) != {"reason_code", "target_topic_id"}:
+        if (
+            not isinstance(item, dict)
+            or _has_duplicate_keys(item)
+            or set(item) != {"reason_code", "target_topic_id"}
+        ):
             continue
         reason_code = item.get("reason_code")
         target_topic_id = item.get("target_topic_id")
@@ -282,13 +368,17 @@ def _parse_verdict(
     allowed_topic_ids: frozenset[str],
 ) -> dict[str, Any]:
     """Parse one complete, closed judge row or reject it atomically."""
-    if not isinstance(raw, dict) or set(raw) != _VERDICT_KEYS:
+    if (
+        not isinstance(raw, dict)
+        or _has_duplicate_keys(raw)
+        or set(raw) != _VERDICT_KEYS
+    ):
         return {}
     if raw.get("candidate_id") != candidate_id:
         return {}
     relevance = _parse_enum(raw.get("relevance"), CandidateRelevance)
     relation = _parse_enum(raw.get("source_relation"), SourceRelation)
-    if relevance is not CandidateRelevance.DIRECT or relation is None:
+    if relevance is None or relation is None:
         return {}
 
     publisher_match = raw.get("publisher_entity_match")
@@ -322,7 +412,11 @@ def _parse_verdict(
     ):
         return {}
     freshness_by_topic = raw.get("freshness_by_topic")
-    if not isinstance(freshness_by_topic, dict) or set(freshness_by_topic) != set(supported):
+    if (
+        not isinstance(freshness_by_topic, dict)
+        or _has_duplicate_keys(freshness_by_topic)
+        or set(freshness_by_topic) != set(supported)
+    ):
         return {}
     parsed_freshness = {
         topic_id: _parse_enum(freshness_by_topic.get(topic_id), FreshnessEligibility)
@@ -436,12 +530,22 @@ class EvidenceAssembler:
         previous: EvidenceBundle | None = None,
         timeout_seconds: float | None = None,
     ) -> EvidenceBundle:
-        del previous
         indexed = {
             f"C{index}": candidate for index, candidate in enumerate(candidates, 1)
         }
         judged = self._judge_output(plan, indexed, timeout_seconds=timeout_seconds)
         gap_hints = _normalize_gap_hints(judged.get(_GAP_HINTS_KEY))
+        judge_anomaly_codes, judge_anomaly_count = _normalize_judge_anomalies(
+            getattr(judged, "judge_anomaly_codes", ()),
+            getattr(judged, "judge_anomaly_count", 0),
+        )
+        if isinstance(previous, EvidenceBundle):
+            judge_anomaly_codes, judge_anomaly_count = _merge_judge_anomalies(
+                previous.judge_anomaly_codes,
+                previous.judge_anomaly_count,
+                judge_anomaly_codes,
+                judge_anomaly_count,
+            )
         allowed_topic_ids = frozenset(
             topic.topic_id for topic in plan.required_topics
         )
@@ -529,6 +633,8 @@ class EvidenceAssembler:
             ordered,
             judged_freshness_by_canonical,
             gap_hints=gap_hints,
+            judge_anomaly_codes=judge_anomaly_codes,
+            judge_anomaly_count=judge_anomaly_count,
         )
         return bundle
 
@@ -592,6 +698,8 @@ class EvidenceAssembler:
         ],
         *,
         gap_hints: Sequence[tuple[str, str]] = (),
+        judge_anomaly_codes: Sequence[JudgeAnomalyCode] = (),
+        judge_anomaly_count: int = 0,
     ) -> EvidenceBundle:
         assessments, eligible_evidence_ids_by_topic = _assess_material_topics(
             plan,
@@ -676,6 +784,8 @@ class EvidenceAssembler:
             supported_topic_ids=supported_topic_ids,
             missing_topic_ids=missing_topic_ids,
             gap_hints=_normalize_gap_hints(gap_hints),
+            judge_anomaly_codes=tuple(judge_anomaly_codes),
+            judge_anomaly_count=judge_anomaly_count,
         )
 
 
@@ -711,6 +821,39 @@ _GAP_HINT_REASONS = frozenset(
         RepairReasonCode.PREMISE_MISMATCH.value,
     }
 )
+
+
+def _normalize_judge_anomalies(
+    raw_codes: Any,
+    raw_count: Any,
+) -> tuple[tuple[JudgeAnomalyCode, ...], int]:
+    """Keep only closed, aggregate Judge diagnostics out of Evidence."""
+    if (
+        isinstance(raw_codes, (str, bytes, Mapping))
+        or not isinstance(raw_codes, (tuple, list))
+        or type(raw_count) is not int
+        or raw_count < 0
+    ):
+        return (), 0
+    try:
+        codes = tuple(JudgeAnomalyCode(code) for code in raw_codes)
+    except (TypeError, ValueError):
+        return (), 0
+    if len(set(codes)) != len(codes) or raw_count < len(codes):
+        return (), 0
+    return codes, min(raw_count, 8)
+
+
+def _merge_judge_anomalies(
+    previous_codes: Sequence[JudgeAnomalyCode],
+    previous_count: int,
+    current_codes: Sequence[JudgeAnomalyCode],
+    current_count: int,
+) -> tuple[tuple[JudgeAnomalyCode, ...], int]:
+    """Preserve body-free Judge diagnostics across the one allowed repair."""
+    codes = tuple(dict.fromkeys((*previous_codes, *current_codes)))
+    return codes, min(previous_count + current_count, 8)
+
 
 _REASON_DECLARATION_ORDER = (
     RepairReasonCode.MISSING_TOPIC,

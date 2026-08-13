@@ -190,6 +190,10 @@ REPAIR_REASON_CODES = {
     "missing_topic", "stale_evidence", "source_conflict", "entity_ambiguity",
     "premise_mismatch", "source_quality_gap", "content_unreadable",
 }
+JUDGE_ANOMALY_CODES = {
+    "missing_candidate", "unknown_candidate", "malformed_candidate",
+    "duplicate_candidate",
+}
 FRESHNESS_ELIGIBILITY = {"not_required", "satisfied", "stale", "unknown"}
 ANSWER_GENERATION_MODES = {"plain", "grounded", "fixed"}
 ANSWER_CERTAINTIES = {"verified", "limited", "conflicting", "unverified"}
@@ -247,7 +251,8 @@ TRACE_FIELDS = {
     "repair_query_count", "retrieval_stop_reason", *LATENCY_FIELDS,
     "must_search", "retrieval_reason_codes", "repair_reason_codes",
     "repair_target_topic_ids", "supported_topic_ids", "missing_topic_ids",
-    "topic_freshness", "answer_generation_mode", "answer_certainty",
+    "topic_freshness", "judge_anomaly_codes", "judge_anomaly_count",
+    "answer_generation_mode", "answer_certainty",
     "answer_claim_scope", "answer_disclosure_codes", "answer_warning_codes",
     "validator_status", "validator_retained_claim_count",
     "validator_removed_block_count", "render_outcome", "render_citation_count",
@@ -2242,7 +2247,7 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         "content_read_count", "semantic_query_count", "repair_query_count",
         "citable_evidence_count", "claim_count", "supported_claim_count", "citation_count",
         "validator_retained_claim_count", "validator_removed_block_count",
-        "render_citation_count", "render_source_count",
+        "render_citation_count", "render_source_count", "judge_anomaly_count",
     ):
         if not _is_int(trace.get(name)):
             errors.append(f"{prefix} {name} must be a non-negative integer")
@@ -2253,12 +2258,24 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     for name, allowed in (
         ("retrieval_reason_codes", RETRIEVAL_COMPLEXITY_CODES),
         ("repair_reason_codes", REPAIR_REASON_CODES),
+        ("judge_anomaly_codes", JUDGE_ANOMALY_CODES),
         ("answer_disclosure_codes", ANSWER_DISCLOSURE_CODES),
         ("answer_warning_codes", WARNING_CODES),
     ):
         values = trace.get(name)
         if not _is_string_list(values) or any(not _closed(value, allowed) for value in values or ()):
             errors.append(f"{prefix} invalid {name}")
+    judge_codes = trace.get("judge_anomaly_codes")
+    judge_count = trace.get("judge_anomaly_count")
+    if (
+        _is_int(judge_count)
+        and judge_count > 8
+    ):
+        errors.append(f"{prefix} judge_anomaly_count must not exceed eight")
+    if isinstance(judge_codes, list) and _is_int(judge_count) and judge_count < len(judge_codes):
+        errors.append(f"{prefix} judge_anomaly_count cannot be smaller than code count")
+    if isinstance(judge_codes, list) and len(set(judge_codes)) != len(judge_codes):
+        errors.append(f"{prefix} duplicate judge_anomaly_codes")
     for name in ("repair_target_topic_ids", "supported_topic_ids", "missing_topic_ids"):
         if not _is_string_list(trace.get(name)) or any(
             not isinstance(value, str) or OPAQUE_TOPIC_ID_PATTERN.fullmatch(value) is None

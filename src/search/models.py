@@ -225,6 +225,15 @@ class RepairReasonCode(StrEnum):
     CONTENT_UNREADABLE = "content_unreadable"
 
 
+class JudgeAnomalyCode(StrEnum):
+    """Closed, body-free parse anomalies from one Evidence Judge response."""
+
+    MISSING_CANDIDATE = "missing_candidate"
+    UNKNOWN_CANDIDATE = "unknown_candidate"
+    MALFORMED_CANDIDATE = "malformed_candidate"
+    DUPLICATE_CANDIDATE = "duplicate_candidate"
+
+
 class RetrievalStopReason(StrEnum):
     EVIDENCE_SUFFICIENT = "evidence_sufficient"
     NO_REPAIR_BENEFIT = "no_repair_benefit"
@@ -385,6 +394,18 @@ def _trace_enum_values(
     result = _tuple(values)
     _require_enum_values(result, enum_type, field_name)
     return result
+
+
+def _validate_judge_anomalies(
+    codes: tuple[JudgeAnomalyCode, ...],
+    count: Any,
+) -> None:
+    if type(count) is not int or count < 0 or count > 8:
+        raise ValueError("judge_anomaly_count must be an integer from zero through eight")
+    if len(set(codes)) != len(codes):
+        raise ValueError("judge_anomaly_codes must be unique")
+    if count < len(codes):
+        raise ValueError("judge_anomaly_count cannot be smaller than its code count")
 
 
 def _trace_metadata_ids(values: Any, field_name: str) -> tuple[str, ...]:
@@ -1020,14 +1041,20 @@ class EvidenceBundle:
     supported_topic_ids: tuple[str, ...] = field(kw_only=True)
     missing_topic_ids: tuple[str, ...] = field(kw_only=True)
     gap_hints: tuple[tuple[str, str], ...] = field(kw_only=True, default=())
+    judge_anomaly_codes: tuple[JudgeAnomalyCode, ...] = field(kw_only=True, default=())
+    judge_anomaly_count: int = field(kw_only=True, default=0)
 
     def __post_init__(self) -> None:
         _require_record(self.decision, RetrievalDecision, "decision")
         _require_record(self.plan, SearchPlan, "plan")
         _require_record(self.gap_analysis, EvidenceGapAnalysis, "gap_analysis")
         _require_record(self.repair_plan, RepairPlan, "repair_plan")
-        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"), topic_assessments=_records(self.topic_assessments, TopicAssessment, "topic_assessments"), supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"), missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"), gap_hints=_gap_hint_pairs(self.gap_hints))
+        _normalize_fields(self, attempts=_records(self.attempts, ProviderAttempt, "attempts"), initial_evidence_ids=_strings(self.initial_evidence_ids, "initial_evidence_ids"), evidence_items=_records(self.evidence_items, EvidenceItem, "evidence_items"), missing_claim_topics=_strings(self.missing_claim_topics, "missing_claim_topics"), weak_source_topics=_strings(self.weak_source_topics, "weak_source_topics"), conflict_groups=_strings(self.conflict_groups, "conflict_groups"), limitations=_strings(self.limitations, "limitations"), conflicts=_records(self.conflicts, EvidenceConflict, "conflicts"), topic_assessments=_records(self.topic_assessments, TopicAssessment, "topic_assessments"), supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"), missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"), gap_hints=_gap_hint_pairs(self.gap_hints), judge_anomaly_codes=_trace_enum_values(self.judge_anomaly_codes, JudgeAnomalyCode, "judge_anomaly_codes"))
         _require_enum(self.evidence_state, EvidenceState, "evidence_state")
+        _validate_judge_anomalies(
+            self.judge_anomaly_codes,
+            self.judge_anomaly_count,
+        )
         material_topic_ids = tuple(
             topic.topic_id for topic in self.plan.required_topics if topic.material
         )
@@ -1467,6 +1494,8 @@ class SearchTrace:
     supported_topic_ids: tuple[str, ...] = ()
     missing_topic_ids: tuple[str, ...] = ()
     topic_freshness: tuple[TopicFreshnessTraceEntry, ...] = ()
+    judge_anomaly_codes: tuple[JudgeAnomalyCode, ...] = ()
+    judge_anomaly_count: int = 0
     answer_generation_mode: AnswerGenerationMode | None = None
     answer_certainty: AnswerCertainty | None = None
     answer_claim_scope: AllowedClaimScope | None = None
@@ -1526,6 +1555,15 @@ class SearchTrace:
             TopicFreshnessTraceEntry,
             "topic_freshness",
         )
+        self.judge_anomaly_codes = _trace_enum_values(
+            self.judge_anomaly_codes,
+            JudgeAnomalyCode,
+            "judge_anomaly_codes",
+        )
+        _validate_judge_anomalies(
+            self.judge_anomaly_codes,
+            self.judge_anomaly_count,
+        )
         for enum_value, enum_type, field_name in (
             (self.answer_generation_mode, AnswerGenerationMode, "answer_generation_mode"),
             (self.answer_certainty, AnswerCertainty, "answer_certainty"),
@@ -1550,6 +1588,7 @@ class SearchTrace:
             "validator_removed_block_count",
             "render_citation_count",
             "render_source_count",
+            "judge_anomaly_count",
         ):
             value = getattr(self, field_name)
             if type(value) is not int or value < 0:
@@ -1579,6 +1618,20 @@ class SearchTrace:
         )
 
     def to_log_dict(self) -> dict[str, Any]:
+        try:
+            judge_anomaly_codes = _trace_enum_values(
+                self.judge_anomaly_codes,
+                JudgeAnomalyCode,
+                "judge_anomaly_codes",
+            )
+            _validate_judge_anomalies(
+                judge_anomaly_codes,
+                self.judge_anomaly_count,
+            )
+            judge_anomaly_count = self.judge_anomaly_count
+        except (TypeError, ValueError):
+            judge_anomaly_codes = ()
+            judge_anomaly_count = 0
         executed_metadata = tuple(
             {
                 "query_index": entry.query_index,
@@ -1621,6 +1674,8 @@ class SearchTrace:
                 }
                 for entry in self.topic_freshness
             ),
+            "judge_anomaly_codes": judge_anomaly_codes,
+            "judge_anomaly_count": judge_anomaly_count,
             "answer_generation_mode": self.answer_generation_mode,
             "answer_certainty": self.answer_certainty,
             "answer_claim_scope": self.answer_claim_scope,

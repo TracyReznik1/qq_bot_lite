@@ -1494,6 +1494,54 @@ class OrchestratorTraceTests(unittest.TestCase):
         self.assertTrue(attempt["available"])
         self.assertTrue(attempt["invocation_started"])
 
+    def test_evidence_judge_anomalies_flow_to_the_body_free_trace(self):
+        m = importlib.import_module("src.search.models")
+
+        def row(candidate_id):
+            return {
+                "candidate_id": candidate_id,
+                "relevance": "direct",
+                "source_relation": "independent",
+                "publisher_entity_match": False,
+                "ownership_basis": None,
+                "publisher": None,
+                "supported_topic_ids": ["topic-1"],
+                "freshness_by_topic": {"topic-1": "not_required"},
+                "conflict_key": None,
+                "conflict_value": None,
+                "conflict_relation": None,
+            }
+
+        class StaticLLM:
+            def chat(self, *_args, **_kwargs):
+                return SimpleNamespace(
+                    content=json.dumps(
+                        {"candidates": {"C1": row("C1"), "C99": row("C99")}, "gap_hints": []}
+                    )
+                )
+
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=self.module.LLMEvidenceJudge(StaticLLM()),
+            providers=(_FakeProvider(hits=[_hit()]),),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+
+        result = orchestrator.run(request())
+
+        self.assertEqual(
+            (m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,),
+            result.evidence.judge_anomaly_codes,
+        )
+        self.assertEqual(1, result.evidence.judge_anomaly_count)
+        logged = result.trace.to_log_dict()
+        self.assertEqual(["unknown_candidate"], logged["judge_anomaly_codes"])
+        self.assertEqual(1, logged["judge_anomaly_count"])
+        self.assertNotIn("C99", json.dumps(logged))
+
     def test_request_local_redaction_audit_flows_from_plan_and_repair_to_trace(self):
         provider = _FakeProvider(hits=[_hit()] * 3)
         orchestrator = self.module.SearchOrchestrator(
@@ -1873,6 +1921,78 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         self.assertEqual(2, judge.calls)
         self.assertTrue(result.evidence.repair_plan.triggered)
         self.assertTrue(result.trace.adaptive_repair_round_started)
+
+    def test_repair_preserves_first_round_judge_anomalies_in_final_trace(self):
+        m = importlib.import_module("src.search.models")
+
+        def verdict(candidate_id, topic_ids=()):
+            return {
+                "candidate_id": candidate_id,
+                "relevance": "direct",
+                "source_relation": "independent",
+                "publisher_entity_match": False,
+                "ownership_basis": None,
+                "publisher": None,
+                "supported_topic_ids": list(topic_ids),
+                "freshness_by_topic": {
+                    topic_id: "not_required" for topic_id in topic_ids
+                },
+                "conflict_key": None,
+                "conflict_value": None,
+                "conflict_relation": None,
+            }
+
+        class TwoRoundLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, **_kwargs):
+                self.calls += 1
+                payload = json.loads(messages[1]["content"])
+                candidate_ids = [
+                    item["candidate_id"] for item in payload["candidates"]
+                ]
+                topic_ids = [
+                    item["topic_id"] for item in payload["required_topics"]
+                ]
+                if self.calls == 1:
+                    candidates = {
+                        "C1": verdict("C1"),
+                        "C99": verdict("C99"),
+                    }
+                else:
+                    candidates = {
+                        candidate_id: verdict(candidate_id, topic_ids)
+                        for candidate_id in candidate_ids
+                    }
+                return SimpleNamespace(
+                    content=json.dumps({"candidates": candidates, "gap_hints": []})
+                )
+
+        llm = TwoRoundLLM()
+        orchestrator = self._orchestrator(
+            providers=(self._per_query_provider(),),
+            judge=self.module.LLMEvidenceJudge(llm),
+        )
+
+        result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
+
+        self.assertEqual(2, llm.calls)
+        self.assertTrue(result.trace.adaptive_repair_round_started)
+        self.assertEqual(2, result.evidence.retrieval_round_count)
+        self.assertEqual(
+            (
+                m.JudgeAnomalyCode.MISSING_CANDIDATE,
+                m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,
+            ),
+            result.evidence.judge_anomaly_codes,
+        )
+        self.assertEqual(3, result.evidence.judge_anomaly_count)
+        self.assertEqual(
+            result.evidence.judge_anomaly_codes,
+            result.trace.judge_anomaly_codes,
+        )
+        self.assertEqual(3, result.trace.judge_anomaly_count)
 
     def test_light_route_never_dispatches_repair(self):
         m = importlib.import_module("src.search.models")

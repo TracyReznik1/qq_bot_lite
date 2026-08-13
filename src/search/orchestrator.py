@@ -837,6 +837,8 @@ class SearchOrchestrator:
             TopicFreshnessTraceEntry(assessment.topic_id, assessment.freshness)
             for assessment in bundle.topic_assessments
         )
+        trace.judge_anomaly_codes = bundle.judge_anomaly_codes
+        trace.judge_anomaly_count = bundle.judge_anomaly_count
         gap = bundle.gap_analysis
         if gap.repair_reason_codes:
             trace.repair_reason_codes = gap.repair_reason_codes

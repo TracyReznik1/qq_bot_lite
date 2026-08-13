@@ -383,6 +383,40 @@ class EvidenceAdmissionTests(unittest.TestCase):
         bundle = assembler.assemble(plan(), (candidate(content="背景相关但不回答问题"),))
         self.assertEqual(bundle.evidence_items, ())
 
+    def test_closed_non_direct_rows_are_not_admitted_but_do_not_fail_parsing(self):
+        judge = StaticEvidenceJudge(
+            {
+                "C1": judge_ok(
+                    "C1",
+                    relevance="irrelevant",
+                    relation="unknown",
+                    supported=(),
+                    freshness_by_topic={},
+                ),
+                "C2": judge_ok(
+                    "C2",
+                    relevance="contextual",
+                    relation="unknown",
+                    supported=(),
+                    freshness_by_topic={},
+                ),
+                "C3": judge_ok("C3", relevance="direct", relation="independent"),
+            }
+        )
+        bundle = self.module.EvidenceAssembler(judge).assemble(
+            plan(),
+            (
+                candidate(url="https://irrelevant.example/page"),
+                candidate(url="https://contextual.example/page"),
+                candidate(url="https://direct.example/page"),
+            ),
+        )
+
+        self.assertEqual(
+            ("https://direct.example/page",),
+            tuple(item.url for item in bundle.evidence_items),
+        )
+
     def test_judge_receives_required_topics_and_remaining_time(self):
         calls = []
 
@@ -466,6 +500,24 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = evidence_module()
 
+    @staticmethod
+    def _candidates(count: int):
+        return tuple(
+            candidate(url=f"https://candidate-{index}.example/release")
+            for index in range(1, count + 1)
+        )
+
+    def _judge(self, content, *, candidate_count: int):
+        class StaticLLM:
+            def chat(self, *_args, **_kwargs):
+                return type("Response", (), {"content": content})()
+
+        return self.module.LLMEvidenceJudge(StaticLLM()).judge(
+            "question",
+            self._candidates(candidate_count),
+            required_topics=({"topic_id": "topic-1", "label": "release"},),
+        )
+
     def test_llm_judge_accepts_only_closed_outer_topic_id_schema(self):
         row = topic_judge_ok(
             "C1",
@@ -529,7 +581,7 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
 
     def test_llm_judge_keeps_valid_rows_when_another_row_fails_closed(self):
         valid = topic_judge_ok("C1")
-        invalid = topic_judge_ok("C2") | {"relevance": "contextual"}
+        invalid = topic_judge_ok("C2") | {"unreviewed_field": True}
 
         class StaticLLM:
             def chat(self, *_args, **_kwargs):
@@ -553,6 +605,186 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
         )
 
         self.assertEqual({"C1": valid}, result)
+
+    def test_llm_judge_preserves_closed_non_direct_rows_without_anomalies(self):
+        irrelevant = topic_judge_ok(
+            "C1",
+            supported_topic_ids=(),
+            freshness_by_topic={},
+            relation="unknown",
+        ) | {"relevance": "irrelevant"}
+        contextual = topic_judge_ok(
+            "C2",
+            supported_topic_ids=(),
+            freshness_by_topic={},
+            relation="unknown",
+        ) | {"relevance": "contextual"}
+        direct = topic_judge_ok("C3")
+
+        result = self._judge(
+            json.dumps(
+                {
+                    "candidates": {
+                        "C1": irrelevant,
+                        "C2": contextual,
+                        "C3": direct,
+                    },
+                    "gap_hints": [],
+                }
+            ),
+            candidate_count=3,
+        )
+
+        self.assertEqual(
+            {"C1": irrelevant, "C2": contextual, "C3": direct},
+            result,
+        )
+        self.assertEqual((), result.judge_anomaly_codes)
+        self.assertEqual(0, result.judge_anomaly_count)
+
+    def test_llm_judge_preserves_a_complete_five_candidate_batch(self):
+        rows = {
+            f"C{index}": topic_judge_ok(f"C{index}")
+            for index in range(1, 6)
+        }
+
+        result = self._judge(
+            json.dumps({"candidates": rows, "gap_hints": []}),
+            candidate_count=5,
+        )
+
+        self.assertEqual(rows, result)
+
+    def test_llm_judge_keeps_partial_valid_rows_and_records_missing_candidates(self):
+        first = topic_judge_ok("C1")
+        third = topic_judge_ok("C3")
+
+        result = self._judge(
+            json.dumps(
+                {
+                    "candidates": {"C1": first, "C3": third},
+                    "gap_hints": [],
+                }
+            ),
+            candidate_count=5,
+        )
+
+        self.assertEqual(first, result["C1"])
+        self.assertEqual(third, result["C3"])
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MISSING_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(3, result.judge_anomaly_count)
+
+    def test_llm_judge_discards_unknown_candidate_without_poisoning_valid_rows(self):
+        first = topic_judge_ok("C1")
+        unknown = topic_judge_ok("C99")
+
+        result = self._judge(
+            json.dumps(
+                {
+                    "candidates": {"C1": first, "C99": unknown},
+                    "gap_hints": [],
+                }
+            ),
+            candidate_count=1,
+        )
+
+        self.assertEqual(first, result["C1"])
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.UNKNOWN_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(1, result.judge_anomaly_count)
+        self.assertNotIn("C99", result)
+
+    def test_llm_judge_rejects_only_a_malformed_expected_candidate_row(self):
+        first = topic_judge_ok("C1")
+        malformed = topic_judge_ok("C2") | {"unreviewed_field": True}
+
+        result = self._judge(
+            json.dumps(
+                {
+                    "candidates": {"C1": first, "C2": malformed},
+                    "gap_hints": [],
+                }
+            ),
+            candidate_count=2,
+        )
+
+        self.assertEqual(first, result["C1"])
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MALFORMED_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(1, result.judge_anomaly_count)
+
+    def test_llm_judge_rejects_only_a_duplicate_expected_candidate_id(self):
+        first = json.dumps(topic_judge_ok("C1"), ensure_ascii=False)
+        second = json.dumps(topic_judge_ok("C2"), ensure_ascii=False)
+        content = (
+            '{"candidates":{"C1":' + first + ',"C1":' + first
+            + ',"C2":' + second + '},"gap_hints":[]}'
+        )
+
+        result = self._judge(content, candidate_count=2)
+
+        self.assertEqual(topic_judge_ok("C2"), result["C2"])
+        self.assertNotIn("C1", result)
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.DUPLICATE_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(1, result.judge_anomaly_count)
+
+    def test_llm_judge_rejects_a_duplicate_nested_candidate_field_only_for_that_row(self):
+        first = json.dumps(topic_judge_ok("C1"), ensure_ascii=False, separators=(",", ":"))
+        malformed = json.dumps(topic_judge_ok("C2"), ensure_ascii=False, separators=(",", ":"))
+        malformed = malformed.replace(
+            '"relevance":"direct"',
+            '"relevance":"direct","relevance":"irrelevant"',
+            1,
+        )
+        content = (
+            '{"candidates":{"C1":' + first + ',"C2":' + malformed
+            + '},"gap_hints":[]}'
+        )
+
+        result = self._judge(content, candidate_count=2)
+
+        self.assertEqual(topic_judge_ok("C1"), result["C1"])
+        self.assertNotIn("C2", result)
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MALFORMED_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(1, result.judge_anomaly_count)
+
+    def test_llm_judge_empty_candidates_are_missing_without_a_judgement(self):
+        result = self._judge(
+            json.dumps({"candidates": {}, "gap_hints": []}),
+            candidate_count=2,
+        )
+
+        self.assertEqual({}, result)
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MISSING_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(2, result.judge_anomaly_count)
+
+    def test_llm_judge_bounds_missing_candidate_anomaly_count(self):
+        result = self._judge(
+            json.dumps({"candidates": {}, "gap_hints": []}),
+            candidate_count=9,
+        )
+
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MISSING_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(8, result.judge_anomaly_count)
 
 
 class MaterialTopicEvidenceTests(unittest.TestCase):
@@ -1042,7 +1274,7 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
                 "relevance": "direct",
                 "supported_topic_ids": ["topic-1"],
             },
-            topic_judge_ok("C1") | {"relevance": "contextual"},
+            topic_judge_ok("C1") | {"unreviewed_field": True},
         )
         for row in invalid_rows:
             with self.subTest(row=row):
@@ -1828,6 +2060,54 @@ class EvidenceGapTests(unittest.TestCase):
         gap = assembler.analyze_gap(plan(required_topics=("定义",)), bundle)
         self.assertFalse(gap.repair_eligible)
         self.assertEqual(gap.missing_topic_ids, ())
+
+    def test_repair_assembly_keeps_prior_judge_anomalies_and_combines_counts(self):
+        m = importlib.import_module("src.search.models")
+        from src.search.evidence import _JudgeParseResult
+
+        class TwoRoundJudge:
+            def __init__(self):
+                self.calls = 0
+
+            def judge(self, _question, candidates, **_kwargs):
+                self.calls += 1
+                rows = {
+                    f"C{index}": judge_ok(f"C{index}")
+                    for index, _candidate in enumerate(candidates, 1)
+                }
+                if self.calls == 1:
+                    return _JudgeParseResult(
+                        rows,
+                        anomaly_codes=(m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,),
+                        anomaly_count=1,
+                    )
+                return _JudgeParseResult(
+                    rows,
+                    anomaly_codes=(
+                        m.JudgeAnomalyCode.MISSING_CANDIDATE,
+                        m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,
+                    ),
+                    anomaly_count=7,
+                )
+
+        assembler = self.module.EvidenceAssembler(TwoRoundJudge())
+        search_plan = plan(required_topics=("定义",), route=SearchTier.STANDARD)
+        first = assembler.assemble(search_plan, (candidate(),))
+        repaired = assembler.assemble(
+            search_plan,
+            (candidate(), candidate(url="https://two.example/release")),
+            previous=first,
+        )
+
+        self.assertEqual(
+            (
+                m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,
+                m.JudgeAnomalyCode.MISSING_CANDIDATE,
+            ),
+            repaired.judge_anomaly_codes,
+        )
+        self.assertEqual(8, repaired.judge_anomaly_count)
+        self.assertEqual(first.evidence_state, repaired.evidence_state)
 
 
 class JudgeGapHintTests(unittest.TestCase):

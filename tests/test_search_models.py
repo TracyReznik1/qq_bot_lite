@@ -276,6 +276,10 @@ class SearchModelContractTests(unittest.TestCase):
                 "no_results", "content_unreadable", "insufficient_evidence", "partial_evidence",
                 "source_conflict", "validation_failed", "user_forbid_web",
             },
+            "JudgeAnomalyCode": {
+                "missing_candidate", "unknown_candidate", "malformed_candidate",
+                "duplicate_candidate",
+            },
         }
         for enum_name, values in expected.items():
             enum_type = getattr(m, enum_name)
@@ -425,6 +429,43 @@ class SearchModelContractTests(unittest.TestCase):
         self.assertEqual("tavily", logged["executed_queries"][1]["provider"])
         self.assertEqual(2, logged["semantic_query_count"])
         json.dumps(logged)
+
+    def test_judge_anomaly_trace_is_closed_bounded_and_body_free(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        bundle = replace(
+            fixtures.bundle(),
+            judge_anomaly_codes=(
+                m.JudgeAnomalyCode.MISSING_CANDIDATE,
+                m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,
+            ),
+            judge_anomaly_count=3,
+        )
+        self.assertEqual(3, bundle.judge_anomaly_count)
+        with self.assertRaises((TypeError, ValueError)):
+            replace(bundle, judge_anomaly_codes=("C99",))
+        with self.assertRaises(ValueError):
+            replace(bundle, judge_anomaly_count=1)
+        with self.assertRaises(ValueError):
+            replace(bundle, judge_anomaly_count=9)
+
+        trace = m.SearchTrace(
+            "req-1",
+            m.RequestSource.CHAT,
+            m.SearchTier.LIGHT,
+            judge_anomaly_codes=(m.JudgeAnomalyCode.UNKNOWN_CANDIDATE,),
+            judge_anomaly_count=1,
+        )
+        logged = trace.to_log_dict()
+        self.assertEqual(["unknown_candidate"], logged["judge_anomaly_codes"])
+        self.assertEqual(1, logged["judge_anomaly_count"])
+
+        trace.judge_anomaly_codes = ("C99",)
+        trace.judge_anomaly_count = 99
+        sanitized = trace.to_log_dict()
+        self.assertEqual([], sanitized["judge_anomaly_codes"])
+        self.assertEqual(0, sanitized["judge_anomaly_count"])
+        self.assertNotIn("C99", json.dumps(sanitized))
 
     def test_validation_failed_is_legal_for_a_sufficient_bundle(self):
         m = models()
