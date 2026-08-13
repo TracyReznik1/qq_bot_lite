@@ -305,11 +305,6 @@ class SearchModelContractTests(unittest.TestCase):
             request_source=m.RequestSource.CHAT,
             route=m.SearchTier.STANDARD,
             skip_reason=None,
-            trigger_codes=(m.TriggerCode.FACTUAL_DEFAULT,),
-            factuality=m.Factuality.FACTUAL,
-            external_fact_required=True,
-            program_minimum_tier=m.SearchTier.STANDARD,
-            final_tier=m.SearchTier.STANDARD,
             adaptive_repair_round_started=True,
             executed_queries=(
                 m.QueryTraceEntry(1, m.QueryPurpose.DIRECT, m.SearchRoundKind.INITIAL, "tavily", m.ProviderStatus.SUCCESS, 3),
@@ -428,17 +423,6 @@ class SearchModelContractTests(unittest.TestCase):
         payload = json.dumps(logged)
         for secret in ("sk-1234567890abcdef", "13800138000", "https://private.invalid"):
             self.assertNotIn(secret, payload)
-
-    def test_trace_legacy_positional_constructor_keeps_retrieval_round_slot(self):
-        m = models()
-        trace = m.SearchTrace(
-            "req-1", m.RequestSource.CHAT, m.SearchTier.STANDARD,
-            None, (), None, False, None, None, False, 0, False, False,
-            1,
-        )
-        self.assertEqual(1, trace.retrieval_round_count)
-        self.assertEqual((), trace.initial_query_redaction_codes)
-        self.assertEqual((), trace.adaptive_repair_redaction_codes)
 
     def test_review_contracts_have_exact_public_fields_and_exports(self):
         m = models()

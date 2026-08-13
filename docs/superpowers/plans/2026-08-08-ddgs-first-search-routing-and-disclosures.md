@@ -1,5 +1,11 @@
 # DDGS-First Search Routing and Disclosures Implementation Plan
 
+> **Historical baseline:** This 2026-08-08 plan is superseded by the approved
+> `2026-08-09-websearch-simplification.md` spec/plan. The runtime now keeps only
+> `skip / light / standard` (operational `deep` is removed), DDGS-first with
+> Tavily fallback only, and risk affects the answer policy rather than search
+> depth. Preserved here for historical reasoning only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make DDGS the primary search provider, use Tavily only as the bounded fallback, route high-freshness questions conservatively, skip pure greetings, and show search uncertainty warnings only for high-consequence conversations.

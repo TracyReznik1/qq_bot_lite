@@ -38,7 +38,7 @@ CATEGORY_QUOTAS = {
     "failure_partial_conflict": 20,
 }
 
-TIERS = ("light", "standard", "deep")
+TIERS = ("light", "standard")
 ROUTES = ("skip", *TIERS)
 SKIP_REASONS = {
     "user_forbid_web",
@@ -159,15 +159,6 @@ TIER_BUDGETS: Mapping[str, Mapping[str, int]] = {
         "retrieval_round_count": 2,
         "hard_timeout_ms": 20_000,
     },
-    "deep": {
-        "initial_query_count": 5,
-        "candidate_url_count": 15,
-        "content_read_count": 8,
-        "semantic_query_count": 6,
-        "repair_query_count": 1,
-        "retrieval_round_count": 2,
-        "hard_timeout_ms": 40_000,
-    },
 }
 
 LATENCY_FIELDS = (
@@ -212,10 +203,9 @@ PROVIDER_ATTEMPT_FIELDS = {
     "available", "invocation_started",
 }
 TRACE_FIELDS = {
-    "request_id", "request_source", "route", "skip_reason", "trigger_codes",
-    "factuality", "external_fact_required", "program_minimum_tier", "final_tier",
+    "request_id", "request_source", "route", "skip_reason",
     "orchestrator_started", "initial_query_count", "initial_round_started",
-    "adaptive_repair_round_started", "adaptive_repair_query",
+    "adaptive_repair_round_started",
     "initial_query_redaction_codes", "adaptive_repair_redaction_codes",
     "retrieval_round_count", "executed_queries", "provider_configured",
     "provider_attempts", "provider_invocation_started", "provider_failures",
@@ -1328,7 +1318,7 @@ def in_d_factual(case: Mapping[str, Any]) -> bool:
     return case.get("external_fact_required") is not False
 
 
-_TIER_RANK = {"skip": 0, "light": 1, "standard": 2, "deep": 3}
+_TIER_RANK = {"skip": 0, "light": 1, "standard": 2}
 
 
 def _router_pairs(
@@ -2152,7 +2142,7 @@ def deterministic_invariant_violations(
         }
         if degradation in disclosure_for_failure and disclosure_for_failure[degradation] not in disclosures:
             violations["failure_without_disclosure"] += 1
-        final_tier = _enum_text(_field(trace, "final_tier")) or route
+        final_tier = route
         minimum_tier = audit.get("minimum_tier") or "skip"
         if _TIER_RANK.get(final_tier, -1) < _TIER_RANK.get(minimum_tier, 0):
             violations["final_tier_below_audit_floor"] += 1
@@ -2186,32 +2176,14 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     skip_reason = trace.get("skip_reason")
     if skip_reason is not None and not _closed(skip_reason, SKIP_REASONS):
         errors.append(f"{prefix} invalid skip_reason")
-    trigger_codes = trace.get("trigger_codes")
-    if not _is_string_list(trigger_codes) or any(not _closed(value, TRIGGER_CODES) for value in trigger_codes or ()) or len(set(trigger_codes or ())) != len(trigger_codes or ()):
-        errors.append(f"{prefix} invalid trigger_codes")
-    if trace.get("factuality") is not None and not _closed(trace.get("factuality"), FACTUALITIES):
-        errors.append(f"{prefix} invalid factuality")
-    for name in ("program_minimum_tier", "final_tier"):
-        if trace.get(name) is not None and not _closed(trace.get(name), ROUTES):
-            errors.append(f"{prefix} invalid {name}")
-    if _closed(route, ROUTES) and trace.get("final_tier") != route:
-        errors.append(f"{prefix} final_tier must equal route")
     if route == "skip" and not _closed(trace.get("skip_reason"), SKIP_REASONS):
         errors.append(f"{prefix} skip route requires a closed skip_reason")
     if _closed(route, TIERS) and trace.get("skip_reason") is not None:
         errors.append(f"{prefix} search route cannot set skip_reason")
     if route == "skip" and _closed(skip_reason, SKIP_REASONS):
         contract = SKIP_REASON_CONTRACTS[skip_reason]
-        normalized_triggers = {
-            value for value in (trigger_codes or ()) if isinstance(value, str)
-        }
         skip_contract_valid = (
-            contract["required_triggers"].issubset(normalized_triggers)
-            and normalized_triggers.issubset(contract["allowed_triggers"])
-            and trace.get("factuality") == contract["factuality"]
-            and trace.get("external_fact_required") is False
-            and trace.get("program_minimum_tier") is None
-            and trace.get("provider_configured") is False
+            trace.get("provider_configured") is False
             and trace.get("provider_failures") == []
             and trace.get("evidence_state") is None
             and trace.get("degradation_reason") in contract["allowed_degradations"]
@@ -2220,7 +2192,6 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         if not skip_contract_valid:
             errors.append(f"{prefix} skip contract mismatch for {skip_reason}")
     for name in (
-        "external_fact_required",
         "orchestrator_started", "initial_round_started",
         "adaptive_repair_round_started", "provider_configured",
         "provider_invocation_started", "knowledge_fallback_used", "repair_used",
@@ -2269,19 +2240,6 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
                 errors.append(f"{query_prefix} query_id has conflicting purposes")
             if _is_nonempty_string(query_id) and isinstance(purpose, str):
                 query_purposes[query_id] = purpose
-    adaptive = trace.get("adaptive_repair_query")
-    if adaptive is not None:
-        if not isinstance(adaptive, Mapping):
-            errors.append(f"{prefix} adaptive_repair_query must be an object or null")
-        else:
-            missing_query = sorted(QUERY_FIELDS - set(adaptive))
-            unexpected_query = sorted(set(adaptive) - QUERY_FIELDS)
-            if missing_query:
-                errors.append(f"{prefix} adaptive_repair_query missing fields: {', '.join(missing_query)}")
-            if unexpected_query:
-                errors.append(f"{prefix} adaptive_repair_query unexpected fields: {', '.join(unexpected_query)}")
-            if not _normalized_identifier(adaptive.get("query_id")) or adaptive.get("purpose") != "repair":
-                errors.append(f"{prefix} invalid adaptive_repair_query")
     attempts = trace.get("provider_attempts")
     if not isinstance(attempts, list):
         errors.append(f"{prefix} provider_attempts must be a list")
@@ -2348,8 +2306,6 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     repair_started = trace.get("adaptive_repair_round_started") is True
     if repair_started != (trace.get("repair_used") is True):
         errors.append(f"{prefix} repair_used disagrees with adaptive repair round")
-    if repair_started != (trace.get("adaptive_repair_query") is not None):
-        errors.append(f"{prefix} adaptive_repair_query disagrees with adaptive repair round")
     if repair_started and _repair_query_count(trace) != 1:
         errors.append(f"{prefix} adaptive repair round requires exactly one repair query")
     if not repair_started and trace.get("adaptive_repair_latency_ms") != 0:
@@ -2378,16 +2334,6 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
                 errors.append(
                     f"{prefix} provider attempt {attempt_index} query_id is not an executed query"
                 )
-    if isinstance(adaptive, Mapping) and isinstance(executed, list):
-        repair_ids = {
-            item.get("query_id") for item in executed
-            if isinstance(item, Mapping) and item.get("purpose") == "repair"
-        }
-        if (
-            not _is_nonempty_string(adaptive.get("query_id"))
-            or adaptive.get("query_id") not in repair_ids
-        ):
-            errors.append(f"{prefix} adaptive_repair_query is not an executed repair query")
     if route == "skip" and any(
         bool(trace.get(name)) for name in (
             "orchestrator_started", "initial_round_started", "adaptive_repair_round_started",
@@ -2598,28 +2544,11 @@ def _validate_trace_audit_pair(
     errors: list[str] = []
     if trace.get("skip_reason") != audit.get("skip_reason"):
         errors.append(f"{prefix} trace/audit skip_reason mismatch")
-    if trace.get("external_fact_required") != audit.get("external_fact_required"):
-        errors.append(f"{prefix} trace/audit external_fact_required mismatch")
-    if trace.get("program_minimum_tier") != audit.get("minimum_tier"):
-        errors.append(f"{prefix} trace/audit minimum_tier mismatch")
     if audit.get("skip_reason") == "user_forbid_web":
-        triggers = trace.get("trigger_codes") if isinstance(trace.get("trigger_codes"), list) else []
-        if trace.get("route") != "skip" or "explicit_no_web" not in triggers:
+        if trace.get("route") != "skip":
             errors.append(f"{prefix} explicit no-web audit requires matching skip trigger")
         if trace.get("degradation_reason") not in {None, "user_forbid_web"}:
             errors.append(f"{prefix} explicit no-web trace has wrong degradation_reason")
-    if audit.get("explicit_search") is True and audit.get("skip_reason") != "user_forbid_web":
-        triggers = {
-            value for value in (trace.get("trigger_codes") or ())
-            if isinstance(value, str)
-        } if isinstance(trace.get("trigger_codes"), list) else set()
-        if not triggers.intersection({
-            "explicit_search", "explicit_verification", "explicit_source_request",
-        }):
-            errors.append(f"{prefix} explicit-search audit lacks an explicit trace trigger")
-    acceptable = audit.get("acceptable_final_tiers")
-    if isinstance(acceptable, list) and trace.get("final_tier") not in acceptable:
-        errors.append(f"{prefix} final_tier is outside reviewed acceptable target")
     stages = {
         value for value in (audit.get("stages_started") or ())
         if isinstance(value, str)
@@ -2841,7 +2770,7 @@ def _evaluate_traces_impl(
     for tier in TIERS:
         values = [
             trace["retrieval_pipeline_latency_ms"] for trace in joined_traces
-            if (trace.get("final_tier") or trace.get("route")) == tier
+            if trace.get("route") == tier
             and "retrieval_pipeline" in audit_by_request_id.get(str(trace.get("request_id")), {}).get("stages_started", [])
             and _is_nonnegative_number(trace.get("retrieval_pipeline_latency_ms"))
         ]
@@ -2877,7 +2806,7 @@ def _evaluate_traces_impl(
     accounted_rate = rates["provider_execution_accounted_rate"]
     if accounted_rate["denominator"] == 0 or accounted_rate["rate"] < 1.0:
         failures.append("provider execution accounting rate below 1.00")
-    retrieval_p95_limits = {"light": 6_000, "standard": 15_000, "deep": 30_000}
+    retrieval_p95_limits = {"light": 6_000, "standard": 15_000}
     for tier, limit in retrieval_p95_limits.items():
         p95 = per_tier_retrieval[tier]["p95"]
         if p95 is None:

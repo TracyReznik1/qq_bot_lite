@@ -1367,11 +1367,6 @@ class SearchTrace:
     request_source: RequestSource
     route: SearchTier
     skip_reason: SkipReason | None = None
-    trigger_codes: tuple[TriggerCode, ...] = ()
-    factuality: Factuality | None = None
-    external_fact_required: bool = False
-    program_minimum_tier: SearchTier | None = None
-    final_tier: SearchTier | None = None
     orchestrator_started: bool = False
     initial_query_count: int = 0
     initial_round_started: bool = False
@@ -1416,7 +1411,6 @@ class SearchTrace:
     finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.trigger_codes = _tuple(self.trigger_codes)
         self.executed_queries = _tuple(self.executed_queries)
         if any(
             not isinstance(entry, QueryTraceEntry)
@@ -1476,11 +1470,6 @@ class SearchTrace:
             "request_source": self.request_source,
             "route": self.route,
             "skip_reason": self.skip_reason,
-            "trigger_codes": self.trigger_codes,
-            "factuality": self.factuality,
-            "external_fact_required": self.external_fact_required,
-            "program_minimum_tier": self.program_minimum_tier,
-            "final_tier": self.final_tier,
             "orchestrator_started": self.orchestrator_started,
             "initial_query_count": self.initial_query_count,
             "initial_round_started": self.initial_round_started,

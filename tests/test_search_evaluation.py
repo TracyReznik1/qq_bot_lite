@@ -155,16 +155,10 @@ def _raw_trace_row(case_id, route="light", **overrides):
         "request_source": "chat",
         "route": route,
         "skip_reason": None,
-        "trigger_codes": ["factual_default"] if searched else [],
-        "factuality": "factual" if searched else "non_factual",
-        "external_fact_required": searched,
-        "program_minimum_tier": route if searched else None,
-        "final_tier": route,
         "orchestrator_started": searched,
         "initial_query_count": 1 if searched else 0,
         "initial_round_started": searched,
         "adaptive_repair_round_started": False,
-        "adaptive_repair_query": None,
         "initial_query_redaction_codes": [],
         "adaptive_repair_redaction_codes": [],
         "retrieval_round_count": 1 if searched else 0,
@@ -274,8 +268,8 @@ def _certifying_offline_artifacts():
             high_consequence=False,
         ),
         _make_case(
-            "offline-deep", "dynamic_fact", minimum_tier="deep",
-            acceptable_final_tiers=["deep"], dynamic=True,
+            "offline-dynamic", "dynamic_fact", minimum_tier="standard",
+            acceptable_final_tiers=["standard"], dynamic=True,
             high_consequence=True, potential_harm="high",
             semantic_labels=semantic_labels,
         ),
@@ -292,21 +286,21 @@ def _certifying_offline_artifacts():
         for case_id, tier in (
             ("offline-light", "light"),
             ("offline-standard", "standard"),
-            ("offline-deep", "deep"),
+            ("offline-dynamic", "standard"),
             ("offline-skip", "skip"),
         )
     ]
     predictions.extend([
         _prediction(
-            "offline-deep", "claim_discovery", model="trusted-evaluator-model",
+            "offline-dynamic", "claim_discovery", model="trusted-evaluator-model",
             label_id="claim", predicted="present",
         ),
         _prediction(
-            "offline-deep", "semantic_support", model="trusted-evaluator-model",
+            "offline-dynamic", "semantic_support", model="trusted-evaluator-model",
             label_id="support", predicted="supported",
         ),
         _prediction(
-            "offline-deep", "relevance", model="trusted-evaluator-model",
+            "offline-dynamic", "relevance", model="trusted-evaluator-model",
             label_id="source", predicted="relevant",
         ),
     ])
@@ -335,7 +329,7 @@ def _certifying_trace_artifacts():
     traces = [
         _raw_trace_row("trace-light", route="light"),
         _raw_trace_row("trace-standard", route="standard"),
-        _raw_trace_row("trace-deep", route="deep"),
+        _raw_trace_row("trace-standard-repair", route="standard"),
     ]
     audits = [
         _audit_row(
@@ -343,16 +337,14 @@ def _certifying_trace_artifacts():
             explicit_search=True,
         ),
         _audit_row("trace-standard", route="standard"),
-        _audit_row("trace-deep", route="deep"),
+        _audit_row("trace-standard-repair", route="standard"),
     ]
-    traces[0]["trigger_codes"] = ["explicit_search"]
-    deep = traces[2]
-    deep.update(
+    repaired = traces[2]
+    repaired.update(
         semantic_query_count=2,
         repair_query_count=1,
         retrieval_round_count=2,
         adaptive_repair_round_started=True,
-        adaptive_repair_query={"query_id": "q-r", "purpose": "repair"},
         repair_used=True,
         adaptive_repair_latency_ms=10,
         executed_queries=[
@@ -360,7 +352,7 @@ def _certifying_trace_artifacts():
             {"query_id": "q-r", "purpose": "repair"},
         ],
         provider_attempts=[
-            deep["provider_attempts"][0],
+            repaired["provider_attempts"][0],
             {
                 "provider": "tavily", "status": "success", "count": 1,
                 "latency_ms": 5, "query_id": "q-r", "configured": True,
@@ -383,15 +375,11 @@ class IntegrityMetricTests(unittest.TestCase):
             ("light", "standard"): 1,
             ("standard", "standard"): 7,
             ("standard", "light"): 2,
-            ("standard", "deep"): 1,
-            ("deep", "deep"): 6,
-            ("deep", "standard"): 1,
         }
-        metrics = tool.tier_metrics(confusion, labels=("light", "standard", "deep"))
-        self.assertAlmostEqual(metrics["macro_f1"], 0.81203, places=4)
+        metrics = tool.tier_metrics(confusion, labels=("light", "standard"))
+        self.assertAlmostEqual(metrics["macro_f1"], 0.83282, places=4)
         self.assertAlmostEqual(metrics["light_f1"], 0.84211, places=4)
-        self.assertAlmostEqual(metrics["standard_f1"], 0.73684, places=4)
-        self.assertAlmostEqual(metrics["deep_f1"], 0.85714, places=4)
+        self.assertAlmostEqual(metrics["standard_f1"], 0.82353, places=4)
 
     def test_precision_recall_f1_formula(self):
         tool = evaluate_tool()
@@ -569,7 +557,7 @@ class IntegrityContractTests(unittest.TestCase):
     def test_repository_integrity_failures_are_only_the_real_owner_review_gate(self):
         tool = evaluate_tool()
         errors = tool.collect_integrity_errors()
-        self.assertEqual(142, len(errors))
+        self.assertEqual(214, len(errors))
         self.assertEqual(140, sum("owner review" in error for error in errors))
         self.assertEqual(2, sum("invalid potential_harm" in error for error in errors))
 
@@ -612,7 +600,7 @@ class ModelQualityContractTests(unittest.TestCase):
             _make_case(
                 "dynamic-1",
                 "dynamic_fact",
-                minimum_tier="deep",
+                minimum_tier="standard",
                 potential_harm="high",
                 dynamic=True,
                 high_consequence=True,
@@ -1231,7 +1219,6 @@ class StrictReviewRegressionTests(unittest.TestCase):
         )
         self.assertFalse(report["certifying"])
         self.assertIn("standard latency zero samples", report["failures"])
-        self.assertIn("deep latency zero samples", report["failures"])
         self.assertEqual(0, report["latencies_ms"]["provider_search_total_latency_ms"]["sample_count"])
         self.assertFalse(report["latencies_ms"]["provider_search_total_latency_ms"]["evaluable"])
 
@@ -1322,7 +1309,6 @@ class ReReviewRound2Tests(unittest.TestCase):
         tool = evaluate_tool()
         traces, audits, _manifest = _certifying_trace_artifacts()
         trace = traces[0]
-        trace["final_tier"] = "skip"
         trace["executed_queries"] = [
             {"query_id": f"q-{index}", "purpose": "direct"} for index in range(10)
         ]
@@ -1337,20 +1323,17 @@ class ReReviewRound2Tests(unittest.TestCase):
             trusted_verifier_key=TEST_VERIFIER_KEY,
         )
         self.assertFalse(report["certifying"])
-        self.assertIn("final_tier must equal route", "\n".join(report["errors"]))
         self.assertEqual(1, report["budget_violations"]["initial_query_count"])
         self.assertEqual(1, report["budget_violations"]["semantic_query_count"])
 
         traces, audits, _manifest = _certifying_trace_artifacts()
         skipped = _raw_trace_row(
             "trace-skip-mismatch", route="skip", skip_reason="pure_math",
-            trigger_codes=["explicit_no_web", "explicit_search"],
             degradation_reason="user_forbid_web",
         )
         audit = _audit_row(
             "trace-skip-mismatch", route="skip", category="explicit_search",
             explicit_search=True, skip_reason="user_forbid_web",
-            external_fact_required=True,
         )
         traces.append(skipped)
         audits.append(audit)
@@ -1361,7 +1344,6 @@ class ReReviewRound2Tests(unittest.TestCase):
         )
         self.assertFalse(report["certifying"])
         self.assertIn("trace/audit skip_reason mismatch", "\n".join(report["errors"]))
-        self.assertIn("trace/audit external_fact_required mismatch", "\n".join(report["errors"]))
 
     def test_cr3_unconfigured_provider_failure_is_derived_and_population_gated(self):
         tool = evaluate_tool()
@@ -1442,7 +1424,7 @@ class ReReviewRound2Tests(unittest.TestCase):
 
     def test_cr5_stage_started_cross_checks_prevent_hidden_latency(self):
         tool = evaluate_tool()
-        for tier, index in (("light", 0), ("standard", 1), ("deep", 2)):
+        for tier, index in (("light", 0), ("standard", 1), ("standard", 2)):
             with self.subTest(tier=tier):
                 traces, audits, _manifest = _certifying_trace_artifacts()
                 traces[index]["retrieval_pipeline_latency_ms"] = 39_000
@@ -2190,19 +2172,11 @@ class ReReviewRound3Tests(unittest.TestCase):
 
     def test_i2_each_skip_reason_rejects_search_trigger_contradictions(self):
         tool = evaluate_tool()
-        factuality = {
-            "user_forbid_web": "ambiguous",
-            "provided_text_transform": "mixed",
-            "provided_content_summary": "mixed",
-        }
         for reason in sorted(tool.SKIP_REASONS):
             with self.subTest(reason=reason):
                 traces, audits, _manifest = _certifying_trace_artifacts()
-                triggers = ["explicit_no_web"] if reason == "user_forbid_web" else []
                 trace = _raw_trace_row(
                     f"skip-{reason}", route="skip", skip_reason=reason,
-                    trigger_codes=triggers,
-                    factuality=factuality.get(reason, "non_factual"),
                 )
                 audit = _audit_row(
                     f"skip-{reason}", route="skip", skip_reason=reason,
@@ -2216,7 +2190,7 @@ class ReReviewRound3Tests(unittest.TestCase):
                 )
                 self.assertTrue(positive["certifying"], positive)
 
-                trace["trigger_codes"] = ["explicit_search"]
+                trace["provider_configured"] = True
                 manifest = _attest_manifest(_sample_manifest(traces, audits))
                 negative = tool.evaluate_traces(
                     traces, audits, sample_manifest=manifest,
@@ -2228,8 +2202,6 @@ class ReReviewRound3Tests(unittest.TestCase):
     def test_i2_skip_contract_rejects_factuality_external_and_failure_states(self):
         tool = evaluate_tool()
         for field, value in (
-            ("factuality", "mixed"),
-            ("external_fact_required", True),
             ("provider_failures", ["provider_timeout"]),
             ("degradation_reason", "provider_timeout"),
         ):
@@ -2241,9 +2213,6 @@ class ReReviewRound3Tests(unittest.TestCase):
                 trace[field] = value
                 audit = _audit_row(
                     f"skip-{field}", route="skip", skip_reason="pure_math",
-                    external_fact_required=(
-                        True if field == "external_fact_required" else False
-                    ),
                 )
                 traces.append(trace)
                 audits.append(audit)

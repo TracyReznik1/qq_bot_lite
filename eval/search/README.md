@@ -189,7 +189,6 @@ round, and hard-timeout violations use the immutable tier budgets:
 |---|---:|---:|---:|---:|---:|---:|
 | light | 5 | 2 | 1 | 0 | 1 | 8 s |
 | standard | 8 | 5 | 4 | 1 | 2 | 20 s |
-| deep | 15 | 8 | 6 | 1 | 2 | 40 s |
 
 Citation/failure invariants are counted separately from model metrics. They
 cover provider/evidence contradictions, Claim-to-Evidence-to-final-URL mapping,
@@ -219,7 +218,7 @@ and the state, single repair query, derived/serialized counts, and latency must
 agree before inclusion.
 Every required stage and tier with zero samples is non-evaluable and
 non-certifying. Retrieval P95 is evaluated separately by route
-(`light <= 6 s`, `standard <= 15 s`, `deep <= 30 s`); answer, validation, and
+(`light <= 6 s`, `standard <= 15 s`); answer, validation, and
 render time are not folded into it.
 
 ## Commands

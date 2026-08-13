@@ -1,5 +1,7 @@
 # qqbot_lite 路线 B：检索收益路由与证据化搜索设计
 
+> **历史基线（historical baseline）：** 本文为 2026-07-29 的设计基线。2026-08-09 已批准的 `2026-08-09-websearch-simplification-design.md` 取代了本文中关于 operational `deep` 档位与检索复杂度/时效/风险耦合的表述；当前运行时只保留 `skip / light / standard`，DDGS-first、Tavily 仅作回退。以下内容仅保留历史推理，不作为现行契约。
+
 **日期：** 2026-07-29
 **状态：** 已按首轮复核修订并经用户确认；实施计划已生成，尚未修改生产代码
 **适用范围：** 普通聊天、显式 `/search`、模型补充检索、搜索失败降级、引用与 QQ 输出
