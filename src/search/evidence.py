@@ -951,6 +951,7 @@ def _detect_conflicts(
     conflicts: list[EvidenceConflict] = []
     conflicting_topic_ids: set[str] = set()
     participating_ids_by_key: dict[str, set[str]] = {}
+    topic_ids_by_key: dict[str, list[str]] = {}
     for topic_id, eligible_evidence_ids in eligible_evidence_ids_by_topic.items():
         members_by_key: dict[str, list[EvidenceItem]] = {}
         for item in items:
@@ -970,6 +971,7 @@ def _detect_conflicts(
             participating_ids_by_key.setdefault(key, set()).update(
                 member.evidence_id for member in members
             )
+            topic_ids_by_key.setdefault(key, []).append(topic_id)
     for key, participating_ids in participating_ids_by_key.items():
         members = tuple(
             item for item in items if item.evidence_id in participating_ids
@@ -987,6 +989,7 @@ def _detect_conflicts(
                     )
                     for member in members
                 ),
+                topic_ids=tuple(dict.fromkeys(topic_ids_by_key[key])),
             )
         )
     return (
@@ -999,24 +1002,12 @@ def _topic_has_evidence(items: Sequence[EvidenceItem], topic: RequiredTopic) -> 
     return any(topic.label in item.supported_topics for item in items)
 
 
-def _conflict_topic_ids(
-    plan: SearchPlan,
-    items: Sequence[EvidenceItem],
-    conflicts: Sequence[EvidenceConflict],
-) -> frozenset[str]:
-    label_to_topic_ids: dict[str, set[str]] = {}
-    for topic in _material_topics(plan):
-        label_to_topic_ids.setdefault(topic.label, set()).add(topic.topic_id)
-    item_by_id = {item.evidence_id: item for item in items}
-    topic_ids: set[str] = set()
-    for conflict in conflicts:
-        for member in conflict.members:
-            item = item_by_id.get(member.evidence_id)
-            if item is None:
-                continue
-            for label in item.supported_topics:
-                topic_ids.update(label_to_topic_ids.get(label, ()))
-    return frozenset(topic_ids)
+def _conflict_topic_ids(conflicts: Sequence[EvidenceConflict]) -> frozenset[str]:
+    return frozenset(
+        topic_id
+        for conflict in conflicts
+        for topic_id in conflict.topic_ids
+    )
 
 
 def _aggregate_gap(
@@ -1043,7 +1034,7 @@ def _aggregate_gap(
     assessment_by_id = {assessment.topic_id: assessment for assessment in assessments}
     reason_by_topic: dict[str, RepairReasonCode] = {}
 
-    conflicting_topic_ids = _conflict_topic_ids(plan, items, conflicts)
+    conflicting_topic_ids = _conflict_topic_ids(conflicts)
     for topic_id in conflicting_topic_ids:
         if topic_id in topic_by_id:
             reason_by_topic[topic_id] = RepairReasonCode.SOURCE_CONFLICT

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import unittest
+from dataclasses import replace
 from datetime import date
 from unittest import mock
 
@@ -23,6 +24,7 @@ from src.search.models import (
     RetrievalDecision,
     RetrievalRequest,
     RiskLevel,
+    RequiredTopic,
     SearchFailureCode,
     SearchPipelineResult,
     SearchPlan,
@@ -32,6 +34,8 @@ from src.search.models import (
     SearchTrace,
     SkipReason,
     SourceRelation,
+    SourceRequirement,
+    FreshnessRequirement,
     TriggerCode,
 )
 from src.services.llm_types import ChatResponse
@@ -81,15 +85,27 @@ def decision(route=SearchTier.LIGHT):
 
 
 def query():
-    return SearchQuery("q1", SearchRoundKind.INITIAL, models().QueryPurpose.DIRECT, "q")
+    return SearchQuery(
+        "initial-1", SearchRoundKind.INITIAL, models().QueryPurpose.DIRECT, "q",
+        query_index=1, target_topic_ids=("topic-1",),
+    )
 
 
 def plan(route=SearchTier.LIGHT, required=("定义",)):
     m = models()
     d = decision(route)
+    topics = tuple(
+        RequiredTopic(
+            f"topic-{index}", label, True,
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        )
+        for index, label in enumerate(required, 1)
+    )
+    direct = replace(query(), target_topic_ids=tuple(topic.topic_id for topic in topics))
     return SearchPlan(
-        d, "什么是光合作用", m.PlanningStatus.NORMAL, (), None, (query(),),
-        tuple(required), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[route],
+        d, "什么是光合作用", m.PlanningStatus.NORMAL, (), None, (direct,),
+        topics, frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[route],
     )
 
 
@@ -136,7 +152,7 @@ def bundle(evidence=(), state=EvidenceState.SUFFICIENT):
     )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(missing, (), False, (), ()),
+        m.EvidenceGapAnalysis(missing_topic_ids, (), False, (), ()),
         m.RepairPlan(False, (), (), None), 1, tuple(evidence), state,
         missing, (), (), (),
         topic_assessments=assessments,
@@ -544,6 +560,26 @@ class FailureFlowTests(unittest.TestCase):
         finalized_result = finalize.call_args.args[0]
         self.assertIs(finalized_result.failure_code, models().SearchFailureCode.VALIDATION_FAILED)
         self.assertIs(finalized_result.trace.degradation_reason, models().SearchFailureCode.VALIDATION_FAILED)
+        self.assertIs(
+            finalized_result.trace.answer_generation_mode,
+            models().AnswerGenerationMode.FIXED,
+        )
+        self.assertIs(
+            finalized_result.trace.answer_certainty,
+            models().AnswerCertainty.UNVERIFIED,
+        )
+        self.assertIs(
+            finalized_result.trace.answer_claim_scope,
+            models().AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
+        )
+        self.assertEqual(
+            (models().DisclosureCode.VALIDATION_FAILED,),
+            finalized_result.trace.answer_disclosure_codes,
+        )
+        self.assertIs(
+            finalized_result.evidence.evidence_state,
+            models().EvidenceState.SUFFICIENT,
+        )
         append.assert_called_once()
         self.assertTrue(append.call_args.args[2])
 
@@ -613,8 +649,8 @@ class FailureFlowTests(unittest.TestCase):
             m.EvidenceGapAnalysis((), (), False, (), ()),
             m.RepairPlan(False, (), (), None), 1,
             (
-                item("E1", "https://a.example.com", title="Source A"),
-                item("E2", "https://b.example.com", title="Source B"),
+                replace(item("E1", "https://a.example.com", title="Source A"), supported_topics=("版本",)),
+                replace(item("E2", "https://b.example.com", title="Source B"), supported_topics=("版本",)),
             ),
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",),
             ("weak_source_topics",),
@@ -625,6 +661,7 @@ class FailureFlowTests(unittest.TestCase):
                         m.EvidenceConflictMember("E1", "3.2", None, "contradicts"),
                         m.EvidenceConflictMember("E2", "3.3", None, "contradicts"),
                     ),
+                    topic_ids=("topic-1",),
                 ),
             ),
             topic_assessments=(
@@ -888,7 +925,7 @@ class PartialConflictFlowTests(unittest.TestCase):
         p = plan(SearchTier.STANDARD, required=("定义", "历史"))
         partial_bundle = m.EvidenceBundle(
             "req-1", p.decision, p, (), ("E1",),
-            m.EvidenceGapAnalysis(("历史",), (), False, (), ()),
+            m.EvidenceGapAnalysis(("topic-2",), (), False, (), ()),
             m.RepairPlan(False, (), (), None), 1, (item("E1", "https://a.example.com"),),
             m.EvidenceState.PARTIAL, ("历史",), (), (), (),
             topic_assessments=(
@@ -920,7 +957,10 @@ class PartialConflictFlowTests(unittest.TestCase):
             "req-1", p.decision, p, (), ("E1", "E2"),
             m.EvidenceGapAnalysis((), (), False, (), ()),
             m.RepairPlan(False, (), (), None), 1,
-            (item("E1", "https://a.example.com", title="Source A"), item("E2", "https://b.example.com", title="Source B")),
+            (
+                replace(item("E1", "https://a.example.com", title="Source A"), supported_topics=("版本",)),
+                replace(item("E2", "https://b.example.com", title="Source B"), supported_topics=("版本",)),
+            ),
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",), (),
             (
                 m.EvidenceConflict(
@@ -930,6 +970,7 @@ class PartialConflictFlowTests(unittest.TestCase):
                         m.EvidenceConflictMember("E1", "3.2", None, "contradicts"),
                         m.EvidenceConflictMember("E2", "3.3", None, "contradicts"),
                     ),
+                    topic_ids=("topic-1",),
                 ),
             ),
             topic_assessments=(

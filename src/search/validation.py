@@ -32,6 +32,11 @@ _FENCE_PATTERN = re.compile(
 _VALID_BLOCK_KINDS = frozenset({"factual", "inference", "non_factual"})
 _NUMERIC_CITATION = re.compile(r"\[\d+\]")
 _HTTP_URL = re.compile(r"^https?://", re.IGNORECASE)
+_MODEL_URL = re.compile(r"https?://[^\s<>'\"\]]+", re.IGNORECASE)
+_MODEL_SOURCE_SECTION = re.compile(
+    r"(?:^|\n)\s*来源[：:].*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 _DISCOVERY_SYSTEM_PROMPT = """\
 You are a bounded claim-discovery validator. Inspect every answer block,
@@ -833,8 +838,14 @@ def sanitize_visible_block_text(
     *,
     protected_texts: Sequence[str] = (),
 ) -> str:
-    """Remove program-owned status/warning atoms from model prose."""
+    """Remove program-owned and model-authored rendering syntax from prose."""
     text = str(text or "")
+    # Citation numbers, source sections and URLs are renderer-owned syntax.
+    # Remove model-authored variants before a block can enter RenderState; the
+    # deterministic renderer appends the real citations and sources later.
+    text = _MODEL_SOURCE_SECTION.sub("", text)
+    text = _MODEL_URL.sub("", text)
+    text = _strip_numeric_citations(text)
     text, status_count = _SEARCH_SUCCESS_STATUS_ATOM.subn("", text)
     warning_spans = _professional_warning_spans(text)
     if warning_spans:

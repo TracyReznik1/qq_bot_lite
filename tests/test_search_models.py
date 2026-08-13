@@ -43,14 +43,44 @@ class SearchModelFixtures:
     def query(self):
         m = self.m
         return m.SearchQuery(
-            "q1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "query text"
+            "initial-1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "query text",
+            query_index=1, target_topic_ids=("topic-1",),
+        )
+
+    def analysis(self):
+        m = self.m
+        return m.RequestAnalysis(
+            m.RetrievalContext(
+                True,
+                None,
+                m.Factuality.FACTUAL,
+                True,
+                (),
+                m.SourceRequirement.ANY_RELEVANT,
+            ),
+            m.FreshnessContext(
+                m.FreshnessRequirement.NOT_REQUIRED,
+                None,
+                None,
+                None,
+                None,
+            ),
+            m.RiskContext(False, False, False),
         )
 
     def plan(self):
         m = self.m
         return m.SearchPlan(
             self.decision(), "question", m.PlanningStatus.NORMAL, (), None,
-            (self.query(),), (), frozenset(), (), self.budget(),
+            (self.query(),),
+            (
+                m.RequiredTopic(
+                    "topic-1", "question", True,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                    source_requirement=m.SourceRequirement.ANY_RELEVANT,
+                ),
+            ),
+            frozenset(), (), self.budget(),
         )
 
     def repair_plan(self):
@@ -150,6 +180,47 @@ class SearchModelFixtures:
         if location == "provider_attempts[].provider":
             return logged["provider_attempts"][0]["provider"]
         raise AssertionError(f"unknown Trace location: {location}")
+
+
+class RenderStateClosureTests(unittest.TestCase):
+    def test_rejects_visible_claim_without_matching_citation_and_citable_source(self):
+        m = models()
+        block = m.AnswerBlock("B1", "factual", "答案", ("C1",))
+        claim = m.Claim("C1", "B1", "答案", True, ("e1",))
+
+        with self.assertRaises(ValueError):
+            m.RenderState(
+                m.RenderOutcome.ANSWER,
+                (block,),
+                (claim,),
+                {},
+                (),
+                (),
+                (),
+                (),
+            )
+
+    def test_rejects_duplicate_or_non_contiguous_citation_numbers(self):
+        m = models()
+        block = m.AnswerBlock("B1", "factual", "答案", ("C1",))
+        claim = m.Claim("C1", "B1", "答案", True, ("e1", "e2"))
+        fixtures = SearchModelFixtures(m)
+        sources = (
+            fixtures.evidence_item(),
+            replace(fixtures.evidence_item(), evidence_id="e2"),
+        )
+        for citations in ({"e1": 1, "e2": 1}, {"e1": 1, "e2": 3}):
+            with self.subTest(citations=citations), self.assertRaises(ValueError):
+                m.RenderState(
+                    m.RenderOutcome.ANSWER,
+                    (block,),
+                    (claim,),
+                    citations,
+                    sources,
+                    (),
+                    (),
+                    (),
+                )
 
 
 class SearchModelContractTests(unittest.TestCase):
@@ -381,6 +452,7 @@ class SearchModelContractTests(unittest.TestCase):
             sufficient,
             m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT),
             m.SearchFailureCode.VALIDATION_FAILED,
+            analysis=fixtures.analysis(),
         )
         self.assertIs(result.failure_code, m.SearchFailureCode.VALIDATION_FAILED)
 
@@ -472,10 +544,11 @@ class SearchModelContractTests(unittest.TestCase):
 
     def test_pipeline_result_rejects_ambiguous_search_and_skip_shapes(self):
         m = models()
+        fixtures = SearchModelFixtures(m)
         decision = self._search_decision(m)
         trace = m.SearchTrace("r", m.RequestSource.CHAT, m.SearchTier.LIGHT)
         with self.assertRaises(ValueError):
-            m.SearchPipelineResult(decision, None, None, trace)
+            m.SearchPipelineResult(decision, None, None, trace, analysis=fixtures.analysis())
         skip = m.RetrievalDecision(
             route=m.SearchTier.SKIP,
             skip_reason=m.SkipReason.PURE_MATH,
@@ -483,7 +556,19 @@ class SearchModelContractTests(unittest.TestCase):
             reason_codes=(),
         )
         with self.assertRaises(ValueError):
-            m.SearchPipelineResult(skip, object(), None, trace)
+            m.SearchPipelineResult(skip, object(), None, trace, analysis=fixtures.analysis())
+
+    def test_pipeline_result_requires_request_analysis(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        with self.assertRaises(TypeError):
+            m.SearchPipelineResult(
+                fixtures.decision(),
+                fixtures.plan(),
+                fixtures.bundle(),
+                m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT),
+                m.SearchFailureCode.INSUFFICIENT_EVIDENCE,
+            )
 
     def test_frozen_contracts_normalize_caller_owned_collections_and_budget_rejects_bools(self):
         m = models()
@@ -663,20 +748,21 @@ class SearchModelContractTests(unittest.TestCase):
 
     def test_every_failure_code_pipeline_shape_is_closed(self):
         m = models()
+        analysis = SearchModelFixtures(m).analysis()
         decision = self._search_decision(m)
         trace = m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT)
         for code in m.SearchFailureCode:
             with self.subTest(code=code):
                 if code is m.SearchFailureCode.PROVIDER_NOT_CONFIGURED:
-                    m.SearchPipelineResult(decision, object(), None, trace, code)
+                    m.SearchPipelineResult(decision, object(), None, trace, code, analysis=analysis)
                 else:
                     with self.assertRaises(ValueError):
-                        m.SearchPipelineResult(decision, object(), None, trace, code)
+                        m.SearchPipelineResult(decision, object(), None, trace, code, analysis=analysis)
         for code in (m.SearchFailureCode.PROVIDER_UNAVAILABLE, m.SearchFailureCode.PROVIDER_TIMEOUT, m.SearchFailureCode.NO_RESULTS, m.SearchFailureCode.CONTENT_UNREADABLE):
             bundle = type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})()
-            m.SearchPipelineResult(decision, object(), bundle, trace, code)
+            m.SearchPipelineResult(decision, object(), bundle, trace, code, analysis=analysis)
         for state, code in ((m.EvidenceState.SUFFICIENT, None), (m.EvidenceState.PARTIAL, m.SearchFailureCode.PARTIAL_EVIDENCE), (m.EvidenceState.CONFLICTING, m.SearchFailureCode.SOURCE_CONFLICT), (m.EvidenceState.INSUFFICIENT, m.SearchFailureCode.INSUFFICIENT_EVIDENCE)):
-            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": state})(), trace, code)
+            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": state})(), trace, code, analysis=analysis)
         for state in (
             m.EvidenceState.SUFFICIENT,
             m.EvidenceState.PARTIAL,
@@ -689,9 +775,10 @@ class SearchModelContractTests(unittest.TestCase):
                     type("Bundle", (), {"evidence_state": state})(),
                     trace,
                     m.SearchFailureCode.VALIDATION_FAILED,
+                    analysis=analysis,
                 )
         with self.assertRaises(ValueError):
-            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})(), trace, m.SearchFailureCode.VALIDATION_FAILED)
+            m.SearchPipelineResult(decision, object(), type("Bundle", (), {"evidence_state": m.EvidenceState.INSUFFICIENT})(), trace, m.SearchFailureCode.VALIDATION_FAILED, analysis=analysis)
 
     def test_provider_readiness_and_result_state_tables(self):
         m = models()
@@ -872,10 +959,7 @@ class RequestAnalysisContextContractTests(unittest.TestCase):
             self._freshness(m),
             self._risk(m),
         )
-        partial_plan = replace(
-            fixtures.plan(),
-            required_topics=("question", "detail"),
-        )
+        partial_plan = self._structured_partial_plan(m, fixtures)
         supported_topic, missing_topic = partial_plan.required_topics
         evidence_item = fixtures.evidence_item()
         evidence = replace(
@@ -907,10 +991,28 @@ class RequestAnalysisContextContractTests(unittest.TestCase):
             evidence,
             m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT),
             m.SearchFailureCode.PARTIAL_EVIDENCE,
-            analysis,
+            analysis=analysis,
         )
 
         self.assertIs(analysis, result.analysis)
+
+    @staticmethod
+    def _structured_partial_plan(m, fixtures):
+        topics = (
+            m.RequiredTopic(
+                "topic-1", "question", True,
+                m.FreshnessRequirement.NOT_REQUIRED,
+            ),
+            m.RequiredTopic(
+                "topic-2", "detail", True,
+                m.FreshnessRequirement.NOT_REQUIRED,
+            ),
+        )
+        query = replace(
+            fixtures.query(),
+            target_topic_ids=("topic-1", "topic-2"),
+        )
+        return replace(fixtures.plan(), required_topics=topics, initial_queries=(query,))
 
 
 class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
@@ -974,6 +1076,22 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
             budget=m.DEFAULT_TIER_BUDGETS[m.SearchTier.STANDARD],
         )
 
+    def test_search_plan_rejects_legacy_topic_labels_and_unsealed_queries(self):
+        m = models()
+        with self.assertRaises(TypeError):
+            self._plan(
+                m,
+                topics=("并发 API",),
+                queries=(
+                    m.SearchQuery(
+                        "q1",
+                        m.SearchRoundKind.INITIAL,
+                        m.QueryPurpose.DIRECT,
+                        "比较并发 API",
+                    ),
+                ),
+            )
+
     def test_required_topic_validates_closed_freshness_source_and_labels(self):
         m = models()
         version = self._topic(
@@ -1006,6 +1124,31 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises((TypeError, ValueError)):
                     self._topic(m, **overrides)
+
+    def test_topic_identifiers_are_opaque_monotonic_slots(self):
+        m = models()
+        factories = (
+            lambda: self._topic(m, topic_id="当前价格"),
+            lambda: m.TopicAssessment(
+                "price",
+                m.FreshnessEligibility.NOT_REQUIRED,
+                (),
+            ),
+            lambda: m.TopicFreshnessTraceEntry(
+                "topic-0",
+                m.FreshnessEligibility.NOT_REQUIRED,
+            ),
+            lambda: m.EvidenceGapAnalysis(
+                ("price",),
+                (),
+                True,
+                (m.RepairReasonCode.MISSING_TOPIC,),
+                ("price",),
+            ),
+        )
+        for factory in factories:
+            with self.subTest(factory=factory), self.assertRaises(ValueError):
+                factory()
 
     def test_structured_plan_closes_topic_ids_material_targets_and_query_slots(self):
         m = models()
@@ -1158,38 +1301,14 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
             m.QueryPurpose.DIRECT,
             "legacy query",
         )
-        legacy_plan = self._plan(
-            m,
-            topics=("legacy label",),
-            queries=(legacy_query,),
-        )
-        self.assertEqual(("legacy label",), tuple(
-            topic.label for topic in legacy_plan.required_topics
-        ))
-        self.assertTrue(all(topic.material for topic in legacy_plan.required_topics))
-        replace(legacy_plan, original_question="replaced legacy question")
-
-        empty_legacy = self._plan(m, topics=())
-        self.assertEqual(1, len(empty_legacy.required_topics))
-        self.assertTrue(empty_legacy.required_topics[0].material)
-
-        three_legacy = self._plan(
-            m,
-            topics=("legacy one", "legacy two", "legacy three"),
-            queries=(legacy_query,),
-        )
-        self.assertEqual(3, len(three_legacy.required_topics))
-        with self.assertRaises((TypeError, ValueError)):
-            self._plan(
-                m,
-                topics=("one", "two", "three", "four"),
-                queries=(legacy_query,),
-            )
-
-        with self.assertRaises((TypeError, ValueError)):
-            self._plan(m, topics=(self._topic(m),), queries=(legacy_query,))
-        with self.assertRaises((TypeError, ValueError)):
-            self._plan(m, topics=("legacy label", self._topic(m)))
+        for topics in (
+            ("legacy label",),
+            (),
+            ("legacy one", "legacy two", "legacy three"),
+            ("legacy label", self._topic(m)),
+        ):
+            with self.subTest(topics=topics), self.assertRaises((TypeError, ValueError)):
+                self._plan(m, topics=topics, queries=(legacy_query,))
 
 
 class TopicAssessmentContractTests(unittest.TestCase):
@@ -1353,7 +1472,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
             m.EvidenceConflictMember("E1", "published", None, "contradicts"),
         )
         with self.assertRaises(ValueError):
-            m.EvidenceConflict("conflict:status", "status", members)
+            m.EvidenceConflict("conflict:status", "status", members, topic_ids=("topic-1",))
 
     def test_evidence_conflict_rejects_members_asserting_only_one_value(self):
         m = models()
@@ -1364,7 +1483,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
                     m.EvidenceConflictMember("E2", values[1], None, "contradicts"),
                 )
                 with self.assertRaises(ValueError):
-                    m.EvidenceConflict("conflict:status", "status", members)
+                    m.EvidenceConflict("conflict:status", "status", members, topic_ids=("topic-1",))
 
     def test_bundle_rejects_state_that_disagrees_with_evidence_priority(self):
         m = models()
@@ -1378,6 +1497,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
                 m.EvidenceConflictMember("e1", "1", None, "contradicts"),
                 m.EvidenceConflictMember("E2", "2", None, "contradicts"),
             ),
+            topic_ids=("topic-1",),
         )
         supported = {
             "initial_evidence_ids": ("e1", "E2"),
@@ -1429,9 +1549,9 @@ class TopicAssessmentContractTests(unittest.TestCase):
             m.EvidenceConflictMember("e1", "1", None, "contradicts"),
             m.EvidenceConflictMember("E2", "2", None, "contradicts"),
         )
-        first_conflict = m.EvidenceConflict("conflict-1", "version", members)
-        second_conflict = m.EvidenceConflict("conflict-2", "status", members)
-        duplicate_id = m.EvidenceConflict("conflict-1", "status", members)
+        first_conflict = m.EvidenceConflict("conflict-1", "version", members, topic_ids=("topic-1",))
+        second_conflict = m.EvidenceConflict("conflict-2", "status", members, topic_ids=("topic-1",))
+        duplicate_id = m.EvidenceConflict("conflict-1", "status", members, topic_ids=("topic-1",))
         cases = (
             (("wrong-id",), (first_conflict,)),
             (("conflict-2", "conflict-1"), (first_conflict, second_conflict)),
@@ -1477,7 +1597,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
             ),
         )
         for evidence_items, members in cases:
-            conflict = m.EvidenceConflict("conflict-1", "version", members)
+            conflict = m.EvidenceConflict("conflict-1", "version", members, topic_ids=("topic-1",))
             with self.subTest(evidence_items=evidence_items), self.assertRaises(ValueError):
                 replace(
                     fixtures.bundle(),
@@ -1489,6 +1609,34 @@ class TopicAssessmentContractTests(unittest.TestCase):
                     conflict_groups=("conflict-1",),
                     conflicts=(conflict,),
                 )
+
+    def test_bundle_rejects_conflict_topic_without_two_member_topic_supports(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        first = fixtures.evidence_item()
+        second = replace(first, evidence_id="E2", supported_topics=())
+        conflict = m.EvidenceConflict(
+            "conflict-1",
+            "version",
+            (
+                m.EvidenceConflictMember("e1", "1", None, "contradicts"),
+                m.EvidenceConflictMember("E2", "2", None, "contradicts"),
+            ),
+            topic_ids=("topic-1",),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "conflict topic must be supported by at least two conflict members",
+        ):
+            replace(
+                fixtures.bundle(),
+                initial_evidence_ids=("e1", "E2"),
+                evidence_items=(first, second),
+                evidence_state=m.EvidenceState.CONFLICTING,
+                conflict_groups=("conflict-1",),
+                conflicts=(conflict,),
+            )
 
     def test_sufficient_bundle_rejects_stale_or_unknown_material_assessment(self):
         m = models()

@@ -6,8 +6,11 @@ import importlib
 import json
 import time
 import unittest
+from dataclasses import replace
 
 from src.search.models import (
+    AnswerCertainty,
+    AllowedClaimScope,
     EvidenceBundle,
     EvidenceGapAnalysis,
     EvidenceItem,
@@ -17,6 +20,7 @@ from src.search.models import (
     Freshness,
     GroundedDraft,
     RepairPlan,
+    RequiredTopic,
     RequestSource,
     RetrievalDecision,
     RetrievalRequest,
@@ -26,6 +30,8 @@ from src.search.models import (
     SearchRoundKind,
     SearchTier,
     SourceRelation,
+    SourceRequirement,
+    FreshnessRequirement,
     SupportLabel,
 )
 from tests.search_fakes import StaticSemanticVerifier
@@ -66,15 +72,28 @@ def answer_state(fail_closed=False):
 
 
 def query():
-    return SearchQuery("q1", SearchRoundKind.INITIAL, __import__("src.search.models", fromlist=["QueryPurpose"]).QueryPurpose.DIRECT, "q")
+    return SearchQuery(
+        "initial-1", SearchRoundKind.INITIAL,
+        __import__("src.search.models", fromlist=["QueryPurpose"]).QueryPurpose.DIRECT,
+        "q", query_index=1, target_topic_ids=("topic-1",),
+    )
 
 
 def plan(required=("版本",)):
     m = models()
     d = decision()
+    topics = tuple(
+        RequiredTopic(
+            f"topic-{index}", label, True,
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        )
+        for index, label in enumerate(required, 1)
+    )
+    direct = replace(query(), target_topic_ids=tuple(topic.topic_id for topic in topics))
     return SearchPlan(
-        d, "当前版本是什么", m.PlanningStatus.NORMAL, ("X",), None, (query(),),
-        tuple(required), frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        d, "当前版本是什么", m.PlanningStatus.NORMAL, ("X",), None, (direct,),
+        topics, frozenset({SourceRelation.PRIMARY}), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
     )
 
 
@@ -116,7 +135,7 @@ def bundle(evidence=(), state=None, missing=()):
     )
     return m.EvidenceBundle(
         "req-1", p.decision, p, (), tuple(e.evidence_id for e in evidence),
-        m.EvidenceGapAnalysis(actual_missing, (), False, (), ()),
+        m.EvidenceGapAnalysis(missing_topic_ids, (), False, (), ()),
         m.RepairPlan(False, (), (), None), 1, tuple(evidence), state,
         actual_missing, (), (), (),
         topic_assessments=assessments,
@@ -674,6 +693,46 @@ class VerifierFailureTests(unittest.TestCase):
         )
         self.assertIn("B1", report.removed_block_ids)
         self.assertTrue(any("semantic_verification_unavailable" in limitation for limitation in report.limitations))
+
+    def test_verifier_unavailable_has_closed_status_and_lowered_effective_state(self):
+        module = validation_module()
+        d = GroundedDraft(
+            (models().AnswerBlock("B1", "factual", "版本是3.2", ("C1",)),),
+            (models().Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
+            (), (), False,
+        )
+        b = bundle((item(),), state=EvidenceState.SUFFICIENT)
+
+        class FailingVerifier:
+            def verify(self, *_args, **_kwargs):
+                raise RuntimeError("boom")
+
+        report = module.validate_and_filter(
+            d, b, answer_state(),
+            claim_discoverer=_Discoverer([]),
+            semantic_verifier=FailingVerifier(),
+        )
+
+        self.assertIs(report.status, models().ValidatorStatus.UNAVAILABLE)
+        self.assertIs(report.effective_certainty, AnswerCertainty.LIMITED)
+        self.assertIs(report.effective_claim_scope, AllowedClaimScope.ALL_SUPPORTED)
+        self.assertIs(b.evidence_state, EvidenceState.SUFFICIENT)
+
+    def test_visible_text_sanitizer_removes_model_authored_source_payloads(self):
+        module = validation_module()
+        text = (
+            "结论来自证据[99]。\n来源：\n"
+            "[99] 伪来源\nhttps://evil.example/path\n"
+            "后续说明 https://still-evil.example/x"
+        )
+
+        cleaned = module.sanitize_visible_block_text(text)
+
+        self.assertNotIn("来源：", cleaned)
+        self.assertNotIn("[99]", cleaned)
+        self.assertNotIn("http://", cleaned)
+        self.assertNotIn("https://", cleaned)
+        self.assertIn("结论来自证据", cleaned)
 
 
 if __name__ == "__main__":

@@ -777,7 +777,7 @@ class OrchestratorFailureTests(unittest.TestCase):
         self.assertTrue(result.trace.provider_invocation_started)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_UNAVAILABLE)
 
-    def test_unreadable_content_is_content_unreadable(self):
+    def test_unreadable_content_becomes_insufficient_evidence_with_content_gap(self):
         class EmptyProvider:
             name = "tavily"
 
@@ -785,9 +785,19 @@ class OrchestratorFailureTests(unittest.TestCase):
                 return ProviderReadiness("tavily", True, True, None)
 
             def search(self, query, *, tier, max_results, timeout_seconds):
-                del query, tier, max_results, timeout_seconds
+                del tier, max_results, timeout_seconds
                 from src.search.models import ProviderResult, ProviderHit
-                hit = ProviderHit("tavily", "q1", "t", "https://example.com/x", None, None, None, None, ())
+                hit = ProviderHit(
+                    "tavily",
+                    query.query_id,
+                    "t",
+                    "https://example.com/x",
+                    None,
+                    None,
+                    None,
+                    None,
+                    (),
+                )
                 return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
 
         class NoContentExtractor:
@@ -808,9 +818,71 @@ class OrchestratorFailureTests(unittest.TestCase):
             clock=FakeClock(),
         )
         result = orchestrator.run(request())
-        self.assertEqual(result.failure_code, SearchFailureCode.CONTENT_UNREADABLE)
-        self.assertIn("content_unreadable", result.evidence.limitations)
+        self.assertEqual(result.failure_code, SearchFailureCode.INSUFFICIENT_EVIDENCE)
+        self.assertEqual(
+            (importlib.import_module("src.search.models").RepairReasonCode.CONTENT_UNREADABLE,),
+            result.evidence.gap_analysis.repair_reason_codes,
+        )
         self._assert_bundle_trace_mirror(result)
+
+    def test_light_zero_content_does_not_dispatch_repair(self):
+        class ZeroContentProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                from src.search.models import ProviderHit, ProviderResult
+
+                self.calls.append(search_query.query_id)
+                hit = ProviderHit(
+                    "tavily",
+                    search_query.query_id,
+                    "zero-content",
+                    f"https://example.com/{search_query.query_id}",
+                    None,
+                    None,
+                    None,
+                    None,
+                    (),
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+
+        class ZeroContentExtractor:
+            def extract(self, hit, _query, **_kwargs):
+                from src.search.models import EvidenceCandidate
+
+                return EvidenceCandidate(hit, None, None, None, "no_content", (), 1)
+
+        provider = ZeroContentProvider()
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("light")),
+            router=_make_router(router_payload("light")),
+            planner=_make_planner(),
+            judge=_FakeJudge(supported_topic_ids=()),
+            providers=(provider,),
+            extractor=ZeroContentExtractor(),
+            clock=FakeClock(),
+        )
+
+        result = orchestrator.run(request("什么是光合作用"))
+
+        self.assertEqual(SearchFailureCode.INSUFFICIENT_EVIDENCE, result.failure_code)
+        self.assertFalse(result.trace.repair_used)
+        self.assertEqual(0, result.trace.repair_query_count)
+        self.assertEqual(1, result.trace.retrieval_round_count)
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(1, result.trace.candidate_url_count)
+        self.assertEqual(1, result.trace.content_read_count)
+        self.assertEqual(1, len(result.trace.provider_attempts))
+        self.assertEqual(
+            (importlib.import_module("src.search.models").RepairReasonCode.CONTENT_UNREADABLE,),
+            result.evidence.gap_analysis.repair_reason_codes,
+        )
 
 
 class OrchestratorDeadlineTests(unittest.TestCase):
@@ -1417,7 +1489,7 @@ class OrchestratorTraceTests(unittest.TestCase):
         self.assertTrue(trace.provider_invocation_started)
         self.assertIs(trace.evidence_state, EvidenceState.SUFFICIENT)
         attempt = trace.to_log_dict()["provider_attempts"][0]
-        self.assertEqual(attempt["query_id"], "initial-1")
+        self.assertEqual(attempt["query_index"], 1)
         self.assertTrue(attempt["configured"])
         self.assertTrue(attempt["available"])
         self.assertTrue(attempt["invocation_started"])
@@ -1482,7 +1554,13 @@ class OrchestratorTraceTests(unittest.TestCase):
         )
         search_plan = m.SearchPlan(
             d, "topic", m.PlanningStatus.NORMAL, (), None, (initial_query,),
-            ("topic",), frozenset(), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+            (
+                m.RequiredTopic(
+                    "topic-1", "topic", True,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                ),
+            ),
+            frozenset(), (), m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
         )
 
         class Router:
@@ -1876,6 +1954,140 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         )
         self.assertEqual(("topic-2",), result.evidence.repair_plan.target_topic_ids)
         self.assertIs(result.trace.retrieval_stop_reason, m.RetrievalStopReason.POST_REPAIR_STOP)
+
+    def test_standard_zero_content_runs_exactly_one_content_unreadable_repair(self):
+        m = importlib.import_module("src.search.models")
+        decision = RetrievalDecision(
+            route=SearchTier.STANDARD,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
+        )
+        direct = m.SearchQuery(
+            "initial-1",
+            m.SearchRoundKind.INITIAL,
+            m.QueryPurpose.DIRECT,
+            "比较并发 API",
+            query_index=1,
+            target_topic_ids=("topic-1",),
+        )
+        search_plan = m.SearchPlan(
+            decision,
+            "比较并发 API",
+            m.PlanningStatus.NORMAL,
+            (),
+            None,
+            (direct,),
+            (
+                m.RequiredTopic(
+                    "topic-1",
+                    "core",
+                    True,
+                    m.FreshnessRequirement.NOT_REQUIRED,
+                ),
+            ),
+            frozenset({m.SourceRelation.PRIMARY, m.SourceRelation.INDEPENDENT}),
+            (),
+            m.DEFAULT_TIER_BUDGETS[SearchTier.STANDARD],
+        )
+
+        class FixedPlanPlanner:
+            def __init__(self):
+                self._real = _make_planner()
+
+            def plan(self, *_args, **_kwargs):
+                return search_plan
+
+            def plan_repair(self, plan, gap, prior_fingerprints=()):
+                return self._real.plan_repair(
+                    plan,
+                    gap,
+                    prior_fingerprints=prior_fingerprints,
+                )
+
+        class ZeroContentProvider:
+            name = "tavily"
+
+            def __init__(self):
+                self.calls = []
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, search_query, **_kwargs):
+                self.calls.append(search_query.query_id)
+                hit = m.ProviderHit(
+                    "tavily",
+                    search_query.query_id,
+                    "zero-content",
+                    f"https://example.com/{search_query.query_id}",
+                    None,
+                    None,
+                    None,
+                    None,
+                    (),
+                )
+                return m.ProviderResult(
+                    "tavily",
+                    m.ProviderStatus.SUCCESS,
+                    (hit,),
+                    1,
+                )
+
+        class ZeroContentExtractor:
+            def extract(self, hit, _query, **_kwargs):
+                return m.EvidenceCandidate(
+                    hit,
+                    None,
+                    None,
+                    None,
+                    "no_content",
+                    (),
+                    1,
+                )
+
+        provider = ZeroContentProvider()
+        orchestrator = self._orchestrator(
+            providers=(provider,),
+            judge=_FakeJudge(supported_topic_ids=()),
+            extractor=ZeroContentExtractor(),
+            planner=FixedPlanPlanner(),
+        )
+
+        result = orchestrator.run(request("比较并发 API"))
+
+        self.assertEqual(SearchFailureCode.INSUFFICIENT_EVIDENCE, result.failure_code)
+        self.assertTrue(result.trace.repair_used)
+        self.assertEqual(1, result.trace.repair_query_count)
+        self.assertEqual(2, result.trace.retrieval_round_count)
+        self.assertEqual(["initial-1", "repair-1"], provider.calls)
+        self.assertEqual(2, result.trace.candidate_url_count)
+        self.assertEqual(2, result.trace.content_read_count)
+        self.assertEqual(2, len(result.trace.provider_attempts))
+        self.assertEqual(
+            (m.RepairReasonCode.CONTENT_UNREADABLE,),
+            result.evidence.repair_plan.reason_codes,
+        )
+        self.assertEqual(
+            ("topic-1",),
+            result.evidence.repair_plan.target_topic_ids,
+        )
+        self.assertIs(
+            result.trace.retrieval_stop_reason,
+            m.RetrievalStopReason.POST_REPAIR_STOP,
+        )
+        self.assertEqual(
+            (m.RepairReasonCode.CONTENT_UNREADABLE,),
+            result.evidence.gap_analysis.repair_reason_codes,
+        )
+        self.assertEqual(
+            ("topic-1",),
+            result.evidence.gap_analysis.repair_target_topic_ids,
+        )
+        self.assertEqual(
+            (m.RepairReasonCode.CONTENT_UNREADABLE,),
+            result.trace.repair_reason_codes,
+        )
 
     def test_judge_hint_for_an_unknown_topic_does_not_repair(self):
         m = importlib.import_module("src.search.models")

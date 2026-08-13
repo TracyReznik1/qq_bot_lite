@@ -21,6 +21,10 @@ from src.search.models import (
     SearchTrace,
     ProviderAttempt,
     ProviderStatus,
+    QueryPurpose,
+    QueryTraceEntry,
+    RetrievalStopReason,
+    SearchRoundKind,
 )
 
 
@@ -162,11 +166,14 @@ def _raw_trace_row(case_id, route="light", **overrides):
         "initial_query_redaction_codes": [],
         "adaptive_repair_redaction_codes": [],
         "retrieval_round_count": 1 if searched else 0,
-        "executed_queries": ([{"query_id": "q-1", "purpose": "direct"}] if searched else []),
+        "executed_queries": ([{
+            "query_index": 1, "purpose": "direct", "round_kind": "initial",
+            "provider": "tavily", "status": "success", "latency_ms": 5,
+        }] if searched else []),
         "provider_configured": searched,
         "provider_attempts": ([{
             "provider": "tavily", "status": "success", "count": 1,
-            "latency_ms": 5, "query_id": "q-1", "configured": True,
+            "latency_ms": 5, "query_index": 1, "configured": True,
             "available": True, "invocation_started": True,
         }] if searched else []),
         "provider_invocation_started": searched,
@@ -185,6 +192,26 @@ def _raw_trace_row(case_id, route="light", **overrides):
         "sufficient_evidence": searched,
         "semantic_query_count": 1 if searched else 0,
         "repair_query_count": 0,
+        "retrieval_stop_reason": "evidence_sufficient" if searched else None,
+        "must_search": searched,
+        "retrieval_reason_codes": [],
+        "repair_reason_codes": [],
+        "repair_target_topic_ids": [],
+        "supported_topic_ids": ["topic-1"] if searched else [],
+        "missing_topic_ids": [],
+        "topic_freshness": ([{"topic_id": "topic-1", "freshness": "not_required"}] if searched else []),
+        "answer_generation_mode": "grounded" if searched else "plain",
+        "answer_certainty": "verified" if searched else "unverified",
+        "answer_claim_scope": "all_supported" if searched else "no_external_factual_claims",
+        "answer_disclosure_codes": [],
+        "answer_warning_codes": [],
+        "validator_status": "passed" if searched else None,
+        "validator_retained_claim_count": 1 if searched else 0,
+        "validator_removed_block_count": 0,
+        "render_outcome": "answer",
+        "render_citation_count": 1 if searched else 0,
+        "render_source_count": 1 if searched else 0,
+        "finalized": True,
     }
     for field in (
         "route_latency_ms", "query_planning_latency_ms",
@@ -203,6 +230,63 @@ def _raw_trace_row(case_id, route="light", **overrides):
         )
     trace.update(overrides)
     return trace
+
+
+def _runtime_trace_row() -> dict[str, object]:
+    """Return the exact body-free shape emitted by production SearchTrace."""
+    trace = SearchTrace("request-runtime", RequestSource.CHAT, SearchTier.LIGHT)
+    trace.orchestrator_started = True
+    trace.initial_round_started = True
+    trace.retrieval_round_count = 1
+    trace.initial_query_count = 1
+    trace.executed_queries = (
+        QueryTraceEntry(
+            1,
+            QueryPurpose.DIRECT,
+            SearchRoundKind.INITIAL,
+            "ddgs",
+            ProviderStatus.SUCCESS,
+            5,
+        ),
+    )
+    trace.provider_configured = True
+    trace.provider_attempts = (
+        ProviderAttempt(
+            "ddgs",
+            ProviderStatus.SUCCESS,
+            1,
+            5,
+            query_id="q-runtime-1",
+            query_index=1,
+            configured=True,
+            available=True,
+            invocation_started=True,
+        ),
+    )
+    trace.provider_invocation_started = True
+    trace.candidate_url_count = 1
+    trace.content_read_count = 1
+    trace.citable_evidence_count = 1
+    from src.search.models import EvidenceState
+    trace.evidence_state = EvidenceState.SUFFICIENT
+    trace.claim_count = 1
+    trace.supported_claim_count = 1
+    trace.citation_count = 1
+    trace.retrieval_stop_reason = RetrievalStopReason.EVIDENCE_SUFFICIENT
+    from src.search.models import (
+        AllowedClaimScope,
+        AnswerCertainty,
+        AnswerGenerationMode,
+        RenderOutcome,
+        ValidatorStatus,
+    )
+    trace.answer_generation_mode = AnswerGenerationMode.GROUNDED
+    trace.answer_certainty = AnswerCertainty.VERIFIED
+    trace.answer_claim_scope = AllowedClaimScope.ALL_SUPPORTED
+    trace.validator_status = ValidatorStatus.PASSED
+    trace.render_outcome = RenderOutcome.ANSWER
+    trace.finalized = True
+    return trace.to_log_dict()
 
 
 def _audit_row(case_id, *, route="light", **overrides):
@@ -347,15 +431,24 @@ def _certifying_trace_artifacts():
         adaptive_repair_round_started=True,
         repair_used=True,
         adaptive_repair_latency_ms=10,
+        repair_reason_codes=["missing_topic"],
+        repair_target_topic_ids=["topic-1"],
+        retrieval_stop_reason="post_repair_stop",
         executed_queries=[
-            {"query_id": "q-1", "purpose": "direct"},
-            {"query_id": "q-r", "purpose": "repair"},
+            {
+                "query_index": 1, "purpose": "direct", "round_kind": "initial",
+                "provider": "tavily", "status": "success", "latency_ms": 5,
+            },
+            {
+                "query_index": 2, "purpose": "repair", "round_kind": "repair",
+                "provider": "tavily", "status": "success", "latency_ms": 5,
+            },
         ],
         provider_attempts=[
             repaired["provider_attempts"][0],
             {
                 "provider": "tavily", "status": "success", "count": 1,
-                "latency_ms": 5, "query_id": "q-r", "configured": True,
+                "latency_ms": 5, "query_index": 2, "configured": True,
                 "available": True, "invocation_started": True,
             },
         ],
@@ -681,6 +774,126 @@ def _trace_row(case_id, route="light", **overrides):
 
 
 class TraceAcceptanceContractTests(unittest.TestCase):
+    def test_runtime_search_trace_serialization_is_accepted_without_legacy_query_ids(self):
+        tool = evaluate_tool()
+        errors = tool._validate_trace(_runtime_trace_row(), 1)
+        self.assertEqual([], errors)
+
+    def test_runtime_search_trace_serialization_exposes_closed_layered_state(self):
+        trace = _runtime_trace_row()
+        self.assertTrue(
+            {
+                "must_search", "retrieval_reason_codes",
+                "repair_reason_codes", "repair_target_topic_ids",
+                "supported_topic_ids", "missing_topic_ids", "topic_freshness",
+                "answer_certainty", "answer_claim_scope",
+                "answer_disclosure_codes", "answer_warning_codes",
+                "validator_status", "validator_retained_claim_count",
+                "validator_removed_block_count", "render_outcome",
+                "render_citation_count", "render_source_count", "finalized",
+            }.issubset(trace),
+        )
+
+    def test_trace_rejects_raw_query_text_and_invalid_layered_enums(self):
+        tool = evaluate_tool()
+        trace = _runtime_trace_row()
+        trace["executed_queries"][0]["query"] = "private user query"
+        trace["answer_certainty"] = "overconfident"
+        errors = tool._validate_trace(trace, 1)
+        self.assertIn("unexpected fields: query", "\n".join(errors))
+        self.assertIn("invalid answer_certainty", "\n".join(errors))
+
+    def test_final_trace_requires_closed_answer_validation_and_render_layers(self):
+        tool = evaluate_tool()
+        for field, value in (
+            ("finalized", False),
+            ("answer_generation_mode", None),
+            ("answer_certainty", None),
+            ("answer_claim_scope", None),
+            ("validator_status", None),
+            ("render_outcome", None),
+        ):
+            with self.subTest(field=field):
+                trace = _raw_trace_row(f"missing-{field}")
+                trace[field] = value
+                self.assertIn(field, "\n".join(tool._validate_trace(trace, 1)))
+
+    def test_fixed_search_failure_does_not_require_or_forge_validator_status(self):
+        tool = evaluate_tool()
+        trace = _raw_trace_row("fixed-no-validator")
+        trace.update(
+            evidence_state="insufficient",
+            sufficient_evidence=False,
+            degradation_reason="no_results",
+            citable_evidence_count=0,
+            claim_count=0,
+            supported_claim_count=0,
+            citation_count=0,
+            answer_generation_mode="fixed",
+            answer_certainty="unverified",
+            answer_claim_scope="no_external_factual_claims",
+            answer_disclosure_codes=["online_verification_failed"],
+            validator_status=None,
+            validator_retained_claim_count=0,
+            validator_removed_block_count=0,
+            render_outcome="failure",
+            render_citation_count=0,
+            render_source_count=0,
+        )
+        self.assertEqual([], tool._validate_trace(trace, 1))
+
+        trace["validator_status"] = "passed"
+        self.assertIn(
+            "fixed trace cannot set validator_status",
+            "\n".join(tool._validate_trace(trace, 1)),
+        )
+
+        trace["validator_status"] = "malformed"
+        trace["degradation_reason"] = "validation_failed"
+        trace["answer_disclosure_codes"] = ["validation_failed"]
+        trace["render_outcome"] = "validation_failure"
+        self.assertEqual([], tool._validate_trace(trace, 1))
+
+    def test_query_entries_and_provider_attempts_match_bidirectionally(self):
+        tool = evaluate_tool()
+        trace = _raw_trace_row("attempt-match")
+        trace["provider_attempts"][0]["provider"] = "ddgs"
+        errors = "\n".join(tool._validate_trace(trace, 1))
+        self.assertIn("does not match an executed query", errors)
+        self.assertIn("does not match a provider attempt", errors)
+
+        fallback = _raw_trace_row("fallback-match")
+        fallback["executed_queries"] = [
+            {"query_index": 1, "purpose": "direct", "round_kind": "initial", "provider": "ddgs", "status": "timeout", "latency_ms": 5},
+            {"query_index": 1, "purpose": "direct", "round_kind": "initial", "provider": "tavily", "status": "success", "latency_ms": 5},
+        ]
+        fallback["provider_attempts"] = [
+            {"provider": "ddgs", "status": "timeout", "count": 1, "latency_ms": 5, "query_index": 1, "configured": True, "available": True, "invocation_started": True},
+            {"provider": "tavily", "status": "success", "count": 1, "latency_ms": 5, "query_index": 1, "configured": True, "available": True, "invocation_started": True},
+        ]
+        self.assertEqual([], tool._validate_trace(fallback, 1))
+
+    def test_repair_trace_requires_post_repair_stop(self):
+        tool = evaluate_tool()
+        traces, _audits, _manifest = _certifying_trace_artifacts()
+        repaired = traces[2]
+        repaired["retrieval_stop_reason"] = "evidence_sufficient"
+        self.assertIn(
+            "post_repair_stop",
+            "\n".join(tool._validate_trace(repaired, 1)),
+        )
+
+    def test_trace_rejects_nonopaque_topic_ids(self):
+        tool = evaluate_tool()
+        for field in ("repair_target_topic_ids", "supported_topic_ids", "missing_topic_ids"):
+            with self.subTest(field=field):
+                trace = _raw_trace_row(f"topic-{field}")
+                trace[field] = ["price"]
+                self.assertIn(field, "\n".join(tool._validate_trace(trace, 1)))
+        trace = _raw_trace_row("topic-freshness")
+        trace["topic_freshness"] = [{"topic_id": "当前价格", "freshness": "satisfied"}]
+        self.assertIn("invalid topic_id", "\n".join(tool._validate_trace(trace, 1)))
+
     def test_external_case_id_labels_control_d_factual_not_embedded_trace_label(self):
         tool = evaluate_tool()
         audits = [_audit_row("fact-1")]
@@ -944,12 +1157,12 @@ class StrictReviewRegressionTests(unittest.TestCase):
     def test_c1_attempt_queries_and_skip_execution_counters_are_cross_checked(self):
         tool = evaluate_tool()
         trace = _raw_trace_row("cross")
-        trace["provider_attempts"][0]["query_id"] = "not-executed"
+        trace["provider_attempts"][0]["query_index"] = 99
         audit = _audit_row("cross")
         report = tool.evaluate_traces(
             [trace], [audit], sample_manifest=_sample_manifest([trace], [audit]),
         )
-        self.assertIn("query_id is not an executed query", "\n".join(report["errors"]))
+        self.assertIn("query_index is not an executed query", "\n".join(report["errors"]))
 
         skipped = _raw_trace_row("skip-cross", route="skip", candidate_url_count=1)
         skip_audit = _audit_row("skip-cross", route="skip")
@@ -1033,11 +1246,17 @@ class StrictReviewRegressionTests(unittest.TestCase):
             "budget", route="light", semantic_query_count=1,
             repair_query_count=0, adaptive_repair_round_started=True,
             repair_used=True, retrieval_round_count=1,
-            adaptive_repair_query={"query_id": "repair-1", "purpose": "repair"},
         )
         trace["executed_queries"] = [
-            {"query_id": f"q-{index}", "purpose": "direct"} for index in range(10)
-        ] + [{"query_id": "repair-1", "purpose": "repair"}]
+            {
+                "query_index": index + 1, "purpose": "direct", "round_kind": "initial",
+                "provider": "tavily", "status": "success", "latency_ms": 1,
+            }
+            for index in range(10)
+        ] + [{
+            "query_index": 11, "purpose": "repair", "round_kind": "repair",
+            "provider": "tavily", "status": "success", "latency_ms": 1,
+        }]
         audit = _audit_row("budget")
         report = tool.evaluate_traces(
             [trace], [audit], sample_manifest=_sample_manifest([trace], [audit]),
@@ -1250,6 +1469,40 @@ class ReReviewRound2Tests(unittest.TestCase):
         self.assertTrue(trace_report["certifying"], trace_report)
         self.assertTrue(trace_report["trusted_attestation_verified"])
 
+    def test_trace_certification_requires_a_trusted_manifest_attestation(self):
+        tool = evaluate_tool()
+        traces, audits, manifest = _certifying_trace_artifacts()
+
+        unsigned_manifest = _sample_manifest(traces, audits)
+        unsigned = tool.evaluate_traces(
+            traces,
+            audits,
+            sample_manifest=unsigned_manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertFalse(unsigned["trusted_attestation_verified"])
+        self.assertFalse(unsigned["certifying"])
+        self.assertIn("attestation", "\n".join(unsigned["failures"]))
+
+        wrong_key = tool.evaluate_traces(
+            traces,
+            audits,
+            sample_manifest=manifest,
+            trusted_verifier_key=b"x" * 32,
+        )
+        self.assertFalse(wrong_key["trusted_attestation_verified"])
+        self.assertFalse(wrong_key["certifying"])
+        self.assertIn("attestation", "\n".join(wrong_key["failures"]))
+
+        trusted = tool.evaluate_traces(
+            traces,
+            audits,
+            sample_manifest=manifest,
+            trusted_verifier_key=TEST_VERIFIER_KEY,
+        )
+        self.assertTrue(trusted["trusted_attestation_verified"])
+        self.assertTrue(trusted["certifying"], trusted)
+
     def test_cr1_attestation_and_fixture_blacklists_cannot_be_self_asserted(self):
         tool = evaluate_tool()
         cases, predictions, _manifest = _certifying_offline_artifacts()
@@ -1310,11 +1563,15 @@ class ReReviewRound2Tests(unittest.TestCase):
         traces, audits, _manifest = _certifying_trace_artifacts()
         trace = traces[0]
         trace["executed_queries"] = [
-            {"query_id": f"q-{index}", "purpose": "direct"} for index in range(10)
+            {
+                "query_index": index + 1, "purpose": "direct", "round_kind": "initial",
+                "provider": "tavily", "status": "success", "latency_ms": 1,
+            }
+            for index in range(10)
         ]
         trace["initial_query_count"] = 10
         trace["semantic_query_count"] = 10
-        trace["provider_attempts"][0]["query_id"] = "q-0"
+        trace["provider_attempts"][0]["query_index"] = 1
         audits[0]["minimum_tier"] = None
         audits[0]["acceptable_final_tiers"] = ["skip"]
         manifest = _attest_manifest(_sample_manifest(traces, audits))
@@ -1612,19 +1869,29 @@ class ReReviewRound2Tests(unittest.TestCase):
         trace.update(
             initial_query_count=2, semantic_query_count=2,
             executed_queries=[
-                {"query_id": "q-1", "purpose": "direct"},
-                {"query_id": "q-2", "purpose": "direct"},
+                {
+                    "query_index": 1, "purpose": "direct", "round_kind": "initial",
+                    "provider": "tavily", "status": "success", "latency_ms": 5,
+                },
+                {
+                    "query_index": 2, "purpose": "direct", "round_kind": "initial",
+                    "provider": "tavily", "status": "timeout", "latency_ms": 5,
+                },
+                {
+                    "query_index": 2, "purpose": "direct", "round_kind": "initial",
+                    "provider": "ddgs", "status": "timeout", "latency_ms": 5,
+                },
             ],
             provider_attempts=[
                 trace["provider_attempts"][0],
                 {
                     "provider": "tavily", "status": "timeout", "count": 1,
-                    "latency_ms": 5, "query_id": "q-2", "configured": True,
+                    "latency_ms": 5, "query_index": 2, "configured": True,
                     "available": True, "invocation_started": True,
                 },
                 {
                     "provider": "ddgs", "status": "timeout", "count": 1,
-                    "latency_ms": 5, "query_id": "q-2", "configured": True,
+                    "latency_ms": 5, "query_index": 2, "configured": True,
                     "available": True, "invocation_started": True,
                 },
             ],
@@ -2149,16 +2416,22 @@ class ReReviewRound3Tests(unittest.TestCase):
                 else:
                     trace.update(
                         adaptive_repair_round_started=True,
-                        adaptive_repair_query={
-                            "query_id": "repair-1", "purpose": "repair",
-                        },
                         repair_used=True, repair_query_count=2,
                         retrieval_round_count=2,
                         adaptive_repair_latency_ms=1,
                         executed_queries=[
-                            {"query_id": "q-1", "purpose": "direct"},
-                            {"query_id": "repair-1", "purpose": "repair"},
-                            {"query_id": "repair-2", "purpose": "repair"},
+                            {
+                                "query_index": 1, "purpose": "direct", "round_kind": "initial",
+                                "provider": "tavily", "status": "success", "latency_ms": 1,
+                            },
+                            {
+                                "query_index": 2, "purpose": "repair", "round_kind": "repair",
+                                "provider": "tavily", "status": "success", "latency_ms": 1,
+                            },
+                            {
+                                "query_index": 3, "purpose": "repair", "round_kind": "repair",
+                                "provider": "tavily", "status": "success", "latency_ms": 1,
+                            },
                         ],
                     )
                     audits[0]["stages_started"].append("adaptive_repair")

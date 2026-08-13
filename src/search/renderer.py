@@ -284,15 +284,11 @@ def _render_sources(
     lines: list[str] = []
     used_ids: list[str] = []
     shown_urls: list[str] = []
-    seen_urls: set[str] = set()
     for item in sources:
         number = citation_map.get(item.evidence_id)
         if number is None or not item.url:
             continue
         url = item.url
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
         title = _bounded_source_title(item.title or url, url, number, qq_limit)
         lines.append(f"[{number}] {_bounded_title(title)}")
         lines.append(url)

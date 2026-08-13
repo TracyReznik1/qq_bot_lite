@@ -151,21 +151,12 @@ def _conflict_scope(evidence: EvidenceBundle | None) -> AllowedClaimScope:
 
 
 def _conflict_topic_ids(evidence: EvidenceBundle) -> frozenset[str]:
-    """Map conflict members back to material topic IDs via their evidence items."""
-    label_to_ids: dict[str, set[str]] = {}
-    for topic in evidence.plan.required_topics:
-        if topic.material:
-            label_to_ids.setdefault(topic.label, set()).add(topic.topic_id)
-    item_by_id = {item.evidence_id: item for item in evidence.evidence_items}
-    topic_ids: set[str] = set()
-    for conflict in evidence.conflicts:
-        for member in conflict.members:
-            item = item_by_id.get(member.evidence_id)
-            if item is None:
-                continue
-            for label in item.supported_topics:
-                topic_ids.update(label_to_ids.get(label, ()))
-    return frozenset(topic_ids)
+    """Read explicit material conflict coverage from Evidence assembly."""
+    return frozenset(
+        topic_id
+        for conflict in evidence.conflicts
+        for topic_id in conflict.topic_ids
+    )
 
 
 def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCode:
@@ -185,7 +176,7 @@ def build_render_state(
     """Build a deterministic render view from policy, validation and evidence."""
     if validation is None:
         cited_ids: list[str] = []
-        conflicts = evidence.conflicts if evidence is not None else ()
+        conflicts = _relevant_conflicts(answer_state, None, evidence)
         for conflict in conflicts:
             for member in conflict.members:
                 if member.evidence_id and member.evidence_id not in cited_ids:
@@ -233,7 +224,7 @@ def build_render_state(
         for evidence_id in claim.evidence_ids:
             if evidence_id and evidence_id not in cited_ids:
                 cited_ids.append(evidence_id)
-    conflicts = evidence.conflicts if evidence is not None else ()
+    conflicts = _relevant_conflicts(answer_state, validation, evidence)
     for conflict in conflicts:
         for member in conflict.members:
             if member.evidence_id and member.evidence_id not in cited_ids:
@@ -255,6 +246,7 @@ def build_render_state(
         if any(member.evidence_id in citation_map for member in conflict.members)
     )
 
+    disclosures = _render_disclosures(answer_state, validation)
     return RenderState(
         outcome=_render_outcome(scope, validation.status),
         visible_blocks=visible_blocks,
@@ -262,9 +254,43 @@ def build_render_state(
         citation_map=citation_map,
         used_sources=used_sources,
         conflict_groups=conflict_groups,
-        disclosure_codes=answer_state.disclosure_codes,
+        disclosure_codes=disclosures,
         warning_codes=answer_state.warning_codes,
     )
+
+
+def _render_disclosures(
+    answer_state: AnswerState,
+    validation: ValidationReport,
+) -> tuple[DisclosureCode, ...]:
+    codes = list(answer_state.disclosure_codes)
+    if validation.status is ValidatorStatus.UNAVAILABLE:
+        codes.append(DisclosureCode.VALIDATION_UNAVAILABLE)
+    return tuple(dict.fromkeys(codes))
+
+
+def _relevant_conflicts(
+    answer_state: AnswerState,
+    validation: ValidationReport | None,
+    evidence: EvidenceBundle | None,
+) -> tuple:
+    """Keep structured conflicts only when the final view exposes them."""
+    if evidence is None:
+        return ()
+    scope = (
+        validation.effective_claim_scope
+        if validation is not None
+        else answer_state.allowed_claim_scope
+    )
+    if (
+        DisclosureCode.SOURCE_CONFLICT in answer_state.disclosure_codes
+        or scope in {
+            AllowedClaimScope.SUPPORTED_SUBSET_WITH_CONFLICTS,
+            AllowedClaimScope.CONFLICT_DESCRIPTION_ONLY,
+        }
+    ):
+        return evidence.conflicts
+    return ()
 
 
 def _render_outcome(

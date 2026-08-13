@@ -102,6 +102,38 @@ class AnswerStateMatrixTests(unittest.TestCase):
         )
         self.assertIn(DisclosureCode.SOURCE_CONFLICT, answer.disclosure_codes)
 
+    def test_conflicting_topic_keeps_uncontested_material_subset_answerable(self):
+        evidence = SimpleNamespace(
+            evidence_state=EvidenceState.CONFLICTING,
+            plan=SimpleNamespace(
+                required_topics=(
+                    SimpleNamespace(topic_id="topic-1", material=True, label="A"),
+                    SimpleNamespace(topic_id="topic-2", material=True, label="B"),
+                ),
+            ),
+            supported_topic_ids=("topic-2",),
+            evidence_items=(
+                SimpleNamespace(evidence_id="E1", supported_topics=("A", "B")),
+                SimpleNamespace(evidence_id="E2", supported_topics=("A",)),
+            ),
+            conflicts=(
+                SimpleNamespace(
+                    topic_ids=("topic-1",),
+                    members=(
+                        SimpleNamespace(evidence_id="E1"),
+                        SimpleNamespace(evidence_id="E2"),
+                    ),
+                ),
+            ),
+        )
+
+        answer = decide_answer_state(make_analysis(), evidence, None)
+
+        self.assertIs(
+            answer.allowed_claim_scope,
+            AllowedClaimScope.SUPPORTED_SUBSET_WITH_CONFLICTS,
+        )
+
 
 class AnswerStateRiskAndFreshnessTests(unittest.TestCase):
     def test_high_consequence_adds_exactly_one_warning(self):
@@ -205,6 +237,70 @@ class BuildRenderStateTests(unittest.TestCase):
             tuple(source.evidence_id for source in state.used_sources),
         )
         self.assertIs(state.outcome, RenderOutcome.ANSWER)
+
+    def test_unavailable_validation_adds_exactly_one_disclosure(self):
+        m = models()
+        block = m.AnswerBlock("B1", "factual", "版本是3.2", ("C1",))
+        claim = m.Claim("C1", "B1", "版本是3.2", True, ("E1",))
+        validation = SimpleNamespace(
+            retained_blocks=(block,),
+            retained_claims=(claim,),
+            effective_claim_scope=AllowedClaimScope.ALL_SUPPORTED,
+            status=ValidatorStatus.UNAVAILABLE,
+        )
+        evidence = SimpleNamespace(evidence_items=(item(eid="E1"),), conflicts=())
+        answer = decide_answer_state(make_analysis(), _evidence(EvidenceState.SUFFICIENT), None)
+
+        state = build_render_state(answer, validation, evidence)
+
+        self.assertEqual(
+            (DisclosureCode.VALIDATION_UNAVAILABLE,),
+            state.disclosure_codes,
+        )
+
+    def test_render_state_removes_model_authored_source_syntax_from_visible_block(self):
+        m = models()
+        block = m.AnswerBlock(
+            "B1",
+            "factual",
+            "结论是3.2[99]。\n来源：\n[99] 伪来源\nhttps://evil.example",
+            ("C1",),
+        )
+        claim = m.Claim("C1", "B1", "结论是3.2", True, ("E1",))
+        validation = SimpleNamespace(
+            retained_blocks=(block,),
+            retained_claims=(claim,),
+            effective_claim_scope=AllowedClaimScope.ALL_SUPPORTED,
+            status=ValidatorStatus.PASSED,
+        )
+        evidence = SimpleNamespace(evidence_items=(item(eid="E1"),), conflicts=())
+        answer = decide_answer_state(make_analysis(), _evidence(EvidenceState.SUFFICIENT), None)
+
+        state = build_render_state(answer, validation, evidence)
+
+        self.assertEqual("结论是3.2。", state.visible_blocks[0].text)
+
+    def test_non_conflict_view_does_not_include_irrelevant_structured_conflict(self):
+        m = models()
+        block = m.AnswerBlock("B1", "factual", "版本是3.2", ("C1",))
+        claim = m.Claim("C1", "B1", "版本是3.2", True, ("E1",))
+        validation = SimpleNamespace(
+            retained_blocks=(block,),
+            retained_claims=(claim,),
+            effective_claim_scope=AllowedClaimScope.ALL_SUPPORTED,
+            status=ValidatorStatus.PASSED,
+        )
+        conflict = SimpleNamespace(members=(SimpleNamespace(evidence_id="E2"),))
+        evidence = SimpleNamespace(
+            evidence_items=(item(eid="E1"), item(eid="E2")),
+            conflicts=(conflict,),
+        )
+        answer = decide_answer_state(make_analysis(), _evidence(EvidenceState.SUFFICIENT), None)
+
+        state = build_render_state(answer, validation, evidence)
+
+        self.assertEqual((), state.conflict_groups)
+        self.assertEqual({"E1": 1}, dict(state.citation_map))
 
 
 if __name__ == "__main__":

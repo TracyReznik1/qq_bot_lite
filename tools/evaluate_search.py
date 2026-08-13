@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
@@ -181,6 +182,28 @@ LATENCY_FIELDS = (
 )
 
 REQUEST_SOURCES = {"chat", "command", "compatibility"}
+RETRIEVAL_COMPLEXITY_CODES = {
+    "multi_fact", "multi_entity", "comparison", "recommendation",
+    "multi_source_required", "cross_verification_required", "ambiguous_entity",
+}
+REPAIR_REASON_CODES = {
+    "missing_topic", "stale_evidence", "source_conflict", "entity_ambiguity",
+    "premise_mismatch", "source_quality_gap", "content_unreadable",
+}
+FRESHNESS_ELIGIBILITY = {"not_required", "satisfied", "stale", "unknown"}
+ANSWER_GENERATION_MODES = {"plain", "grounded", "fixed"}
+ANSWER_CERTAINTIES = {"verified", "limited", "conflicting", "unverified"}
+ANSWER_CLAIM_SCOPES = {
+    "all_supported", "supported_subset", "supported_subset_with_conflicts",
+    "conflict_description_only", "no_external_factual_claims",
+}
+ANSWER_DISCLOSURE_CODES = {
+    "online_verification_failed", "partial_evidence", "source_conflict",
+    "validation_unavailable", "validation_failed", "user_forbid_web",
+}
+WARNING_CODES = {"high_consequence"}
+VALIDATOR_STATUSES = {"passed", "filtered", "unavailable", "malformed"}
+RENDER_OUTCOMES = {"answer", "partial", "conflict", "failure", "validation_failure"}
 FACTUALITIES = {"non_factual", "factual", "mixed", "ambiguous"}
 TRIGGER_CODES = {
     "explicit_no_web", "explicit_search", "explicit_verification",
@@ -197,9 +220,17 @@ REDACTION_CODES = {
     "email_address", "empty_after_redaction", "invalid_redaction_code",
 }
 PROVIDER_NAMES = {"tavily", "ddgs", "[redacted]"}
-QUERY_FIELDS = {"query_id", "purpose"}
+OPAQUE_TOPIC_ID_PATTERN = re.compile(r"topic-[1-9][0-9]*")
+QUERY_ROUND_KINDS = {"initial", "repair"}
+RETRIEVAL_STOP_REASONS = {
+    "evidence_sufficient", "no_repair_benefit", "budget_exhausted",
+    "post_repair_stop",
+}
+QUERY_FIELDS = {
+    "query_index", "purpose", "round_kind", "provider", "status", "latency_ms",
+}
 PROVIDER_ATTEMPT_FIELDS = {
-    "provider", "status", "count", "latency_ms", "query_id", "configured",
+    "provider", "status", "count", "latency_ms", "query_index", "configured",
     "available", "invocation_started",
 }
 TRACE_FIELDS = {
@@ -213,7 +244,14 @@ TRACE_FIELDS = {
     "repair_used", "claim_count", "supported_claim_count", "citation_count",
     "knowledge_fallback_used", "degradation_reason", "content_read_count",
     "provider_attempted", "sufficient_evidence", "semantic_query_count",
-    "repair_query_count", *LATENCY_FIELDS,
+    "repair_query_count", "retrieval_stop_reason", *LATENCY_FIELDS,
+    "must_search", "retrieval_reason_codes", "repair_reason_codes",
+    "repair_target_topic_ids", "supported_topic_ids", "missing_topic_ids",
+    "topic_freshness", "answer_generation_mode", "answer_certainty",
+    "answer_claim_scope", "answer_disclosure_codes", "answer_warning_codes",
+    "validator_status", "validator_retained_claim_count",
+    "validator_removed_block_count", "render_outcome", "render_citation_count",
+    "render_source_count", "finalized",
 }
 AUDIT_FIELDS = {
     "case_id", "request_id", "category", "allow_skip", "skip_reason",
@@ -1663,46 +1701,46 @@ def offline(
 
 def _semantic_query_count(trace: Any) -> int:
     executed = _field(trace, "executed_queries", ()) or ()
-    query_ids: set[str] = set()
+    query_indexes: set[int] = set()
     for query in executed:
         if isinstance(query, Mapping):
-            query_id = query.get("query_id")
+            query_index = query.get("query_index")
         elif isinstance(query, tuple) and len(query) == 2:
-            query_id = getattr(query[0], "query_id", query[0])
+            query_index = getattr(query[0], "query_index", query[0])
         else:
-            query_id = getattr(query, "query_id", None)
-        if _is_nonempty_string(query_id):
-            query_ids.add(query_id)
+            query_index = getattr(query, "query_index", None)
+        if _is_int(query_index) and query_index > 0:
+            query_indexes.add(query_index)
     if isinstance(trace, Mapping) and "executed_queries" in trace:
-        return len(query_ids)
+        return len(query_indexes)
     value = _field(trace, "semantic_query_count")
     return value if _is_int(value) else 0
 
 
 def _repair_query_count(trace: Any) -> int:
     executed = _field(trace, "executed_queries", ()) or ()
-    query_ids: set[str] = set()
+    query_indexes: set[int] = set()
     for query in executed:
-        purpose = query.get("purpose") if isinstance(query, Mapping) else getattr(query, "purpose", None)
-        query_id = query.get("query_id") if isinstance(query, Mapping) else getattr(query, "query_id", None)
-        if _enum_text(purpose) == "repair" and _is_nonempty_string(query_id):
-            query_ids.add(query_id)
+        round_kind = query.get("round_kind") if isinstance(query, Mapping) else getattr(query, "round_kind", None)
+        query_index = query.get("query_index") if isinstance(query, Mapping) else getattr(query, "query_index", None)
+        if _enum_text(round_kind) == "repair" and _is_int(query_index) and query_index > 0:
+            query_indexes.add(query_index)
     if isinstance(trace, Mapping) and "executed_queries" in trace:
-        return len(query_ids)
+        return len(query_indexes)
     value = _field(trace, "repair_query_count")
     return value if _is_int(value) else int(bool(_field(trace, "adaptive_repair_round_started")))
 
 
 def _initial_query_count(trace: Any) -> int:
     executed = _field(trace, "executed_queries", ()) or ()
-    query_ids: set[str] = set()
+    query_indexes: set[int] = set()
     for query in executed:
-        purpose = query.get("purpose") if isinstance(query, Mapping) else getattr(query, "purpose", None)
-        query_id = query.get("query_id") if isinstance(query, Mapping) else getattr(query, "query_id", None)
-        if _enum_text(purpose) != "repair" and _is_nonempty_string(query_id):
-            query_ids.add(query_id)
+        round_kind = query.get("round_kind") if isinstance(query, Mapping) else getattr(query, "round_kind", None)
+        query_index = query.get("query_index") if isinstance(query, Mapping) else getattr(query, "query_index", None)
+        if _enum_text(round_kind) == "initial" and _is_int(query_index) and query_index > 0:
+            query_indexes.add(query_index)
     if isinstance(trace, Mapping) and "executed_queries" in trace:
-        return len(query_ids)
+        return len(query_indexes)
     return _counter(trace, "initial_query_count")
 
 
@@ -2195,7 +2233,7 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         "orchestrator_started", "initial_round_started",
         "adaptive_repair_round_started", "provider_configured",
         "provider_invocation_started", "knowledge_fallback_used", "repair_used",
-        "provider_attempted", "sufficient_evidence",
+        "provider_attempted", "sufficient_evidence", "must_search", "finalized",
     ):
         if type(trace.get(name)) is not bool:
             errors.append(f"{prefix} {name} must be boolean")
@@ -2203,6 +2241,8 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         "initial_query_count", "retrieval_round_count", "candidate_url_count",
         "content_read_count", "semantic_query_count", "repair_query_count",
         "citable_evidence_count", "claim_count", "supported_claim_count", "citation_count",
+        "validator_retained_claim_count", "validator_removed_block_count",
+        "render_citation_count", "render_source_count",
     ):
         if not _is_int(trace.get(name)):
             errors.append(f"{prefix} {name} must be a non-negative integer")
@@ -2210,8 +2250,52 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         values = trace.get(name)
         if not _is_string_list(values) or any(not _closed(value, REDACTION_CODES) for value in values or ()):
             errors.append(f"{prefix} invalid {name}")
+    for name, allowed in (
+        ("retrieval_reason_codes", RETRIEVAL_COMPLEXITY_CODES),
+        ("repair_reason_codes", REPAIR_REASON_CODES),
+        ("answer_disclosure_codes", ANSWER_DISCLOSURE_CODES),
+        ("answer_warning_codes", WARNING_CODES),
+    ):
+        values = trace.get(name)
+        if not _is_string_list(values) or any(not _closed(value, allowed) for value in values or ()):
+            errors.append(f"{prefix} invalid {name}")
+    for name in ("repair_target_topic_ids", "supported_topic_ids", "missing_topic_ids"):
+        if not _is_string_list(trace.get(name)) or any(
+            not isinstance(value, str) or OPAQUE_TOPIC_ID_PATTERN.fullmatch(value) is None
+            for value in trace.get(name) or ()
+        ):
+            errors.append(f"{prefix} invalid {name}")
+    topic_freshness = trace.get("topic_freshness")
+    if not isinstance(topic_freshness, list):
+        errors.append(f"{prefix} topic_freshness must be a list")
+    else:
+        seen_topic_ids: set[str] = set()
+        for topic_index, topic in enumerate(topic_freshness, 1):
+            topic_prefix = f"{prefix} topic freshness {topic_index}"
+            if not isinstance(topic, Mapping) or set(topic) != {"topic_id", "freshness"}:
+                errors.append(f"{topic_prefix} must contain exactly topic_id and freshness")
+                continue
+            topic_id = topic.get("topic_id")
+            if not isinstance(topic_id, str) or OPAQUE_TOPIC_ID_PATTERN.fullmatch(topic_id) is None:
+                errors.append(f"{topic_prefix} invalid topic_id")
+            elif topic_id in seen_topic_ids:
+                errors.append(f"{topic_prefix} duplicate topic_id")
+            else:
+                seen_topic_ids.add(topic_id)
+            if not _closed(topic.get("freshness"), FRESHNESS_ELIGIBILITY):
+                errors.append(f"{topic_prefix} invalid freshness")
+    for name, allowed in (
+        ("answer_generation_mode", ANSWER_GENERATION_MODES),
+        ("answer_certainty", ANSWER_CERTAINTIES),
+        ("answer_claim_scope", ANSWER_CLAIM_SCOPES),
+        ("validator_status", VALIDATOR_STATUSES),
+        ("render_outcome", RENDER_OUTCOMES),
+    ):
+        value = trace.get(name)
+        if value is not None and not _closed(value, allowed):
+            errors.append(f"{prefix} invalid {name}")
     executed = trace.get("executed_queries")
-    query_purposes: dict[str, str] = {}
+    query_rounds: dict[int, str] = {}
     if not isinstance(executed, list):
         errors.append(f"{prefix} executed_queries must be a list")
     else:
@@ -2226,20 +2310,29 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
                 errors.append(f"{query_prefix} missing fields: {', '.join(query_missing)}")
             if query_unexpected:
                 errors.append(f"{query_prefix} unexpected fields: {', '.join(query_unexpected)}")
-            query_id = query.get("query_id")
+            query_id = query.get("query_index")
             purpose = query.get("purpose")
-            if not _normalized_identifier(query_id):
-                errors.append(f"{query_prefix} invalid query_id")
+            round_kind = query.get("round_kind")
+            if not _is_int(query_id) or query_id <= 0:
+                errors.append(f"{query_prefix} invalid query_index")
             if not _closed(purpose, QUERY_PURPOSES):
                 errors.append(f"{query_prefix} invalid purpose")
+            if not _closed(round_kind, QUERY_ROUND_KINDS):
+                errors.append(f"{query_prefix} invalid round_kind")
+            if not _closed(query.get("provider"), PROVIDER_NAMES):
+                errors.append(f"{query_prefix} invalid provider")
+            if not _closed(query.get("status"), PROVIDER_STATUSES):
+                errors.append(f"{query_prefix} invalid status")
+            if not _is_nonnegative_number(query.get("latency_ms")):
+                errors.append(f"{query_prefix} invalid latency_ms")
             if (
-                _is_nonempty_string(query_id)
-                and query_id in query_purposes
-                and query_purposes[query_id] != purpose
+                _is_int(query_id)
+                and query_id in query_rounds
+                and query_rounds[query_id] != round_kind
             ):
-                errors.append(f"{query_prefix} query_id has conflicting purposes")
-            if _is_nonempty_string(query_id) and isinstance(purpose, str):
-                query_purposes[query_id] = purpose
+                errors.append(f"{query_prefix} query_index has conflicting round kinds")
+            if _is_int(query_id) and isinstance(round_kind, str):
+                query_rounds[query_id] = round_kind
     attempts = trace.get("provider_attempts")
     if not isinstance(attempts, list):
         errors.append(f"{prefix} provider_attempts must be a list")
@@ -2263,8 +2356,8 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
                 errors.append(f"{attempt_prefix} count must be a non-negative integer")
             if not _is_nonnegative_number(attempt.get("latency_ms")):
                 errors.append(f"{prefix} provider attempt {attempt_index} invalid latency_ms")
-            if not _normalized_identifier(attempt.get("query_id")):
-                errors.append(f"{attempt_prefix} invalid query_id")
+            if not _is_int(attempt.get("query_index")) or attempt.get("query_index") <= 0:
+                errors.append(f"{attempt_prefix} invalid query_index")
             for name in ("configured", "available", "invocation_started"):
                 if type(attempt.get(name)) is not bool:
                     errors.append(f"{attempt_prefix} {name} must be boolean")
@@ -2290,6 +2383,33 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         errors.append(f"{prefix} invalid evidence_state")
     if trace.get("degradation_reason") is not None and not _closed(trace.get("degradation_reason"), FAILURE_CODES):
         errors.append(f"{prefix} invalid degradation_reason")
+    if trace.get("retrieval_stop_reason") is not None and not _closed(
+        trace.get("retrieval_stop_reason"), RETRIEVAL_STOP_REASONS,
+    ):
+        errors.append(f"{prefix} invalid retrieval_stop_reason")
+    if trace.get("finalized") is not True:
+        errors.append(f"{prefix} finalized must be true")
+    if route != "skip" and trace.get("orchestrator_started") is True:
+        for field_name in (
+            "answer_generation_mode",
+            "answer_certainty",
+            "answer_claim_scope",
+            "render_outcome",
+        ):
+            if trace.get(field_name) is None:
+                errors.append(f"{prefix} finalized search trace requires {field_name}")
+        generation_mode = trace.get("answer_generation_mode")
+        validator_status = trace.get("validator_status")
+        if generation_mode == "grounded" and validator_status is None:
+            errors.append(f"{prefix} finalized grounded trace requires validator_status")
+        if generation_mode in {"fixed", "plain"} and validator_status is not None:
+            malformed_fixed = (
+                generation_mode == "fixed"
+                and validator_status == "malformed"
+                and trace.get("degradation_reason") == "validation_failed"
+            )
+            if not malformed_fixed:
+                errors.append(f"{prefix} {generation_mode} trace cannot set validator_status")
     for name in LATENCY_FIELDS:
         if not _is_nonnegative_number(trace.get(name)):
             errors.append(f"{prefix} {name} must be a finite non-negative number")
@@ -2308,6 +2428,8 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         errors.append(f"{prefix} repair_used disagrees with adaptive repair round")
     if repair_started and _repair_query_count(trace) != 1:
         errors.append(f"{prefix} adaptive repair round requires exactly one repair query")
+    if _repair_query_count(trace) > 0 and trace.get("retrieval_stop_reason") != "post_repair_stop":
+        errors.append(f"{prefix} repair query requires post_repair_stop")
     if not repair_started and trace.get("adaptive_repair_latency_ms") != 0:
         errors.append(f"{prefix} non-started adaptive repair requires zero latency")
     if trace.get("provider_attempted") != trace.get("provider_invocation_started"):
@@ -2319,20 +2441,36 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     ):
         errors.append(f"{prefix} provider_invocation_started disagrees with provider attempts")
     if isinstance(attempts, list) and isinstance(executed, list):
-        executed_ids = {
-            item.get("query_id") for item in executed
-            if isinstance(item, Mapping) and _is_nonempty_string(item.get("query_id"))
+        executed_keys = {
+            (item.get("query_index"), item.get("provider"), item.get("status"))
+            for item in executed
+            if isinstance(item, Mapping)
+        }
+        attempt_keys = {
+            (item.get("query_index"), item.get("provider"), item.get("status"))
+            for item in attempts
+            if isinstance(item, Mapping)
         }
         for attempt_index, attempt in enumerate(attempts, 1):
             if (
                 isinstance(attempt, Mapping)
                 and (
-                    not _is_nonempty_string(attempt.get("query_id"))
-                    or attempt.get("query_id") not in executed_ids
-                )
+                    attempt.get("query_index"), attempt.get("provider"), attempt.get("status")
+                ) not in executed_keys
             ):
                 errors.append(
-                    f"{prefix} provider attempt {attempt_index} query_id is not an executed query"
+                    f"{prefix} provider attempt {attempt_index} query_index is not an executed query; provider/status does not match an executed query"
+                )
+        for query_index, query in enumerate(executed, 1):
+            if (
+                isinstance(query, Mapping)
+                and attempts
+                and (
+                query.get("query_index"), query.get("provider"), query.get("status")
+                ) not in attempt_keys
+            ):
+                errors.append(
+                    f"{prefix} executed query {query_index} does not match a provider attempt"
                 )
     if route == "skip" and any(
         bool(trace.get(name)) for name in (
@@ -2832,6 +2970,8 @@ def _evaluate_traces_impl(
     trusted_attestation_verified = not _validate_trusted_attestation(
         sample_manifest, trusted_verifier_key, "sample manifest",
     )
+    if not trusted_attestation_verified:
+        failures.append("trusted sample manifest attestation was not verified")
 
     return {
         "mode": "traces",

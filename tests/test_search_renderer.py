@@ -54,6 +54,7 @@ def _conflict():
             EvidenceConflictMember("E1", "3.2", None, "contradicts"),
             EvidenceConflictMember("E2", "3.3", None, "contradicts"),
         ),
+        topic_ids=("topic-1",),
     )
 
 
@@ -156,17 +157,37 @@ class PureRendererTests(unittest.TestCase):
         rendered = render_search_reply(state, qq_limit=1700)
         self.assertIn("[1]", rendered.text)
 
-    def test_unused_sources_never_appear(self):
+    def test_same_url_evidence_keeps_each_citation_source_entry(self):
         block = AnswerBlock("B1", "factual", "正文", ("C1",))
-        claim = Claim("C1", "B1", "正文", True, ("E1",))
+        claim = Claim("C1", "B1", "正文", True, ("E1", "E2"))
+        shared_url = "https://example.com/shared"
         state = _state(
             blocks=(block,),
             claims=(claim,),
-            citation_map={"E1": 1},
-            sources=(item(eid="E1"), item(eid="E2", url="https://unused.example.com")),
+            citation_map={"E1": 1, "E2": 2},
+            sources=(
+                item(eid="E1", url=shared_url, title="Source A"),
+                item(eid="E2", url=shared_url, title="Source B"),
+            ),
         )
+
         rendered = render_search_reply(state, qq_limit=1700)
-        self.assertNotIn("https://unused.example.com", rendered.text)
+
+        self.assertIn("正文[1][2]", rendered.text)
+        self.assertIn("[1] Source A", rendered.text)
+        self.assertIn("[2] Source B", rendered.text)
+        self.assertEqual(2, rendered.text.count(shared_url))
+
+    def test_unused_sources_are_rejected_by_render_state_contract(self):
+        block = AnswerBlock("B1", "factual", "正文", ("C1",))
+        claim = Claim("C1", "B1", "正文", True, ("E1",))
+        with self.assertRaises(ValueError):
+            _state(
+                blocks=(block,),
+                claims=(claim,),
+                citation_map={"E1": 1},
+                sources=(item(eid="E1"), item(eid="E2", url="https://unused.example.com")),
+            )
 
     def test_long_source_url_stays_atomic(self):
         block = AnswerBlock("B1", "factual", "正文", ("C1",))

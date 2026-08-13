@@ -19,6 +19,7 @@ from src.search.models import (
     AnswerState,
     DisclosureCode,
     EvidenceState,
+    RenderOutcome,
     RequestSource,
     RetrievalRequest,
     SearchFailureCode,
@@ -26,6 +27,7 @@ from src.search.models import (
     SearchTier,
     SkipReason,
     ValidatorRequirement,
+    ValidatorStatus,
     WarningCode,
 )
 from src.search.policy import build_render_state, decide_answer_state
@@ -304,6 +306,7 @@ def _grounded_generation(
         return _handle_draft_failure(result, answer_state)
     if report is None:
         return _handle_draft_failure(result, answer_state)
+    _record_validation_trace(result.trace, report)
     render_state = build_render_state(answer_state, report, result.evidence)
     rendered = _render_view(render_state, result)
     return rendered.text, result
@@ -315,6 +318,9 @@ def _handle_draft_failure(
 ) -> tuple[str, SearchPipelineResult]:
     """A malformed draft cannot produce a definite grounded answer."""
     result.trace.degradation_reason = SearchFailureCode.VALIDATION_FAILED
+    result.trace.validator_status = ValidatorStatus.MALFORMED
+    result.trace.validator_retained_claim_count = 0
+    result.trace.validator_removed_block_count = 0
     failed_result = replace(result, failure_code=SearchFailureCode.VALIDATION_FAILED)
     disclosures = [DisclosureCode.VALIDATION_FAILED]
     if (
@@ -331,6 +337,7 @@ def _handle_draft_failure(
         answer_state.warning_codes,
         answer_state.validator_requirement,
     )
+    _record_answer_trace(result.trace, failed_state)
     render_state = build_render_state(failed_state, None, failed_result.evidence)
     rendered = _render_view(render_state, failed_result)
     return rendered.text, failed_result
@@ -394,6 +401,7 @@ def generate_reply(
             result.evidence,
             result.failure_code,
         )
+        _record_answer_trace(result.trace, answer_state)
         if answer_state.generation_mode is AnswerGenerationMode.PLAIN:
             reply, final_result = _handle_plain(mem_ctx, text, images, result)
         elif answer_state.generation_mode is AnswerGenerationMode.GROUNDED:
@@ -425,6 +433,9 @@ def _handle_plain(mem_ctx, text, images, result) -> tuple[str, SearchPipelineRes
         trace=result.trace,
         qq_limit=_qq_limit(),
     )
+    result.trace.render_outcome = RenderOutcome.ANSWER
+    result.trace.render_citation_count = 0
+    result.trace.render_source_count = 0
     return rendered.text, result
 
 
@@ -454,7 +465,24 @@ def _render_view(
         0.0,
     )
     result.trace.citation_count = len(rendered.shown_source_urls)
+    result.trace.render_outcome = render_state.outcome
+    result.trace.render_citation_count = len(rendered.used_evidence_ids)
+    result.trace.render_source_count = len(rendered.shown_source_urls)
     return rendered
+
+
+def _record_answer_trace(trace, answer_state) -> None:
+    trace.answer_generation_mode = answer_state.generation_mode
+    trace.answer_certainty = answer_state.certainty
+    trace.answer_claim_scope = answer_state.allowed_claim_scope
+    trace.answer_disclosure_codes = answer_state.disclosure_codes
+    trace.answer_warning_codes = answer_state.warning_codes
+
+
+def _record_validation_trace(trace, report) -> None:
+    trace.validator_status = report.status
+    trace.validator_retained_claim_count = len(report.retained_claims)
+    trace.validator_removed_block_count = len(report.removed_block_ids)
 
 
 def _fixed_answer_state(

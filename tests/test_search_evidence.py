@@ -54,15 +54,33 @@ def decision(tier=SearchTier.STANDARD):
     )
 
 
-def query(qid="q1", text="什么是光合作用"):
-    return SearchQuery(qid, SearchRoundKind.INITIAL, QueryPurpose.DIRECT, text)
+def query(qid="initial-1", text="什么是光合作用", targets=("topic-1",)):
+    return SearchQuery(
+        qid,
+        SearchRoundKind.INITIAL,
+        QueryPurpose.DIRECT,
+        text,
+        query_index=1,
+        target_topic_ids=targets,
+    )
 
 
 def plan(required_topics=("定义",), route=SearchTier.STANDARD):
     d = decision(route)
+    topics = tuple(
+        RequiredTopic(
+            f"topic-{index}",
+            label,
+            True,
+            FreshnessRequirement.NOT_REQUIRED,
+            source_requirement=SourceRequirement.ANY_RELEVANT,
+        )
+        for index, label in enumerate(required_topics, 1)
+    ) if all(type(value) is str for value in required_topics) else tuple(required_topics)
+    material_ids = tuple(value.topic_id for value in topics if value.material)
     return SearchPlan(
         d, "什么是光合作用", __import__("src.search.models", fromlist=["PlanningStatus"]).PlanningStatus.NORMAL,
-        ("光合作用",), None, (query(),), tuple(required_topics),
+        ("光合作用",), None, (query(targets=material_ids),), topics,
         frozenset({SourceRelation.PRIMARY, SourceRelation.INDEPENDENT}), (), _budget(route),
     )
 
@@ -978,6 +996,9 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
             ("E1", "E2"),
             tuple(member.evidence_id for member in bundle.conflicts[0].members),
         )
+        self.assertEqual(("topic-1",), bundle.conflicts[0].topic_ids)
+        gap = self.module.EvidenceAssembler(judge).analyze_gap(search_plan, bundle)
+        self.assertEqual(("topic-1",), gap.repair_target_topic_ids)
 
     def test_version_literal_has_matching_mismatching_and_absent_outcomes(self):
         search_plan = topic_plan(

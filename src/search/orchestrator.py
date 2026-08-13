@@ -43,6 +43,7 @@ from src.search.models import (
     SearchTier,
     SearchTrace,
     SkipReason,
+    TopicFreshnessTraceEntry,
     TriggerCode,
 )
 from src.search.planner import SearchPlanner, _query_fingerprint
@@ -152,6 +153,8 @@ class SearchOrchestrator:
         decision = retrieval_decision
         trace.route = retrieval_decision.route
         trace.skip_reason = retrieval_decision.skip_reason
+        trace.must_search = retrieval_decision.must_search
+        trace.retrieval_reason_codes = retrieval_decision.reason_codes
         trace.route_latency_ms = self._elapsed_ms(response_started)
 
         if retrieval_decision.route is SearchTier.SKIP:
@@ -280,6 +283,7 @@ class SearchOrchestrator:
         trace.evidence_assembly_total_latency_ms = trace.initial_evidence_assembly_latency_ms
         trace.citable_evidence_count = sum(1 for item in bundle.evidence_items if item.citable)
         trace.evidence_state = bundle.evidence_state
+        self._record_evidence_trace(trace, bundle)
 
         if self._expired(deadline):
             return self._timeout_result(
@@ -288,21 +292,6 @@ class SearchOrchestrator:
                 trace,
                 retrieval_started,
                 bundle=bundle,
-                analysis=analysis,
-            )
-
-        if not bundle.evidence_items and any(
-            result.status is ProviderStatus.SUCCESS and result.hits
-            for result in provider_results
-        ):
-            return self._failure_result(
-                decision,
-                plan,
-                trace,
-                retrieval_started,
-                failure=SearchFailureCode.CONTENT_UNREADABLE,
-                bundle=None,
-                limitation="content_unreadable",
                 analysis=analysis,
             )
 
@@ -330,6 +319,7 @@ class SearchOrchestrator:
             budget=budget,
         )
         repair_dispatched = False
+        post_repair_gap = gap
         if gates_pass and gap.repair_eligible:
             repair_started = self._monotonic()
             prior_fingerprints = tuple(
@@ -346,6 +336,8 @@ class SearchOrchestrator:
             if repair_completed and isinstance(planned_repair, RepairPlan):
                 repair = planned_repair
             if repair.triggered and repair.repair_query is not None:
+                trace.repair_reason_codes = repair.reason_codes
+                trace.repair_target_topic_ids = repair.target_topic_ids
                 repair_dispatched = True
                 trace.adaptive_repair_round_started = True
                 trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
@@ -372,6 +364,16 @@ class SearchOrchestrator:
                     existing_candidate_keys=candidate_keys,
                     existing_read_count=reads,
                 )
+                repair_unreadable_topic_ids = _unreadable_topic_ids(
+                    plan,
+                    _repair_unreadable,
+                    additional_queries=(repair.repair_query,),
+                )
+                unreadable_topic_ids = tuple(
+                    dict.fromkeys(
+                        (*unreadable_topic_ids, *repair_unreadable_topic_ids)
+                    )
+                )
                 candidate_keys.update(repair_keys)
                 reads = min(reads + more_reads, budget.max_content_reads)
                 trace.candidate_url_count = len(candidate_keys)
@@ -390,6 +392,14 @@ class SearchOrchestrator:
                     bundle = repaired_bundle
                 trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_evidence_started)
                 trace.evidence_state = bundle.evidence_state
+                self._record_evidence_trace(trace, bundle)
+                # This is diagnostic-only: it is sealed below and deliberately
+                # never feeds a second repair dispatch.
+                post_repair_gap = self._assembler().analyze_gap(
+                    plan,
+                    bundle,
+                    content_unreadable_topic_ids=unreadable_topic_ids,
+                )
                 trace.repair_used = True
                 # A second gap never triggers another dispatch.
                 trace.retrieval_stop_reason = RetrievalStopReason.POST_REPAIR_STOP
@@ -402,7 +412,7 @@ class SearchOrchestrator:
                 trace,
                 retrieval_started,
                 bundle=bundle,
-                gap=gap,
+                gap=post_repair_gap,
                 repair=repair,
                 initial_canonical_urls=initial_canonical_urls,
                 analysis=analysis,
@@ -422,8 +432,9 @@ class SearchOrchestrator:
                 route_standard,
             )
         else:
-            # Post-repair state: never call analyze_gap again for dispatch.
-            final_gap = bundle.gap_analysis
+            # Post-repair state is diagnostic-only: it never opens a third
+            # round, even if its gap remains repair-eligible.
+            final_gap = post_repair_gap
         bundle = self._finalize_bundle(
             bundle,
             trace,
@@ -739,23 +750,24 @@ class SearchOrchestrator:
         if not attempts:
             return
         for attempt in attempts:
+            logged_attempt = replace(attempt, query_index=query.query_index)
             entry = QueryTraceEntry(
                 query_index=query.query_index,
                 purpose=query.purpose,
                 round_kind=query.round_kind,
-                provider=attempt.provider,
-                status=attempt.status,
-                latency_ms=attempt.latency_ms,
+                provider=logged_attempt.provider,
+                status=logged_attempt.status,
+                latency_ms=logged_attempt.latency_ms,
             )
             if entry not in trace.executed_queries:
                 trace.executed_queries = (*trace.executed_queries, entry)
-            trace.provider_attempts = (*trace.provider_attempts, attempt)
-            if attempt.invocation_started:
+            trace.provider_attempts = (*trace.provider_attempts, logged_attempt)
+            if logged_attempt.invocation_started:
                 trace.provider_invocation_started = True
-            if attempt.status is not ProviderStatus.SUCCESS:
+            if logged_attempt.status is not ProviderStatus.SUCCESS:
                 trace.provider_failures = (
                     *trace.provider_failures,
-                    _failure_for_status(attempt.status),
+                    _failure_for_status(logged_attempt.status),
                 )
 
     def _assembler_with_rejecting_judge(self) -> EvidenceAssembler:
@@ -809,11 +821,26 @@ class SearchOrchestrator:
         )
         trace.provider_failures = tuple(dict.fromkeys(trace.provider_failures))
         trace.evidence_state = bundle.evidence_state
+        self._record_evidence_trace(trace, bundle)
         trace.citable_evidence_count = sum(
             1 for item in bundle.evidence_items if item.citable
         )
         trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
         return bundle
+
+    @staticmethod
+    def _record_evidence_trace(trace: SearchTrace, bundle: EvidenceBundle) -> None:
+        """Project immutable Evidence into body-free Trace metadata only."""
+        trace.supported_topic_ids = bundle.supported_topic_ids
+        trace.missing_topic_ids = bundle.missing_topic_ids
+        trace.topic_freshness = tuple(
+            TopicFreshnessTraceEntry(assessment.topic_id, assessment.freshness)
+            for assessment in bundle.topic_assessments
+        )
+        gap = bundle.gap_analysis
+        if gap.repair_reason_codes:
+            trace.repair_reason_codes = gap.repair_reason_codes
+            trace.repair_target_topic_ids = gap.repair_target_topic_ids
 
     def _failure_result(
         self,

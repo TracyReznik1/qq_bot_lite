@@ -847,7 +847,7 @@ def _parse_model_topic(raw: Any, index: int) -> RequiredTopic | None:
         return None
     try:
         return RequiredTopic(
-            topic_id=f"model-topic-{index}",
+            topic_id=f"topic-{index}",
             label=label,
             material=material,
             freshness_requirement=freshness_requirement,

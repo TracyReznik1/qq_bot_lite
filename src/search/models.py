@@ -8,6 +8,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Mapping
 import math
+import re
 
 
 class SearchTier(StrEnum):
@@ -371,6 +372,28 @@ def _repair_reason_codes(values: Any, field_name: str) -> tuple[RepairReasonCode
     return codes
 
 
+def _trace_enum_values(
+    values: Any,
+    enum_type: type[StrEnum],
+    field_name: str,
+) -> tuple[Any, ...]:
+    if isinstance(values, (str, bytes, Mapping)) or not isinstance(
+        values,
+        (tuple, list, set, frozenset),
+    ):
+        raise TypeError(f"{field_name} must be a collection of closed enum values")
+    result = _tuple(values)
+    _require_enum_values(result, enum_type, field_name)
+    return result
+
+
+def _trace_metadata_ids(values: Any, field_name: str) -> tuple[str, ...]:
+    result = _topic_ids(values, field_name)
+    for value in result:
+        _require_safe_metadata(value, field_name)
+    return tuple(dict.fromkeys(result))
+
+
 def _safe_redaction_codes(values: Any) -> tuple[RedactionCode, ...]:
     try:
         return _redaction_codes(values, "redaction codes")
@@ -413,6 +436,18 @@ def _is_sensitive(value: str) -> bool:
 def _require_safe_metadata(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value or _is_sensitive(value):
         raise ValueError(f"{field_name} must be non-sensitive metadata")
+
+
+def _require_opaque_topic_id(value: str, field_name: str = "topic_id") -> None:
+    if not isinstance(value, str) or re.fullmatch(r"topic-[1-9][0-9]*", value) is None:
+        raise ValueError(f"{field_name} must be an opaque topic-N identifier")
+
+
+def _topic_ids(values: Any, field_name: str) -> tuple[str, ...]:
+    result = _strings(values, field_name)
+    for value in result:
+        _require_opaque_topic_id(value, field_name)
+    return result
 
 
 @dataclass(frozen=True)
@@ -601,8 +636,7 @@ class RequiredTopic:
     source_requirement: SourceRequirement = SourceRequirement.ANY_RELEVANT
 
     def __post_init__(self) -> None:
-        if not isinstance(self.topic_id, str) or not self.topic_id.strip():
-            raise ValueError("topic_id must be a non-blank string")
+        _require_opaque_topic_id(self.topic_id)
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("label must be a non-blank string")
         if type(self.material) is not bool:
@@ -646,34 +680,6 @@ class RequiredTopic:
             and not self.version_constraint
         ):
             raise ValueError("version topic freshness requires version_constraint")
-
-
-_LEGACY_REQUIRED_TOPIC_MARKER = "_task4_legacy_required_topic"
-
-
-def _legacy_required_topic(topic_id: str, label: str) -> RequiredTopic:
-    """Build the Task 10-removable label-only SearchPlan input shim."""
-    topic = RequiredTopic(
-        topic_id=topic_id,
-        label=label,
-        material=True,
-        freshness_requirement=FreshnessRequirement.NOT_REQUIRED,
-        source_requirement=SourceRequirement.ANY_RELEVANT,
-    )
-    # `dataclasses.replace(plan, ...)` retains topic objects.  The marker
-    # therefore preserves only the explicit legacy-string constructor path;
-    # newly-built RequiredTopic plans must pass sealed-query validation.
-    object.__setattr__(topic, _LEGACY_REQUIRED_TOPIC_MARKER, True)
-    return topic
-
-
-def _has_legacy_required_topic_provenance(
-    topics: tuple[RequiredTopic, ...],
-) -> bool:
-    return bool(topics) and all(
-        getattr(topic, _LEGACY_REQUIRED_TOPIC_MARKER, False) is True
-        for topic in topics
-    )
 
 
 @dataclass(frozen=True)
@@ -731,37 +737,15 @@ class SearchPlan:
             (tuple, list, set, frozenset),
         ):
             raise TypeError("required_topics must be a collection of RequiredTopic values")
-        raw_topics = _tuple(self.required_topics)
-        legacy_topic_labels = all(type(topic) is str for topic in raw_topics)
-        if legacy_topic_labels:
-            topic_labels = _strings(raw_topics, "required_topics")
-            if len(topic_labels) > 3:
-                raise ValueError("legacy required_topics cannot exceed three labels")
-            if not topic_labels:
-                topic_labels = (
-                    str(self.original_question or "").strip() or "用户问题",
-                )
-            required_topics = tuple(
-                _legacy_required_topic(
-                    topic_id=f"topic-{index}",
-                    label=label,
-                )
-                for index, label in enumerate(topic_labels, 1)
-            )
-        else:
-            required_topics = _records(
-                raw_topics,
-                RequiredTopic,
-                "required_topics",
-            )
+        required_topics = _records(
+            _tuple(self.required_topics),
+            RequiredTopic,
+            "required_topics",
+        )
         initial_queries = _records(
             self.initial_queries,
             SearchQuery,
             "initial_queries",
-        )
-        legacy_query_slots = all(
-            query.query_index is None and not query.target_topic_ids
-            for query in initial_queries
         )
         _normalize_fields(
             self,
@@ -781,16 +765,7 @@ class SearchPlan:
         )
         _require_enum(self.planning_status, PlanningStatus, "planning_status")
         _require_enum_values(self.required_source_relations, SourceRelation, "required_source_relations")
-        legacy_topic_provenance = (
-            legacy_topic_labels
-            or _has_legacy_required_topic_provenance(required_topics)
-        )
-        # Task 10 removes this constructor shim.  Only a plan that originated
-        # from legacy strings may retain legacy query slots through
-        # `dataclasses.replace`; a newly-built RequiredTopic plan is always
-        # required to carry sealed initial query metadata.
-        if not (legacy_topic_provenance and legacy_query_slots):
-            self._validate_structured_queries()
+        self._validate_structured_queries()
 
     def _validate_structured_queries(self) -> None:
         if not self.required_topics or len(self.required_topics) > 3:
@@ -863,7 +838,7 @@ class RepairPlan:
         _normalize_fields(
             self,
             reason_codes=_repair_reason_codes(self.reason_codes, "reason_codes"),
-            target_topic_ids=_strings(self.target_topic_ids, "target_topic_ids"),
+            target_topic_ids=_topic_ids(self.target_topic_ids, "target_topic_ids"),
             query_redaction_codes=_redaction_codes(self.query_redaction_codes, "query_redaction_codes"),
         )
         if type(self.triggered) is not bool:
@@ -952,6 +927,7 @@ class EvidenceConflict:
     conflict_id: str
     conflict_key: str
     members: tuple[EvidenceConflictMember, ...]
+    topic_ids: tuple[str, ...] = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _require_safe_metadata(self.conflict_id, "conflict_id")
@@ -960,6 +936,7 @@ class EvidenceConflict:
         _normalize_fields(
             self,
             members=_records(self.members, EvidenceConflictMember, "members"),
+            topic_ids=_topic_ids(self.topic_ids, "topic_ids"),
         )
         if len(self.members) < 2:
             raise ValueError("a conflict requires at least two members")
@@ -967,6 +944,10 @@ class EvidenceConflict:
             raise ValueError("a conflict requires at least two distinct evidence ids")
         if len({str(member.value).strip() for member in self.members}) < 2:
             raise ValueError("a conflict requires at least two distinct asserted values")
+        if not self.topic_ids or any(not topic_id.strip() for topic_id in self.topic_ids):
+            raise ValueError("a conflict requires non-blank topic ids")
+        if len(set(self.topic_ids)) != len(self.topic_ids):
+            raise ValueError("conflict topic ids must be unique")
 
 
 @dataclass(frozen=True)
@@ -980,10 +961,10 @@ class EvidenceGapAnalysis:
     def __post_init__(self) -> None:
         _normalize_fields(
             self,
-            missing_topic_ids=_strings(self.missing_topic_ids, "missing_topic_ids"),
+            missing_topic_ids=_topic_ids(self.missing_topic_ids, "missing_topic_ids"),
             conflict_group_ids=_strings(self.conflict_group_ids, "conflict_group_ids"),
             repair_reason_codes=_repair_reason_codes(self.repair_reason_codes, "repair_reason_codes"),
-            repair_target_topic_ids=_strings(self.repair_target_topic_ids, "repair_target_topic_ids"),
+            repair_target_topic_ids=_topic_ids(self.repair_target_topic_ids, "repair_target_topic_ids"),
         )
         if type(self.repair_eligible) is not bool:
             raise TypeError("repair_eligible must be a boolean")
@@ -1001,8 +982,7 @@ class TopicAssessment:
     supporting_evidence_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.topic_id, str) or not self.topic_id.strip():
-            raise ValueError("topic_id must be a non-blank string")
+        _require_opaque_topic_id(self.topic_id)
         _require_enum(self.freshness, FreshnessEligibility, "freshness")
         supporting_evidence_ids = _strings(
             self.supporting_evidence_ids,
@@ -1106,12 +1086,29 @@ class EvidenceBundle:
         if self.conflict_groups != conflict_ids:
             raise ValueError("conflict groups must match conflicts in order")
         for conflict in self.conflicts:
+            if any(topic_id not in material_topic_ids for topic_id in conflict.topic_ids):
+                raise ValueError("conflict topic ids must be material plan topic ids")
+            if any(topic_id not in self.missing_topic_ids for topic_id in conflict.topic_ids):
+                raise ValueError("conflict topic ids must be unresolved material topics")
             for member in conflict.members:
                 item = evidence_by_id.get(member.evidence_id)
                 if item is None:
                     raise ValueError("conflict members must reference bundle evidence")
                 if not item.citable or not item.relevance_gate_passed:
                     raise ValueError("conflict members require citable relevant evidence")
+            for topic_id in conflict.topic_ids:
+                topic = next(
+                    topic for topic in material_topics if topic.topic_id == topic_id
+                )
+                supporting_member_ids = {
+                    member.evidence_id
+                    for member in conflict.members
+                    if topic.label in evidence_by_id[member.evidence_id].supported_topics
+                }
+                if len(supporting_member_ids) < 2:
+                    raise ValueError(
+                        "conflict topic must be supported by at least two conflict members"
+                    )
         for topic in material_topics:
             assessment = assessment_by_id[topic.topic_id]
             for evidence_id in assessment.supporting_evidence_ids:
@@ -1163,6 +1160,7 @@ class ProviderAttempt:
     count: int
     latency_ms: int | float
     query_id: str = ""
+    query_index: int = 0
     configured: bool = True
     available: bool = True
     invocation_started: bool = True
@@ -1172,6 +1170,8 @@ class ProviderAttempt:
         _require_safe_metadata(self.provider, "provider")
         if self.query_id:
             _require_safe_metadata(self.query_id, "query_id")
+        if type(self.query_index) is not int or self.query_index < 0:
+            raise ValueError("query_index must be a non-negative integer")
         if type(self.count) is not int or self.count < 0:
             raise ValueError("count must be a non-negative integer")
         _require_number(self.latency_ms, "latency_ms")
@@ -1324,6 +1324,48 @@ class RenderState:
         )
         _require_enum_values(self.disclosure_codes, DisclosureCode, "disclosure_codes")
         _require_enum_values(self.warning_codes, WarningCode, "warning_codes")
+        _validate_render_closure(self)
+
+
+def _validate_render_closure(state: RenderState) -> None:
+    """Require deterministic citations and sources to close over the view."""
+    block_by_id = {block.block_id: block for block in state.visible_blocks}
+    if len(block_by_id) != len(state.visible_blocks):
+        raise ValueError("visible block ids must be unique")
+    claims_by_id = {claim.claim_id: claim for claim in state.visible_claims}
+    if len(claims_by_id) != len(state.visible_claims):
+        raise ValueError("visible claim ids must be unique")
+    for claim in state.visible_claims:
+        block = block_by_id.get(claim.block_id)
+        if block is None or claim.claim_id not in block.claim_ids:
+            raise ValueError("visible claims must belong to visible blocks")
+
+    source_by_id = {item.evidence_id: item for item in state.used_sources}
+    if len(source_by_id) != len(state.used_sources):
+        raise ValueError("used source evidence ids must be unique")
+    if any(
+        not item.citable or not isinstance(item.url, str) or not item.url.startswith(("http://", "https://"))
+        for item in state.used_sources
+    ):
+        raise ValueError("used sources must be citable HTTP evidence")
+
+    citation_ids = set(state.citation_map)
+    source_ids = set(source_by_id)
+    if citation_ids != source_ids:
+        raise ValueError("citation map and used sources must reference the same evidence")
+    numbers = tuple(state.citation_map.values())
+    if len(set(numbers)) != len(numbers) or set(numbers) != set(range(1, len(numbers) + 1)):
+        raise ValueError("citation numbers must be unique and contiguous")
+
+    required_ids = {
+        evidence_id
+        for claim in state.visible_claims
+        for evidence_id in claim.evidence_ids
+    }
+    for conflict in state.conflict_groups:
+        required_ids.update(member.evidence_id for member in conflict.members)
+    if required_ids != citation_ids:
+        raise ValueError("citations must close exactly over visible claims and conflicts")
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1401,18 @@ class QueryTraceEntry:
             raise ValueError("provider must be a non-blank string")
         _require_number(self.latency_ms, "latency_ms")
         _normalize_fields(self, provider=self.provider.strip())
+
+
+@dataclass(frozen=True)
+class TopicFreshnessTraceEntry:
+    """Body-free, opaque topic identifier plus its closed freshness result."""
+
+    topic_id: str
+    freshness: FreshnessEligibility
+
+    def __post_init__(self) -> None:
+        _require_opaque_topic_id(self.topic_id)
+        _require_enum(self.freshness, FreshnessEligibility, "freshness")
 
 
 @dataclass
@@ -1406,6 +1460,24 @@ class SearchTrace:
     initial_query_redaction_codes: tuple[RedactionCode, ...] = ()
     adaptive_repair_redaction_codes: tuple[RedactionCode, ...] = ()
     retrieval_stop_reason: RetrievalStopReason | None = None
+    must_search: bool = False
+    retrieval_reason_codes: tuple[RetrievalComplexityCode, ...] = ()
+    repair_reason_codes: tuple[RepairReasonCode, ...] = ()
+    repair_target_topic_ids: tuple[str, ...] = ()
+    supported_topic_ids: tuple[str, ...] = ()
+    missing_topic_ids: tuple[str, ...] = ()
+    topic_freshness: tuple[TopicFreshnessTraceEntry, ...] = ()
+    answer_generation_mode: AnswerGenerationMode | None = None
+    answer_certainty: AnswerCertainty | None = None
+    answer_claim_scope: AllowedClaimScope | None = None
+    answer_disclosure_codes: tuple[DisclosureCode, ...] = ()
+    answer_warning_codes: tuple[WarningCode, ...] = ()
+    validator_status: ValidatorStatus | None = None
+    validator_retained_claim_count: int = 0
+    validator_removed_block_count: int = 0
+    render_outcome: RenderOutcome | None = None
+    render_citation_count: int = 0
+    render_source_count: int = 0
     response_started_at: float | None = field(default=None, repr=False, compare=False)
     response_finished_at: float | None = field(default=None, repr=False, compare=False)
     finalized: bool = field(default=False, init=False, repr=False, compare=False)
@@ -1425,6 +1497,63 @@ class SearchTrace:
         self.adaptive_repair_redaction_codes = _redaction_codes(
             self.adaptive_repair_redaction_codes, "adaptive_repair_redaction_codes"
         )
+        if type(self.must_search) is not bool:
+            raise TypeError("must_search must be a boolean")
+        self.retrieval_reason_codes = _trace_enum_values(
+            self.retrieval_reason_codes,
+            RetrievalComplexityCode,
+            "retrieval_reason_codes",
+        )
+        self.repair_reason_codes = _trace_enum_values(
+            self.repair_reason_codes,
+            RepairReasonCode,
+            "repair_reason_codes",
+        )
+        self.repair_target_topic_ids = _trace_metadata_ids(
+            self.repair_target_topic_ids,
+            "repair_target_topic_ids",
+        )
+        self.supported_topic_ids = _trace_metadata_ids(
+            self.supported_topic_ids,
+            "supported_topic_ids",
+        )
+        self.missing_topic_ids = _trace_metadata_ids(
+            self.missing_topic_ids,
+            "missing_topic_ids",
+        )
+        self.topic_freshness = _records(
+            self.topic_freshness,
+            TopicFreshnessTraceEntry,
+            "topic_freshness",
+        )
+        for enum_value, enum_type, field_name in (
+            (self.answer_generation_mode, AnswerGenerationMode, "answer_generation_mode"),
+            (self.answer_certainty, AnswerCertainty, "answer_certainty"),
+            (self.answer_claim_scope, AllowedClaimScope, "answer_claim_scope"),
+            (self.validator_status, ValidatorStatus, "validator_status"),
+            (self.render_outcome, RenderOutcome, "render_outcome"),
+        ):
+            if enum_value is not None:
+                _require_enum(enum_value, enum_type, field_name)
+        self.answer_disclosure_codes = _trace_enum_values(
+            self.answer_disclosure_codes,
+            DisclosureCode,
+            "answer_disclosure_codes",
+        )
+        self.answer_warning_codes = _trace_enum_values(
+            self.answer_warning_codes,
+            WarningCode,
+            "answer_warning_codes",
+        )
+        for field_name in (
+            "validator_retained_claim_count",
+            "validator_removed_block_count",
+            "render_citation_count",
+            "render_source_count",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
         for attempt in self.provider_attempts:
             if not isinstance(attempt, ProviderAttempt):
                 raise TypeError("provider_attempts must contain ProviderAttempt values")
@@ -1479,6 +1608,31 @@ class SearchTrace:
             "retrieval_round_count": self.retrieval_round_count,
             "executed_queries": executed_metadata,
             "retrieval_stop_reason": self.retrieval_stop_reason,
+            "must_search": self.must_search,
+            "retrieval_reason_codes": self.retrieval_reason_codes,
+            "repair_reason_codes": self.repair_reason_codes,
+            "repair_target_topic_ids": self.repair_target_topic_ids,
+            "supported_topic_ids": self.supported_topic_ids,
+            "missing_topic_ids": self.missing_topic_ids,
+            "topic_freshness": tuple(
+                {
+                    "topic_id": entry.topic_id,
+                    "freshness": entry.freshness,
+                }
+                for entry in self.topic_freshness
+            ),
+            "answer_generation_mode": self.answer_generation_mode,
+            "answer_certainty": self.answer_certainty,
+            "answer_claim_scope": self.answer_claim_scope,
+            "answer_disclosure_codes": self.answer_disclosure_codes,
+            "answer_warning_codes": self.answer_warning_codes,
+            "validator_status": self.validator_status,
+            "validator_retained_claim_count": self.validator_retained_claim_count,
+            "validator_removed_block_count": self.validator_removed_block_count,
+            "render_outcome": self.render_outcome,
+            "render_citation_count": self.render_citation_count,
+            "render_source_count": self.render_source_count,
+            "finalized": self.finalized,
             "provider_configured": self.provider_configured,
             "provider_attempts": [_attempt_metadata(attempt) for attempt in self.provider_attempts],
             "provider_invocation_started": self.provider_invocation_started,
@@ -1557,12 +1711,10 @@ class SearchPipelineResult:
     evidence: EvidenceBundle | None
     trace: SearchTrace
     failure_code: SearchFailureCode | None = None
-    # Task 10 retains old direct constructors; production must always supply
-    # the immutable analysis created at the beginning of the request.
-    analysis: RequestAnalysis | None = None
+    analysis: RequestAnalysis = field(kw_only=True)
 
     def __post_init__(self) -> None:
-        _require_record(self.analysis, RequestAnalysis, "analysis", optional=True)
+        _require_record(self.analysis, RequestAnalysis, "analysis")
         if self.failure_code is not None:
             _require_enum(self.failure_code, SearchFailureCode, "failure_code")
         if self.decision.route is SearchTier.SKIP:
@@ -1611,7 +1763,7 @@ def _attempt_metadata(attempt: ProviderAttempt) -> dict[str, Any]:
         "status": attempt.status,
         "count": attempt.count,
         "latency_ms": attempt.latency_ms,
-        "query_id": _safe_log_identifier(attempt.query_id),
+        "query_index": attempt.query_index,
         "configured": attempt.configured,
         "available": attempt.available,
         "invocation_started": attempt.invocation_started,
