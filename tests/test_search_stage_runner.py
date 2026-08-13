@@ -15,6 +15,12 @@ class SearchStageRunnerTests(unittest.TestCase):
 
         self.assertEqual(StageCallResult(True, value), result)
 
+    def test_stage_callable_receives_no_runner_arguments(self):
+        # Closure capture is outside this generic runner's enforcement boundary.
+        result = run_stage(lambda *args, **kwargs: (args, kwargs), timeout_seconds=0.5)
+
+        self.assertEqual(StageCallResult(True, ((), {})), result)
+
     def test_queued_stage_is_cancelled_after_timeout(self):
         release = threading.Event()
         started = threading.Semaphore(0)
