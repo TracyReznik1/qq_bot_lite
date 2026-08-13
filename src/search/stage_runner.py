@@ -19,7 +19,7 @@ class StageCallResult:
 
 
 def run_stage(call: Callable[[], object], *, timeout_seconds: float) -> StageCallResult:
-    """Run a zero-argument stage without sharing caller-owned mutable state."""
+    """Run a zero-argument stage and seal a timeout result for its caller."""
 
     if not callable(call):
         raise TypeError("call must be callable")

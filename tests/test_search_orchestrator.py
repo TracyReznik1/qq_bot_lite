@@ -7,7 +7,7 @@ import json
 import threading
 import time
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from datetime import date
 from unittest import mock
@@ -31,6 +31,11 @@ from src.search.models import (
     SearchTier,
     SkipReason,
     TriggerCode,
+)
+from src.search.budget import (
+    DEFAULT_SEARCH_BUDGET_POLICY,
+    RouteStageBudget,
+    SearchBudgetPolicy,
 )
 from tests.search_fakes import (
     FakeClock,
@@ -102,6 +107,22 @@ def request(question="什么是光合作用", force_search=False):
         force_search=force_search,
         request_source=RequestSource.CHAT,
     )
+
+
+def short_watchdog_policy(route, seconds):
+    """Keep data caps unchanged while deriving a short interim watchdog."""
+
+    budgets = {
+        tier: DEFAULT_SEARCH_BUDGET_POLICY.for_route(tier)
+        for tier in (SearchTier.LIGHT, SearchTier.STANDARD)
+    }
+    budgets[route] = RouteStageBudget(
+        **{
+            field.name: seconds if field.name == "scheduling_margin_seconds" else 0
+            for field in fields(RouteStageBudget)
+        }
+    )
+    return SearchBudgetPolicy(budgets)
 
 
 def _make_router(payload):
@@ -482,8 +503,7 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
         self.assertIs(QueryPurpose.DIRECT, result.plan.initial_queries[0].purpose)
         self.assertIn(QueryPurpose.DIRECT, [query.purpose for query in provider.calls])
 
-    def test_retrieval_deadline_starts_after_analysis_but_trace_keeps_analysis_time(self):
-        m = importlib.import_module("src.search.models")
+    def test_interim_watchdog_starts_after_analysis_until_task_8_moves_anchor(self):
         clock = FakeClock()
         analysis = _task3_analysis()
 
@@ -526,7 +546,7 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
 
         self.assertEqual(1, analyzer.calls)
         self.assertEqual(
-            m.DEFAULT_TIER_BUDGETS[SearchTier.LIGHT].hard_timeout_seconds,
+            DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.LIGHT),
             planner.deadline - clock.monotonic(),
         )
         self.assertEqual(17_000, result.trace.route_latency_ms)
@@ -888,22 +908,11 @@ class OrchestratorFailureTests(unittest.TestCase):
 class OrchestratorDeadlineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = orchestrator_module()
-        original = DEFAULT_TIER_BUDGETS[SearchTier.LIGHT]
-        self.short_budget = SimpleNamespace(
-            max_initial_queries=original.max_initial_queries,
-            max_candidate_urls=original.max_candidate_urls,
-            max_content_reads=original.max_content_reads,
-            max_repair_queries=original.max_repair_queries,
-            max_total_queries=original.max_total_queries,
-            max_retrieval_rounds=original.max_retrieval_rounds,
-            hard_timeout_seconds=0.05,
-        )
-        self.budgets = dict(DEFAULT_TIER_BUDGETS)
-        self.budgets[SearchTier.LIGHT] = self.short_budget
+        self.short_policy = short_watchdog_policy(SearchTier.LIGHT, 0.05)
 
-    def _run_with_short_budget(self, orchestrator):
+    def _run_with_short_watchdog(self, orchestrator):
         started = time.monotonic()
-        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", self.budgets):
+        with mock.patch.object(self.module, "DEFAULT_SEARCH_BUDGET_POLICY", self.short_policy):
             try:
                 result = orchestrator.run(request())
             except TimeoutError as exc:  # hard deadline must be contained
@@ -943,7 +952,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-        result, elapsed = self._run_with_short_budget(orchestrator)
+        result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
@@ -993,7 +1002,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         )
 
         try:
-            result, elapsed = self._run_with_short_budget(orchestrator)
+            result, elapsed = self._run_with_short_watchdog(orchestrator)
         finally:
             release_workers.set()
             for blocker in blockers:
@@ -1082,7 +1091,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         orchestrator._registry._remaining = controlled_remaining
         try:
             with mock.patch.object(provider_base, "_ADAPTER_EXECUTOR", executor):
-                result, elapsed = self._run_with_short_budget(orchestrator)
+                result, elapsed = self._run_with_short_watchdog(orchestrator)
             self.assertTrue(executor.running.is_set())
             self.assertTrue(executor.sealed.wait(timeout=1.0))
             trace_before_release = result.trace.to_log_dict()
@@ -1137,7 +1146,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-        result, elapsed = self._run_with_short_budget(orchestrator)
+        result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
@@ -1165,7 +1174,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-        result, elapsed = self._run_with_short_budget(orchestrator)
+        result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
         self.assertIsNotNone(result.plan)
@@ -1187,7 +1196,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-        result, elapsed = self._run_with_short_budget(orchestrator)
+        result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
@@ -1208,7 +1217,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=SlowExtractor(),
         )
 
-        result, elapsed = self._run_with_short_budget(orchestrator)
+        result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
         self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
@@ -1230,18 +1239,6 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 from src.search.models import ProviderResult
                 return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
 
-        original = DEFAULT_TIER_BUDGETS[SearchTier.STANDARD]
-        short_standard = SimpleNamespace(
-            max_initial_queries=original.max_initial_queries,
-            max_candidate_urls=original.max_candidate_urls,
-            max_content_reads=original.max_content_reads,
-            max_repair_queries=original.max_repair_queries,
-            max_total_queries=original.max_total_queries,
-            max_retrieval_rounds=original.max_retrieval_rounds,
-            hard_timeout_seconds=0.05,
-        )
-        budgets = dict(DEFAULT_TIER_BUDGETS)
-        budgets[SearchTier.STANDARD] = short_standard
 
         class FourQueryPlanner:
             def plan(self, *args, **kwargs):
@@ -1272,7 +1269,11 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", budgets):
+        with mock.patch.object(
+            self.module,
+            "DEFAULT_SEARCH_BUDGET_POLICY",
+            short_watchdog_policy(SearchTier.STANDARD, 0.05),
+        ):
             with self.assertRaisesRegex(
                 AssertionError,
                 "tier/direct contract",
@@ -1307,18 +1308,6 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 )
                 return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
 
-        original = DEFAULT_TIER_BUDGETS[SearchTier.STANDARD]
-        short_standard = SimpleNamespace(
-            max_initial_queries=original.max_initial_queries,
-            max_candidate_urls=original.max_candidate_urls,
-            max_content_reads=original.max_content_reads,
-            max_repair_queries=original.max_repair_queries,
-            max_total_queries=original.max_total_queries,
-            max_retrieval_rounds=original.max_retrieval_rounds,
-            hard_timeout_seconds=0.12,
-        )
-        budgets = dict(DEFAULT_TIER_BUDGETS)
-        budgets[SearchTier.STANDARD] = short_standard
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
@@ -1329,7 +1318,11 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         )
         started = time.monotonic()
 
-        with mock.patch.object(self.module, "DEFAULT_TIER_BUDGETS", budgets):
+        with mock.patch.object(
+            self.module,
+            "DEFAULT_SEARCH_BUDGET_POLICY",
+            short_watchdog_policy(SearchTier.STANDARD, 0.12),
+        ):
             result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
         elapsed = time.monotonic() - started
 

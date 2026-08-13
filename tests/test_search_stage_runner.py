@@ -38,7 +38,7 @@ class SearchStageRunnerTests(unittest.TestCase):
 
         self.assertFalse(queued_started.wait(0.1))
 
-    def test_running_stage_timeout_returns_promptly_and_late_result_is_not_retained(self):
+    def test_running_stage_timeout_returns_promptly_and_seals_its_timeout_result(self):
         release = threading.Event()
         started = threading.Event()
         finished = threading.Event()

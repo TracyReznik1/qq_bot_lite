@@ -12,6 +12,7 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 from src.config import config
+from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
 from src.search.evidence import EvidenceAssembler, LLMEvidenceJudge
 from src.search.extraction import SearchExtractor
 from src.search.models import (
@@ -174,10 +175,15 @@ class SearchOrchestrator:
             )
             return result
 
-        # One monotonic hard deadline per tier starts before planning, so
-        # planner and Evidence-judge latency count toward the retrieval budget.
+        # Task 2 keeps the legacy post-analysis anchor runnable while moving its
+        # only duration source to the derived policy. Task 8 moves this anchor
+        # to response_started and removes the rolling deadline entirely.
         budget = DEFAULT_TIER_BUDGETS[retrieval_decision.route]
-        deadline = self._monotonic() + float(budget.hard_timeout_seconds)
+        deadline = self._monotonic() + float(
+            DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(
+                retrieval_decision.route
+            )
+        )
 
         trace.orchestrator_started = True
         retrieval_started = self._monotonic()
