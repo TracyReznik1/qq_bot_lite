@@ -179,10 +179,48 @@ def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCod
 
 def build_render_state(
     answer_state: AnswerState,
-    validation: ValidationReport,
+    validation: ValidationReport | None,
     evidence: EvidenceBundle | None,
 ) -> RenderState:
     """Build a deterministic render view from policy, validation and evidence."""
+    if validation is None:
+        cited_ids: list[str] = []
+        conflicts = evidence.conflicts if evidence is not None else ()
+        for conflict in conflicts:
+            for member in conflict.members:
+                if member.evidence_id and member.evidence_id not in cited_ids:
+                    cited_ids.append(member.evidence_id)
+        citation_map = {
+            evidence_id: index for index, evidence_id in enumerate(cited_ids, 1)
+        }
+        items = evidence.evidence_items if evidence is not None else ()
+        item_by_id = {item.evidence_id: item for item in items}
+        used_sources = tuple(
+            item_by_id[evidence_id]
+            for evidence_id in cited_ids
+            if evidence_id in item_by_id and item_by_id[evidence_id].citable
+        )
+        conflict_groups = tuple(
+            conflict
+            for conflict in conflicts
+            if any(member.evidence_id in citation_map for member in conflict.members)
+        )
+        outcome = (
+            RenderOutcome.VALIDATION_FAILURE
+            if DisclosureCode.VALIDATION_FAILED in answer_state.disclosure_codes
+            else RenderOutcome.FAILURE
+        )
+        return RenderState(
+            outcome=outcome,
+            visible_blocks=(),
+            visible_claims=(),
+            citation_map=citation_map,
+            used_sources=used_sources,
+            conflict_groups=conflict_groups,
+            disclosure_codes=answer_state.disclosure_codes,
+            warning_codes=answer_state.warning_codes,
+        )
+
     scope = validation.effective_claim_scope
     visible_blocks = tuple(
         replace(block, text=sanitize_visible_block_text(block.text))
@@ -195,6 +233,11 @@ def build_render_state(
         for evidence_id in claim.evidence_ids:
             if evidence_id and evidence_id not in cited_ids:
                 cited_ids.append(evidence_id)
+    conflicts = evidence.conflicts if evidence is not None else ()
+    for conflict in conflicts:
+        for member in conflict.members:
+            if member.evidence_id and member.evidence_id not in cited_ids:
+                cited_ids.append(member.evidence_id)
     citation_map = {
         evidence_id: index for index, evidence_id in enumerate(cited_ids, 1)
     }
@@ -206,7 +249,6 @@ def build_render_state(
         for evidence_id in cited_ids
         if evidence_id in item_by_id and item_by_id[evidence_id].citable
     )
-    conflicts = evidence.conflicts if evidence is not None else ()
     conflict_groups = tuple(
         conflict
         for conflict in conflicts

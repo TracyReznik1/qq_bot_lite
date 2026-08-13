@@ -13,7 +13,11 @@ from src.memory.models import MemoryContext
 from src.config import config
 from src.search import get_search_orchestrator, reset_search_orchestrator
 from src.search.models import (
+    AllowedClaimScope,
+    AnswerCertainty,
     AnswerGenerationMode,
+    AnswerState,
+    DisclosureCode,
     EvidenceState,
     RequestSource,
     RetrievalRequest,
@@ -21,8 +25,10 @@ from src.search.models import (
     SearchPipelineResult,
     SearchTier,
     SkipReason,
+    ValidatorRequirement,
+    WarningCode,
 )
-from src.search.policy import decide_answer_state
+from src.search.policy import build_render_state, decide_answer_state
 from src.search.renderer import render_search_reply, render_plain_reply
 from src.services.llm_client import get_llm_client
 from src.services.llm_types import ChatResponse
@@ -286,7 +292,7 @@ def _grounded_generation(
             (time.monotonic() - structural_started) * 1000.0,
             0.0,
         )
-        return _handle_draft_failure(mem_ctx, text, images, result, response.content)
+        return _handle_draft_failure(result, answer_state)
     result.trace.structural_validation_latency_ms += max(
         (time.monotonic() - structural_started) * 1000.0,
         0.0,
@@ -295,19 +301,38 @@ def _grounded_generation(
         report = _validate_draft(draft, result, answer_state)
     except Exception:
         logger.debug("grounded draft validation failed", exc_info=True)
-        return _handle_draft_failure(mem_ctx, text, images, result, response.content)
+        return _handle_draft_failure(result, answer_state)
     if report is None:
-        return _handle_draft_failure(mem_ctx, text, images, result, response.content)
-    rendered = render_search_reply(result, report, qq_limit=_qq_limit())
+        return _handle_draft_failure(result, answer_state)
+    render_state = build_render_state(answer_state, report, result.evidence)
+    rendered = _render_view(render_state, result)
     return rendered.text, result
 
 
-def _handle_draft_failure(mem_ctx, text, images, result, raw_content: str) -> tuple[str, SearchPipelineResult]:
+def _handle_draft_failure(
+    result: SearchPipelineResult,
+    answer_state: AnswerState,
+) -> tuple[str, SearchPipelineResult]:
     """A malformed draft cannot produce a definite grounded answer."""
-    del mem_ctx, text, images, raw_content
     result.trace.degradation_reason = SearchFailureCode.VALIDATION_FAILED
     failed_result = replace(result, failure_code=SearchFailureCode.VALIDATION_FAILED)
-    rendered = render_search_reply(failed_result, None, qq_limit=_qq_limit())
+    disclosures = [DisclosureCode.VALIDATION_FAILED]
+    if (
+        result.evidence is not None
+        and result.evidence.evidence_state is EvidenceState.CONFLICTING
+    ):
+        disclosures.append(DisclosureCode.SOURCE_CONFLICT)
+    failed_state = AnswerState(
+        None,
+        AnswerGenerationMode.FIXED,
+        AnswerCertainty.UNVERIFIED,
+        AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
+        tuple(disclosures),
+        answer_state.warning_codes,
+        answer_state.validator_requirement,
+    )
+    render_state = build_render_state(failed_state, None, failed_result.evidence)
+    rendered = _render_view(render_state, failed_result)
     return rendered.text, failed_result
 
 
@@ -410,31 +435,41 @@ def _handle_fixed(
     result,
     answer_state,
 ) -> tuple[str, SearchPipelineResult]:
-    is_no_web = bool(
-        result.decision.skip_reason is SkipReason.USER_FORBID_WEB
-    )
-    if is_no_web and not (
-        result.decision.requires_clarification or answer_state.warning_codes
-    ):
-        # Stable knowledge may answer for a low-risk no-web request.
-        messages = _build_messages(
-            mem_ctx, text, images, evidence_payload="", include_memories=False
-        )
-        response = _generate_answer(result.trace, messages, temperature=0.5)
-        rendered = render_search_reply(
-            result, None,
-            knowledge_fallback_text=response.content,
-            qq_limit=_qq_limit(),
-        )
-        return rendered.text, result
-
-    if result.decision.route is SearchTier.SKIP:
-        rendered = render_search_reply(result, None, qq_limit=_qq_limit())
-        return rendered.text, result
-
-    # External-fact failure: never invent facts from the ordinary model.
-    rendered = render_search_reply(result, None, qq_limit=_qq_limit())
+    # Fixed output (no-web limitation or external-fact failure): never invoke the
+    # ordinary answer model to invent facts.
+    del mem_ctx, text, images
+    render_state = build_render_state(answer_state, None, result.evidence)
+    rendered = _render_view(render_state, result)
     return rendered.text, result
+
+
+def _render_view(
+    render_state,
+    result: SearchPipelineResult,
+) -> "RenderedReply":
+    started = time.monotonic()
+    rendered = render_search_reply(render_state, qq_limit=_qq_limit())
+    result.trace.qq_render_latency_ms = max(
+        (time.monotonic() - started) * 1000.0,
+        0.0,
+    )
+    result.trace.citation_count = len(rendered.shown_source_urls)
+    return rendered
+
+
+def _fixed_answer_state(
+    answer_state: AnswerState,
+    disclosure: DisclosureCode,
+) -> AnswerState:
+    return AnswerState(
+        None,
+        AnswerGenerationMode.FIXED,
+        AnswerCertainty.UNVERIFIED,
+        AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
+        (disclosure,),
+        answer_state.warning_codes,
+        answer_state.validator_requirement,
+    )
 
 
 def _parse_draft(content: str):

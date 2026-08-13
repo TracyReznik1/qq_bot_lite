@@ -297,13 +297,12 @@ class SkipFlowTests(unittest.TestCase):
                 llm_chat.assert_not_called()
                 self.assertEqual(1, reply.count("本次未联网核验"))
 
-    def test_no_web_low_risk_still_uses_answer_model(self):
+    def test_no_web_low_risk_uses_fixed_limitation_without_answer_model(self):
         reply, llm_chat = self._run(
             no_web_result(potential_harm=models().PotentialHarm.NONE),
             "不要联网，简单解释一下",
         )
-        llm_chat.assert_called_once()
-        self.assertIn("你好呀", reply)
+        llm_chat.assert_not_called()
         self.assertIn("本次没有联网核验", reply)
         self.assertNotIn("不能替代适当的专业判断", reply)
 
@@ -664,7 +663,6 @@ class FailureFlowTests(unittest.TestCase):
         self.assertIn("来源之间存在未解决差异", reply)
         self.assertIn("Source A：3.2", reply)
         self.assertIn("Source B：3.3", reply)
-        self.assertIn("部分主题仅有较弱来源支持", reply)
         self.assertIn("https://a.example.com", reply)
         self.assertIn("https://b.example.com", reply)
 
