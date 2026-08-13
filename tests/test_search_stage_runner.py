@@ -70,6 +70,40 @@ class SearchStageRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "stage failed"):
             run_stage(lambda: (_ for _ in ()).throw(RuntimeError("stage failed")), timeout_seconds=0.5)
 
+    def test_worker_timeout_error_propagates_to_the_stage_owner(self):
+        with self.assertRaisesRegex(TimeoutError, "worker timeout"):
+            run_stage(
+                lambda: (_ for _ in ()).throw(TimeoutError("worker timeout")),
+                timeout_seconds=0.5,
+            )
+
+    def test_executor_recovers_after_queued_timeout_when_workers_are_released(self):
+        release = threading.Event()
+        started = threading.Semaphore(0)
+
+        def block_worker():
+            started.release()
+            release.wait(1.0)
+
+        blockers = [stage_runner._STAGE_EXECUTOR.submit(block_worker) for _ in range(8)]
+        try:
+            for _ in blockers:
+                self.assertTrue(started.acquire(timeout=0.5))
+
+            self.assertEqual(
+                StageCallResult(False, None),
+                run_stage(lambda: "queued", timeout_seconds=0.05),
+            )
+        finally:
+            release.set()
+            for blocker in blockers:
+                blocker.result(timeout=1.0)
+
+        self.assertEqual(
+            StageCallResult(True, "healthy"),
+            run_stage(lambda: "healthy", timeout_seconds=0.5),
+        )
+
     def test_call_and_timeout_validation_are_closed(self):
         with self.assertRaises(TypeError):
             run_stage(None, timeout_seconds=0.5)

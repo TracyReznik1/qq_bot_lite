@@ -18,8 +18,26 @@ class StageCallResult:
     value: object | None
 
 
+@dataclass(frozen=True)
+class _StageOutcome:
+    value: object | None = None
+    error: BaseException | None = None
+
+
+def _run_call(call: Callable[[], object]) -> _StageOutcome:
+    try:
+        return _StageOutcome(value=call())
+    except BaseException as exc:
+        return _StageOutcome(error=exc)
+
+
 def run_stage(call: Callable[[], object], *, timeout_seconds: float) -> StageCallResult:
-    """Run a zero-argument stage and seal a timeout result for its caller."""
+    """Run a cooperative zero-argument stage and seal the caller's timeout result.
+
+    A timeout and cancellation do not terminate a running worker thread. Callers
+    must provide bounded/cooperative callables and must not rely on this runner
+    to force-stop their work.
+    """
 
     if not callable(call):
         raise TypeError("call must be callable")
@@ -30,9 +48,12 @@ def run_stage(call: Callable[[], object], *, timeout_seconds: float) -> StageCal
         or timeout_seconds <= 0
     ):
         raise ValueError("timeout_seconds must be a finite positive number")
-    future = _STAGE_EXECUTOR.submit(call)
+    future = _STAGE_EXECUTOR.submit(_run_call, call)
     try:
-        return StageCallResult(True, future.result(timeout=float(timeout_seconds)))
+        outcome = future.result(timeout=float(timeout_seconds))
     except FuturesTimeoutError:
         future.cancel()
         return StageCallResult(False, None)
+    if outcome.error is not None:
+        raise outcome.error
+    return StageCallResult(True, outcome.value)

@@ -14,38 +14,52 @@ class SearchBudgetPolicyTests(unittest.TestCase):
     def test_light_stages_are_independent_and_watchdog_is_derived(self):
         budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT)
 
-        self.assertEqual(3, budget.analysis_route_seconds)
-        self.assertEqual(6, budget.initial_ddgs_seconds)
-        self.assertEqual(6, budget.initial_tavily_seconds)
-        self.assertEqual(4, budget.initial_reader_seconds)
-        self.assertEqual(4, budget.initial_judge_seconds)
-        self.assertEqual(0, budget.planner_seconds)
-        self.assertEqual(0, budget.repair_ddgs_seconds)
+        self.assertEqual(
+            {
+                "analysis_route_seconds": 3,
+                "planner_seconds": 0,
+                "initial_ddgs_seconds": 6,
+                "initial_tavily_seconds": 6,
+                "initial_reader_seconds": 4,
+                "initial_judge_seconds": 4,
+                "gap_seconds": 0,
+                "repair_planner_seconds": 0,
+                "repair_ddgs_seconds": 0,
+                "repair_tavily_seconds": 0,
+                "repair_reader_seconds": 0,
+                "repair_judge_seconds": 0,
+                "answer_seconds": 4,
+                "validator_seconds": 4,
+                "renderer_seconds": 1,
+                "scheduling_margin_seconds": 2,
+            },
+            vars(budget),
+        )
         self.assertEqual(34, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.LIGHT))
 
     def test_standard_stages_and_watchdog_are_derived(self):
         budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.STANDARD)
 
         self.assertEqual(
-            (4, 8, 8, 6, 5),
-            (
-                budget.planner_seconds,
-                budget.initial_ddgs_seconds,
-                budget.initial_tavily_seconds,
-                budget.initial_reader_seconds,
-                budget.initial_judge_seconds,
-            ),
-        )
-        self.assertEqual(
-            (1, 2, 5, 5, 3, 4),
-            (
-                budget.gap_seconds,
-                budget.repair_planner_seconds,
-                budget.repair_ddgs_seconds,
-                budget.repair_tavily_seconds,
-                budget.repair_reader_seconds,
-                budget.repair_judge_seconds,
-            ),
+            {
+                "analysis_route_seconds": 3,
+                "planner_seconds": 4,
+                "initial_ddgs_seconds": 8,
+                "initial_tavily_seconds": 8,
+                "initial_reader_seconds": 6,
+                "initial_judge_seconds": 5,
+                "gap_seconds": 1,
+                "repair_planner_seconds": 2,
+                "repair_ddgs_seconds": 5,
+                "repair_tavily_seconds": 5,
+                "repair_reader_seconds": 3,
+                "repair_judge_seconds": 4,
+                "answer_seconds": 4,
+                "validator_seconds": 4,
+                "renderer_seconds": 1,
+                "scheduling_margin_seconds": 2,
+            },
+            vars(budget),
         )
         self.assertEqual(65, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.STANDARD))
 
