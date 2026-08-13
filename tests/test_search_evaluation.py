@@ -439,7 +439,7 @@ class IntegrityMetricTests(unittest.TestCase):
         traces = [
             _trace_with(route="standard", initial_query_count=3, retrieval_round_count=1, adaptive_repair_round_started=False),
             _trace_with(route="standard", initial_query_count=3, retrieval_round_count=2, adaptive_repair_round_started=True),
-            _trace_with(route="deep", initial_query_count=5, retrieval_round_count=2, adaptive_repair_round_started=True),
+            _trace_with(route="standard", initial_query_count=3, retrieval_round_count=2, adaptive_repair_round_started=True),
         ]
         self.assertEqual(tool.initial_batch_round_count(traces), 3)
         self.assertEqual(tool.repair_round_count(traces), 2)

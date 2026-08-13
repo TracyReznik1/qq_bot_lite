@@ -1261,11 +1261,6 @@ class LLMRequestAnalyzer:
         return parse_advisor_json(response.content)
 
 
-# Temporary caller-name compatibility through Task 10.  The new class exposes
-# ``analyze`` rather than the retired advisor's tier-recommendation interface.
-LLMRoutingAdvisor = LLMRequestAnalyzer
-
-
 # ── decision construction ───────────────────────────────────────────────
 
 _COMPLEXITY_TRIGGER_CODES: Mapping[RetrievalComplexityCode, TriggerCode] = {
@@ -1296,27 +1291,11 @@ def _retrieval_reason_codes(context: RetrievalContext) -> tuple[TriggerCode, ...
 def _skip_from_context(context: RetrievalContext) -> RetrievalDecision:
     if context.skip_reason is None:
         raise ValueError("skip context requires a skip_reason")
-    if context.skip_reason is SkipReason.USER_FORBID_WEB:
-        codes: tuple[TriggerCode, ...] = (TriggerCode.EXPLICIT_NO_WEB,)
-        if context.must_search:
-            codes = (*codes, TriggerCode.EXPLICIT_SEARCH)
-    else:
-        codes = _retrieval_reason_codes(context)
     return RetrievalDecision(
         route=SearchTier.SKIP,
         skip_reason=context.skip_reason,
-        forced_search=context.must_search,
-        trigger_codes=codes,
-        benefit_dimensions=frozenset(),
-        factuality=context.factuality,
-        external_fact_required=context.external_fact_required,
-        freshness=Freshness.NONE,
-        risk=RiskLevel.LOW,
-        actionability=Actionability.NONE,
-        potential_harm=PotentialHarm.NONE,
-        program_minimum_tier=None,
-        model_recommended_tier=None,
-        final_reason_codes=codes,
+        must_search=context.must_search,
+        reason_codes=(),
     )
 
 
@@ -1324,29 +1303,14 @@ def _search_from_context(
     context: RetrievalContext,
     route: SearchTier,
 ) -> RetrievalDecision:
-    reason_codes = _retrieval_reason_codes(context)
-    if not reason_codes:
-        reason_codes = (TriggerCode.FACTUAL_DEFAULT,)
-    benefit_dimensions = frozenset({BenefitDimension.ACCURACY})
+    reason_codes = tuple(context.complexity_codes)
     if context.source_requirement is SourceRequirement.INDEPENDENT_CORROBORATION:
-        benefit_dimensions = frozenset(
-            {BenefitDimension.ACCURACY, BenefitDimension.VERIFIABILITY}
-        )
+        reason_codes = (*reason_codes, RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED)
     return RetrievalDecision(
         route=route,
         skip_reason=None,
-        forced_search=context.must_search,
-        trigger_codes=reason_codes,
-        benefit_dimensions=benefit_dimensions,
-        factuality=context.factuality,
-        external_fact_required=context.external_fact_required,
-        freshness=Freshness.NONE,
-        risk=RiskLevel.LOW,
-        actionability=Actionability.NONE,
-        potential_harm=PotentialHarm.NONE,
-        program_minimum_tier=route,
-        model_recommended_tier=None,
-        final_reason_codes=reason_codes,
+        must_search=context.must_search,
+        reason_codes=reason_codes,
     )
 
 
@@ -1669,9 +1633,3 @@ def _build_request_analysis(
         freshness=_freshness_context(question, classification),
         risk=_risk_context(question, classification),
     )
-
-
-def _operational_tier(tier: SearchTier | None) -> SearchTier | None:
-    if tier is SearchTier.DEEP:
-        return SearchTier.STANDARD
-    return tier

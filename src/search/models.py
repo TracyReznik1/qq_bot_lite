@@ -14,7 +14,6 @@ class SearchTier(StrEnum):
     SKIP = "skip"
     LIGHT = "light"
     STANDARD = "standard"
-    DEEP = "deep"
 
 
 class SkipReason(StrEnum):
@@ -115,7 +114,6 @@ class FreshnessEligibility(StrEnum):
 class Freshness(StrEnum):
     NONE = "none"
     LOW = "low"
-    HIGH = "high"
 
 
 class RiskLevel(StrEnum):
@@ -297,18 +295,6 @@ PROVIDER_STATUS_FAILURE_CODES: Mapping[ProviderStatus, SearchFailureCode | None]
         ProviderStatus.UNAVAILABLE: SearchFailureCode.PROVIDER_UNAVAILABLE,
     }
 )
-
-
-_TIER_RANK = {
-    SearchTier.SKIP: 0,
-    SearchTier.LIGHT: 1,
-    SearchTier.STANDARD: 2,
-    SearchTier.DEEP: 3,
-}
-
-
-def max_tier(left: SearchTier, right: SearchTier) -> SearchTier:
-    return left if _TIER_RANK[left] >= _TIER_RANK[right] else right
 
 
 def _require_enum(value: Any, enum_type: type[StrEnum], field_name: str) -> None:
@@ -544,59 +530,29 @@ class RequestAnalysis:
 class RetrievalDecision:
     route: SearchTier
     skip_reason: SkipReason | None
-    forced_search: bool
-    trigger_codes: tuple[TriggerCode, ...]
-    benefit_dimensions: frozenset[BenefitDimension]
-    factuality: Factuality
-    external_fact_required: bool
-    freshness: Freshness
-    risk: RiskLevel
-    actionability: Actionability
-    potential_harm: PotentialHarm
-    program_minimum_tier: SearchTier | None
-    model_recommended_tier: SearchTier | None
-    final_reason_codes: tuple[TriggerCode, ...]
+    must_search: bool
+    reason_codes: tuple[RetrievalComplexityCode, ...]
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, trigger_codes=_tuple(self.trigger_codes), benefit_dimensions=_enum_set(self.benefit_dimensions, BenefitDimension, "benefit_dimensions"), final_reason_codes=_tuple(self.final_reason_codes))
+        _normalize_fields(self, reason_codes=_tuple(self.reason_codes))
         _require_enum(self.route, SearchTier, "route")
+        if type(self.must_search) is not bool:
+            raise TypeError("must_search must be a boolean")
         if self.skip_reason is not None:
             _require_enum(self.skip_reason, SkipReason, "skip_reason")
-        _require_enum_values(self.trigger_codes, TriggerCode, "trigger_codes")
-        _require_enum_values(self.benefit_dimensions, BenefitDimension, "benefit_dimensions")
-        _require_enum(self.factuality, Factuality, "factuality")
-        _require_enum(self.freshness, Freshness, "freshness")
-        _require_enum(self.risk, RiskLevel, "risk")
-        _require_enum(self.actionability, Actionability, "actionability")
-        _require_enum(self.potential_harm, PotentialHarm, "potential_harm")
-        _require_enum_values(self.final_reason_codes, TriggerCode, "final_reason_codes")
-        if self.program_minimum_tier is not None:
-            _require_enum(self.program_minimum_tier, SearchTier, "program_minimum_tier")
-        if self.model_recommended_tier is not None:
-            _require_enum(self.model_recommended_tier, SearchTier, "model_recommended_tier")
+        _require_enum_values(self.reason_codes, RetrievalComplexityCode, "reason_codes")
         if self.route is SearchTier.SKIP:
             if self.skip_reason is None:
                 raise ValueError("skip route requires a skip_reason")
-            if self.program_minimum_tier is not None:
-                raise ValueError("skip route cannot have a program minimum tier")
-        else:
-            if self.skip_reason is not None:
-                raise ValueError("search routes cannot have a skip_reason")
-            if self.program_minimum_tier is None:
-                raise ValueError("search routes require a program minimum tier")
-            if self.program_minimum_tier is SearchTier.SKIP:
-                raise ValueError("program minimum tier cannot be skip")
-            if _TIER_RANK[self.route] < _TIER_RANK[self.program_minimum_tier]:
-                raise ValueError("final route cannot be below program minimum tier")
-        if self.forced_search and self.route is SearchTier.SKIP and not self.requires_clarification:
-            raise ValueError("forced search cannot use skip without explicit web/search conflict")
+        elif self.skip_reason is not None:
+            raise ValueError("search routes cannot have a skip_reason")
 
     @property
     def requires_clarification(self) -> bool:
         return (
             self.route is SearchTier.SKIP
             and self.skip_reason is SkipReason.USER_FORBID_WEB
-            and self.forced_search
+            and self.must_search
         )
 
 
@@ -627,7 +583,6 @@ DEFAULT_TIER_BUDGETS: Mapping[SearchTier, TierBudget] = MappingProxyType(
     {
         SearchTier.LIGHT: TierBudget(1, 5, 2, 0, 1, 1, 8),
         SearchTier.STANDARD: TierBudget(3, 8, 5, 1, 4, 2, 20),
-        SearchTier.DEEP: TierBudget(5, 15, 8, 1, 6, 2, 40),
     }
 )
 

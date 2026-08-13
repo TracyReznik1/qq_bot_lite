@@ -204,7 +204,7 @@ class TavilyAdapterTests(unittest.TestCase):
     def test_deep_uses_advanced_and_raw_content(self):
         client = FakeTavilyClient()
         adapter = self._adapter(client)
-        adapter.search(query(), tier=SearchTier.DEEP, max_results=15, timeout_seconds=40.0)
+        adapter.search(query(), tier=SearchTier.STANDARD, max_results=15, timeout_seconds=40.0)
         self.assertEqual(client.calls[0][1]["search_depth"], "advanced")
         self.assertTrue(client.calls[0][1]["include_raw_content"])
 
@@ -1015,7 +1015,7 @@ class RegistryTests(unittest.TestCase):
         reserve = {
             SearchTier.LIGHT: 0.08,
             SearchTier.STANDARD: 0.08,
-            SearchTier.DEEP: 0.08,
+            SearchTier.STANDARD: 0.08,
         }
         with mock.patch.object(
             self.base, "_TAVILY_FALLBACK_RESERVE_SECONDS", reserve,

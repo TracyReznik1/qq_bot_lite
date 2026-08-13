@@ -44,10 +44,7 @@ def _skip_orchestrator():
         SkipReason,
     )
     skip = RetrievalDecision(
-        SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
-        frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
-        RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
-        None, None, (),
+        route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
     )
     return SimpleNamespace(run=lambda req: SearchPipelineResult(
         skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,

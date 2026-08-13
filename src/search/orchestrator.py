@@ -149,25 +149,16 @@ class SearchOrchestrator:
             response_started_at=response_started,
         )
         retrieval_decision = self._router.decide(analysis.retrieval)
-        # Planner, providers, and budgets consume only retrieval metadata.
-        # Retained risk/freshness fields are output compatibility metadata.
-        decision = _with_legacy_analysis_metadata(retrieval_decision, analysis)
-        if retrieval_decision.route is SearchTier.DEEP:
-            raise RuntimeError("production router emitted retired deep route")
+        decision = retrieval_decision
         trace.route = retrieval_decision.route
         trace.skip_reason = retrieval_decision.skip_reason
-        trace.trigger_codes = retrieval_decision.trigger_codes
-        trace.factuality = retrieval_decision.factuality
-        trace.external_fact_required = retrieval_decision.external_fact_required
-        trace.program_minimum_tier = retrieval_decision.program_minimum_tier
-        trace.final_tier = retrieval_decision.route
         trace.route_latency_ms = self._elapsed_ms(response_started)
 
         if retrieval_decision.route is SearchTier.SKIP:
             if retrieval_decision.requires_clarification:
                 trace.degradation_reason = SearchFailureCode.USER_FORBID_WEB
             result = SearchPipelineResult(
-                decision=decision,
+                decision=retrieval_decision,
                 plan=None,
                 evidence=None,
                 trace=trace,
@@ -936,39 +927,6 @@ class SearchOrchestrator:
 
     def _elapsed_ms(self, started: float) -> int:
         return int((self._monotonic() - started) * 1000)
-
-
-def _with_legacy_analysis_metadata(
-    decision: Any,
-    analysis: RequestAnalysis,
-) -> Any:
-    """Bridge contexts to retained decision metadata without changing routing.
-
-    Task 3 keeps the legacy decision fields for downstream consumers.  This
-    mapping runs only after the pure retrieval-context router has chosen its
-    tier, so freshness and risk cannot influence provider, query, or budget
-    selection.
-    """
-    freshness = (
-        Freshness.NONE
-        if analysis.freshness.requirement is FreshnessRequirement.NOT_REQUIRED
-        else Freshness.HIGH
-    )
-    if analysis.risk.high_consequence:
-        risk = RiskLevel.HIGH
-        actionability = Actionability.PERSONALIZED
-        potential_harm = PotentialHarm.HIGH
-    else:
-        risk = RiskLevel.LOW
-        actionability = Actionability.NONE
-        potential_harm = PotentialHarm.NONE
-    return replace(
-        decision,
-        freshness=freshness,
-        risk=risk,
-        actionability=actionability,
-        potential_harm=potential_harm,
-    )
 
 
 def _call_with_supported_kwargs(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

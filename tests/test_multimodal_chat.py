@@ -39,10 +39,7 @@ class MultimodalChatTests(unittest.TestCase):
         chat_service.chat_history.pop(session_key, None)
         from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
         skip = RetrievalDecision(
-            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
-            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
-            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
-            None, None, (),
+            route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
         )
         orchestrator = mock.Mock(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,

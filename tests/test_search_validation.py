@@ -46,9 +46,7 @@ def models():
 def decision(tier=SearchTier.STANDARD):
     m = models()
     return m.RetrievalDecision(
-        tier, None, False, (), frozenset(), Factuality.FACTUAL,
-        True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
-        m.PotentialHarm.NONE, tier, None, (),
+        route=tier, skip_reason=None, must_search=True, reason_codes=(),
     )
 
 
@@ -211,7 +209,7 @@ class StructuralValidationTests(unittest.TestCase):
         return self.module.validate_and_filter(
             draft,
             b,
-            answer_state(fail_closed=decision_tier is SearchTier.DEEP),
+            answer_state(fail_closed=decision_tier is SearchTier.STANDARD),
             claim_discoverer=_Discoverer([]),
             semantic_verifier=StaticSemanticVerifier({"supported"}),
         )
@@ -557,7 +555,7 @@ class NoSearchAccessTests(unittest.TestCase):
             (models().Claim("C1", "B1", "版本是3.2", True, ("E1",)),),
             (), (), False,
         )
-        trace = models().SearchTrace("req-1", RequestSource.CHAT, SearchTier.DEEP)
+        trace = models().SearchTrace("req-1", RequestSource.CHAT, SearchTier.STANDARD)
 
         class DelayedFailingDiscoverer:
             def discover(self, _draft, _evidence):

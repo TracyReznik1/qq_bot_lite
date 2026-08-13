@@ -50,9 +50,7 @@ def evidence_module():
 def decision(tier=SearchTier.STANDARD):
     m = __import__("src.search.models", fromlist=["RetrievalDecision"])
     return m.RetrievalDecision(
-        tier, None, False, (), frozenset(), Factuality.FACTUAL,
-        True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
-        m.PotentialHarm.NONE, tier, None, (),
+        route=tier, skip_reason=None, must_search=True, reason_codes=(),
     )
 
 
@@ -1013,33 +1011,6 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
                 ).assemble(search_plan, (candidate(title=title, content=content),))
                 self.assertIs(expected, bundle.topic_assessments[0].freshness)
 
-    def test_legacy_tier_risk_and_freshness_do_not_change_admission_or_state(self):
-        search_plan = topic_plan(topic("topic-1", "release"))
-        legacy_variant = replace(
-            search_plan,
-            decision=replace(
-                search_plan.decision,
-                route=SearchTier.DEEP,
-                program_minimum_tier=SearchTier.DEEP,
-                risk=RiskLevel.HIGH,
-                freshness=Freshness.HIGH,
-            ),
-        )
-        weak = replace(
-            candidate(content="release snippet"),
-            extraction_status="search_result_snippet_after_fetch_failure",
-            content_reads_consumed=1,
-        )
-        judge = StaticEvidenceJudge({"C1": topic_judge_ok("C1")})
-        baseline = self.module.EvidenceAssembler(judge).assemble(search_plan, (weak,))
-        variant = self.module.EvidenceAssembler(judge).assemble(legacy_variant, (weak,))
-
-        self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertIs(variant.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertEqual(baseline.supported_topic_ids, variant.supported_topic_ids)
-        self.assertFalse(baseline.evidence_items[0].citable)
-        self.assertFalse(variant.evidence_items[0].citable)
-
     def test_judge_rejects_unknown_topic_or_freshness_values_fail_closed(self):
         search_plan = topic_plan(topic("topic-1", "release"))
         invalid_rows = (
@@ -1612,10 +1583,6 @@ class EvidenceStateTests(unittest.TestCase):
 
     def test_risk_does_not_change_failed_fetch_snippet_admission(self):
         baseline_plan = topic_plan(topic("topic-1", "剂量"))
-        risky_plan = replace(
-            baseline_plan,
-            decision=replace(baseline_plan.decision, risk=RiskLevel.HIGH),
-        )
         weak = replace(
             candidate(content="药物剂量搜索片段"),
             extraction_status="search_result_snippet_after_fetch_failure",
@@ -1626,40 +1593,9 @@ class EvidenceStateTests(unittest.TestCase):
         )
 
         baseline = self.module.EvidenceAssembler(judge).assemble(baseline_plan, (weak,))
-        high_risk = self.module.EvidenceAssembler(judge).assemble(risky_plan, (weak,))
 
         self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertIs(high_risk.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertEqual(baseline.supported_topic_ids, high_risk.supported_topic_ids)
         self.assertFalse(baseline.evidence_items[0].citable)
-        self.assertFalse(high_risk.evidence_items[0].citable)
-
-    def test_legacy_freshness_metadata_does_not_change_current_topic_admission(self):
-        current_plan = current_topic_plan("当前版本")
-        legacy_variant = replace(
-            current_plan,
-            decision=replace(current_plan.decision, freshness=Freshness.HIGH),
-        )
-        weak = replace(
-            candidate(content="当前版本是 2.0 的搜索片段"),
-            extraction_status="search_result_snippet_after_fetch_failure",
-            content_reads_consumed=1,
-        )
-        judge = StaticEvidenceJudge(
-            {
-                "C1": topic_judge_ok(
-                    "C1",
-                    freshness_by_topic={"topic-1": "satisfied"},
-                )
-            }
-        )
-
-        baseline = self.module.EvidenceAssembler(judge).assemble(current_plan, (weak,))
-        variant = self.module.EvidenceAssembler(judge).assemble(legacy_variant, (weak,))
-
-        self.assertIs(baseline.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertIs(variant.evidence_state, EvidenceState.INSUFFICIENT)
-        self.assertEqual(baseline.supported_topic_ids, variant.supported_topic_ids)
 
     def test_two_weak_dynamic_snippets_cannot_form_material_conflict(self):
         weak_candidates = tuple(
@@ -1841,7 +1777,7 @@ class EvidenceGapTests(unittest.TestCase):
             }}
         )
         assembler = self.module.EvidenceAssembler(judge)
-        p = plan(required_topics=("定义",), route=SearchTier.DEEP)
+        p = plan(required_topics=("定义",), route=SearchTier.STANDARD)
         # A candidate whose excerpt is empty cannot be citable.
         from src.search.models import EvidenceCandidate, ExcerptOrigin
         empty = EvidenceCandidate(

@@ -73,9 +73,10 @@ def analysis(skip_reason=None, high_consequence=False, fail_closed=False):
 def decision(route=SearchTier.LIGHT):
     m = models()
     return m.RetrievalDecision(
-        route, None, False, (), frozenset(), Factuality.FACTUAL,
-        True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
-        m.PotentialHarm.NONE, route, None, (),
+        route=route,
+        skip_reason=None,
+        must_search=True,
+        reason_codes=(),
     )
 
 
@@ -148,9 +149,10 @@ def search_result(route=SearchTier.LIGHT, evidence=None, failure=None, skip_reas
     m = models()
     if skip_reason is not None:
         d = m.RetrievalDecision(
-            SearchTier.SKIP, skip_reason, False, (), frozenset(),
-            Factuality.NON_FACTUAL, False, Freshness.NONE, RiskLevel.LOW,
-            m.Actionability.NONE, m.PotentialHarm.NONE, None, None, (),
+            route=SearchTier.SKIP,
+            skip_reason=skip_reason,
+            must_search=False,
+            reason_codes=(),
         )
         return m.SearchPipelineResult(
             d,
@@ -177,20 +179,10 @@ def search_result(route=SearchTier.LIGHT, evidence=None, failure=None, skip_reas
 def no_web_result(*, potential_harm, trigger_codes=()):
     m = models()
     d = m.RetrievalDecision(
-        SearchTier.SKIP,
-        SkipReason.USER_FORBID_WEB,
-        False,
-        tuple(trigger_codes),
-        frozenset(),
-        Factuality.FACTUAL,
-        True,
-        Freshness.NONE,
-        RiskLevel.LOW,
-        m.Actionability.NONE,
-        potential_harm,
-        None,
-        None,
-        tuple(trigger_codes),
+        route=SearchTier.SKIP,
+        skip_reason=SkipReason.USER_FORBID_WEB,
+        must_search=False,
+        reason_codes=(),
     )
     high_consequence = (
         potential_harm is m.PotentialHarm.HIGH
@@ -523,7 +515,7 @@ class FailureFlowTests(unittest.TestCase):
 
     def test_dynamic_low_risk_failure_does_not_use_memory_or_risk_warning(self):
         result = search_result(
-            SearchTier.DEEP,
+            SearchTier.STANDARD,
             failure=SearchFailureCode.PROVIDER_TIMEOUT,
         )
         reply, llm_chat = self._run(
@@ -537,7 +529,7 @@ class FailureFlowTests(unittest.TestCase):
         self.assertNotIn("TEC赢了", reply)
 
     def test_deep_malformed_draft_returns_validation_failed_and_trace_agrees(self):
-        result = search_result(SearchTier.DEEP, bundle((item(),)))
+        result = search_result(SearchTier.STANDARD, bundle((item(),)))
         chat_service._search_orchestrator = mock.Mock(run=lambda req: result)
         with (
             _patch_memory(),
@@ -556,7 +548,7 @@ class FailureFlowTests(unittest.TestCase):
         self.assertTrue(append.call_args.args[2])
 
     def test_deep_cross_block_claim_mapping_is_validation_failed_without_citation_shift(self):
-        result = search_result(SearchTier.DEEP, bundle((item(),)))
+        result = search_result(SearchTier.STANDARD, bundle((item(),)))
         chat_service._search_orchestrator = mock.Mock(run=lambda req: result)
         cross_block = json.dumps({
             "answer_blocks": [
@@ -584,7 +576,7 @@ class FailureFlowTests(unittest.TestCase):
         self.assertIs(finalized_result.trace.degradation_reason, models().SearchFailureCode.VALIDATION_FAILED)
 
     def test_deep_malformed_claim_discovery_is_validation_failed(self):
-        result = search_result(SearchTier.DEEP, bundle((item(),)))
+        result = search_result(SearchTier.STANDARD, bundle((item(),)))
         chat_service._search_orchestrator = mock.Mock(run=lambda req: result)
         valid_draft = json.dumps({
             "answer_blocks": [
@@ -778,7 +770,7 @@ class TraceLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(trace.response_finished_at)
 
     def test_delayed_claim_discovery_exception_finalizes_validation_failure_trace_once(self):
-        result = search_result(SearchTier.DEEP, bundle((item(),)))
+        result = search_result(SearchTier.STANDARD, bundle((item(),)))
         old = getattr(chat_service, "_search_orchestrator", None)
         chat_service._search_orchestrator = mock.Mock(run=lambda req: result)
         draft_payload = json.dumps({

@@ -741,38 +741,7 @@ class SearchPlanner:
                 target_topic_ids=material_topic_ids,
             )
         ]
-        if decision.route is SearchTier.DEEP:
-            location_hint = _deep_location_hint(direct_text)
-            queries.append(
-                SearchQuery(
-                    query_id="",
-                    round_kind=SearchRoundKind.INITIAL,
-                    purpose=QueryPurpose.TIME_BOUNDED,
-                    text=f"{location_hint} {today.isoformat()} 新闻 重要事件",
-                    date_from=today,
-                    date_to=today,
-                    target_topic_ids=material_topic_ids,
-                )
-            )
-            queries.append(
-                SearchQuery(
-                    query_id="",
-                    round_kind=SearchRoundKind.INITIAL,
-                    purpose=QueryPurpose.PRIMARY,
-                    text=f"{location_hint} {today.isoformat()} 官方 通报",
-                    target_topic_ids=material_topic_ids,
-                )
-            )
-            queries.append(
-                SearchQuery(
-                    query_id="",
-                    round_kind=SearchRoundKind.INITIAL,
-                    purpose=QueryPurpose.INDEPENDENT,
-                    text=f"{location_hint} {today.isoformat()} 新闻 重要事件 独立报道",
-                    target_topic_ids=material_topic_ids,
-                )
-            )
-        elif decision.route is SearchTier.STANDARD:
+        if decision.route is SearchTier.STANDARD:
             queries.append(
                 SearchQuery(
                     query_id="",
@@ -1163,13 +1132,6 @@ def _extract_entities(original: str) -> tuple[str, ...]:
         if candidate not in entities:
             entities.append(candidate)
     return tuple(entities[:8])
-
-
-def _deep_location_hint(original: str) -> str:
-    match = re.search(r"([一-鿿]{2,6}?)(?:今天|最近|目前|现在|最新)", original)
-    if match is not None:
-        return match.group(1)
-    return str(original or "").strip()
 
 
 def _derive_required_topics(original: str) -> tuple[str, ...]:

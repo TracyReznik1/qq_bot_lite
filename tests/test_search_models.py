@@ -31,9 +31,10 @@ class SearchModelFixtures:
     def decision(self):
         m = self.m
         return m.RetrievalDecision(
-            m.SearchTier.LIGHT, None, False, (), frozenset(), m.Factuality.FACTUAL,
-            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
-            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, (),
+            route=m.SearchTier.LIGHT,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
         )
 
     def budget(self):
@@ -159,7 +160,7 @@ class SearchModelContractTests(unittest.TestCase):
         m = models()
 
         expected = {
-            "SearchTier": {"skip", "light", "standard", "deep"},
+            "SearchTier": {"skip", "light", "standard"},
             "SkipReason": {
                 "user_forbid_web", "social_or_emotional", "creative_or_roleplay",
                 "provided_text_transform", "provided_content_summary", "pure_math",
@@ -182,7 +183,7 @@ class SearchModelContractTests(unittest.TestCase):
                 "risk_control",
             },
             "Factuality": {"non_factual", "factual", "mixed", "ambiguous"},
-            "Freshness": {"none", "low", "high"},
+            "Freshness": {"none", "low"},
             "FreshnessEligibility": {"not_required", "satisfied", "stale", "unknown"},
             "RiskLevel": {"low", "medium", "high"},
             "Actionability": {"none", "general", "personalized"},
@@ -214,106 +215,43 @@ class SearchModelContractTests(unittest.TestCase):
 
     def test_decisions_accept_all_routes_and_expose_conflict_clarification(self):
         m = models()
-        common = dict(
-            forced_search=False,
-            trigger_codes=(),
-            benefit_dimensions=frozenset(),
-            factuality=m.Factuality.NON_FACTUAL,
-            external_fact_required=False,
-            freshness=m.Freshness.NONE,
-            risk=m.RiskLevel.LOW,
-            actionability=m.Actionability.NONE,
-            potential_harm=m.PotentialHarm.NONE,
-            model_recommended_tier=None,
-            final_reason_codes=(),
-        )
-
         skipped = m.RetrievalDecision(
             route=m.SearchTier.SKIP,
             skip_reason=m.SkipReason.PURE_MATH,
-            program_minimum_tier=None,
-            **common,
+            must_search=False,
+            reason_codes=(),
         )
         self.assertFalse(skipped.requires_clarification)
-        for tier in (m.SearchTier.LIGHT, m.SearchTier.STANDARD, m.SearchTier.DEEP):
+        for tier in (m.SearchTier.LIGHT, m.SearchTier.STANDARD):
             with self.subTest(tier=tier):
                 decision = m.RetrievalDecision(
                     route=tier,
                     skip_reason=None,
-                    program_minimum_tier=tier,
-                    **common,
+                    must_search=True,
+                    reason_codes=(),
                 )
                 self.assertEqual(tier, decision.route)
 
         conflict = m.RetrievalDecision(
             route=m.SearchTier.SKIP,
             skip_reason=m.SkipReason.USER_FORBID_WEB,
-            forced_search=True,
-            trigger_codes=(m.TriggerCode.EXPLICIT_NO_WEB, m.TriggerCode.EXPLICIT_SEARCH),
-            benefit_dimensions=frozenset(),
-            factuality=m.Factuality.AMBIGUOUS,
-            external_fact_required=False,
-            freshness=m.Freshness.NONE,
-            risk=m.RiskLevel.LOW,
-            actionability=m.Actionability.NONE,
-            potential_harm=m.PotentialHarm.NONE,
-            program_minimum_tier=None,
-            model_recommended_tier=None,
-            final_reason_codes=(m.TriggerCode.EXPLICIT_NO_WEB, m.TriggerCode.EXPLICIT_SEARCH),
+            must_search=True,
+            reason_codes=(),
         )
         self.assertTrue(conflict.requires_clarification)
 
-        # Task 3 carries the force/explicit-search conflict in RetrievalContext.
-        # Retained decision reason codes are diagnostic only and must not erase
-        # the clarification state when their legacy set is minimal.
-        minimal_conflict = m.RetrievalDecision(
-            route=m.SearchTier.SKIP,
-            skip_reason=m.SkipReason.USER_FORBID_WEB,
-            forced_search=True,
-            trigger_codes=(m.TriggerCode.EXPLICIT_NO_WEB,),
-            benefit_dimensions=frozenset(),
-            factuality=m.Factuality.AMBIGUOUS,
-            external_fact_required=False,
-            freshness=m.Freshness.NONE,
-            risk=m.RiskLevel.LOW,
-            actionability=m.Actionability.NONE,
-            potential_harm=m.PotentialHarm.NONE,
-            program_minimum_tier=None,
-            model_recommended_tier=None,
-            final_reason_codes=(m.TriggerCode.EXPLICIT_NO_WEB,),
-        )
-        self.assertTrue(minimal_conflict.requires_clarification)
-
     def test_decision_rejects_illegal_route_combinations_and_free_text_codes(self):
         m = models()
-        common = dict(
-            forced_search=False,
-            trigger_codes=(),
-            benefit_dimensions=frozenset(),
-            factuality=m.Factuality.FACTUAL,
-            external_fact_required=True,
-            freshness=m.Freshness.NONE,
-            risk=m.RiskLevel.LOW,
-            actionability=m.Actionability.NONE,
-            potential_harm=m.PotentialHarm.NONE,
-            model_recommended_tier=None,
-            final_reason_codes=(),
-        )
         invalid = (
-            dict(route=m.SearchTier.SKIP, skip_reason=None, program_minimum_tier=None),
-            dict(route=m.SearchTier.LIGHT, skip_reason=m.SkipReason.PURE_MATH, program_minimum_tier=m.SearchTier.LIGHT),
-            dict(route=m.SearchTier.LIGHT, skip_reason=None, program_minimum_tier=None),
-            dict(route=m.SearchTier.LIGHT, skip_reason=None, program_minimum_tier=m.SearchTier.STANDARD),
-            dict(route=m.SearchTier.LIGHT, skip_reason=None, program_minimum_tier=m.SearchTier.SKIP),
-            dict(route=m.SearchTier.SKIP, skip_reason=m.SkipReason.PURE_MATH, program_minimum_tier=None, forced_search=True),
-            dict(route=m.SearchTier.LIGHT, skip_reason=None, program_minimum_tier=m.SearchTier.LIGHT, trigger_codes=("free_text",)),
-            dict(route=m.SearchTier.LIGHT, skip_reason=None, program_minimum_tier=m.SearchTier.LIGHT, final_reason_codes=("free_text",)),
+            dict(route=m.SearchTier.SKIP, skip_reason=None, must_search=False, reason_codes=()),
+            dict(route=m.SearchTier.LIGHT, skip_reason=m.SkipReason.PURE_MATH, must_search=True, reason_codes=()),
+            dict(route=m.SearchTier.LIGHT, skip_reason=None, must_search="yes", reason_codes=()),
+            dict(route=m.SearchTier.LIGHT, skip_reason=None, must_search=True, reason_codes=("free_text",)),
         )
         for overrides in invalid:
             with self.subTest(overrides=overrides):
-                values = common | overrides
                 with self.assertRaises((TypeError, ValueError)):
-                    m.RetrievalDecision(**values)
+                    m.RetrievalDecision(**overrides)
 
     def test_budgets_are_immutable_and_validate_derived_totals(self):
         m = models()
@@ -326,22 +264,12 @@ class SearchModelContractTests(unittest.TestCase):
             (3, 8, 5, 1, 4, 2, 20),
             tuple(m.DEFAULT_TIER_BUDGETS[m.SearchTier.STANDARD].__dict__.values()),
         )
-        self.assertEqual(
-            (5, 15, 8, 1, 6, 2, 40),
-            tuple(m.DEFAULT_TIER_BUDGETS[m.SearchTier.DEEP].__dict__.values()),
-        )
         with self.assertRaises(TypeError):
             m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT] = m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT]
         with self.assertRaises(FrozenInstanceError):
             m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT].max_content_reads = 99
         with self.assertRaises(ValueError):
             m.TierBudget(1, 5, 2, 1, 1, 2, 8)
-
-    def test_max_tier_returns_the_higher_closed_tier(self):
-        m = models()
-
-        self.assertEqual(m.SearchTier.DEEP, m.max_tier(m.SearchTier.STANDARD, m.SearchTier.DEEP))
-        self.assertEqual(m.SearchTier.LIGHT, m.max_tier(m.SearchTier.SKIP, m.SearchTier.LIGHT))
 
     def test_provider_runtime_statuses_map_to_closed_failure_codes(self):
         m = models()
@@ -565,26 +493,25 @@ class SearchModelContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.SearchPipelineResult(decision, None, None, trace)
         skip = m.RetrievalDecision(
-            m.SearchTier.SKIP, m.SkipReason.PURE_MATH, False, (), frozenset(),
-            m.Factuality.NON_FACTUAL, False, m.Freshness.NONE, m.RiskLevel.LOW,
-            m.Actionability.NONE, m.PotentialHarm.NONE, None, None, (),
+            route=m.SearchTier.SKIP,
+            skip_reason=m.SkipReason.PURE_MATH,
+            must_search=False,
+            reason_codes=(),
         )
         with self.assertRaises(ValueError):
             m.SearchPipelineResult(skip, object(), None, trace)
 
     def test_frozen_contracts_normalize_caller_owned_collections_and_budget_rejects_bools(self):
         m = models()
-        triggers = [m.TriggerCode.FACTUAL_DEFAULT]
-        benefits = {m.BenefitDimension.ACCURACY}
+        reasons = [m.RetrievalComplexityCode.MULTI_FACT]
         decision = m.RetrievalDecision(
-            m.SearchTier.LIGHT, None, False, triggers, benefits, m.Factuality.FACTUAL,
-            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
-            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, triggers,
+            route=m.SearchTier.LIGHT,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=reasons,
         )
-        triggers.append(m.TriggerCode.EXPLICIT_SEARCH)
-        benefits.add(m.BenefitDimension.FRESHNESS)
-        self.assertEqual((m.TriggerCode.FACTUAL_DEFAULT,), decision.trigger_codes)
-        self.assertEqual(frozenset({m.BenefitDimension.ACCURACY}), decision.benefit_dimensions)
+        reasons.append(m.RetrievalComplexityCode.MULTI_ENTITY)
+        self.assertEqual((m.RetrievalComplexityCode.MULTI_FACT,), decision.reason_codes)
         for index in range(7):
             values = [1, 5, 2, 0, 1, 1, 8]
             values[index] = True
@@ -835,9 +762,10 @@ class SearchModelContractTests(unittest.TestCase):
     @staticmethod
     def _search_decision(m):
         return m.RetrievalDecision(
-            m.SearchTier.LIGHT, None, False, (), frozenset(), m.Factuality.FACTUAL,
-            True, m.Freshness.NONE, m.RiskLevel.LOW, m.Actionability.NONE,
-            m.PotentialHarm.NONE, m.SearchTier.LIGHT, None, (),
+            route=m.SearchTier.LIGHT,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
         )
 
 
@@ -1007,10 +935,10 @@ class RequiredTopicAndQueryPlanContractTests(unittest.TestCase):
     @staticmethod
     def _decision(m):
         return m.RetrievalDecision(
-            m.SearchTier.STANDARD, None, False, (), frozenset(),
-            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
-            m.Actionability.NONE, m.PotentialHarm.NONE,
-            m.SearchTier.STANDARD, None, (),
+            route=m.SearchTier.STANDARD,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
         )
 
     @staticmethod

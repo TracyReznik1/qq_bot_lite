@@ -74,7 +74,6 @@ AttemptFinishedObserver = Callable[[ProviderAttempt], None]
 _TAVILY_FALLBACK_RESERVE_SECONDS = {
     SearchTier.LIGHT: 3.5,
     SearchTier.STANDARD: 5.0,
-    SearchTier.DEEP: 8.0,
 }
 
 

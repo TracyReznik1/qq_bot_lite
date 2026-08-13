@@ -413,56 +413,6 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
             SearchFailureCode.PROVIDER_NOT_CONFIGURED,
         )
 
-    def test_legacy_risk_and_freshness_metadata_do_not_reach_planner_or_budget(self):
-        m = importlib.import_module("src.search.models")
-        analysis = m.RequestAnalysis(
-            m.RetrievalContext(
-                must_search=False,
-                skip_reason=None,
-                factuality=m.Factuality.FACTUAL,
-                external_fact_required=True,
-                complexity_codes=(),
-                source_requirement=m.SourceRequirement.ANY_RELEVANT,
-            ),
-            m.FreshnessContext(m.FreshnessRequirement.CURRENT, None, None, None, None),
-            m.RiskContext(True, True, True),
-        )
-
-        class CapturingPlanner:
-            def __init__(self):
-                self.decision = None
-                self.contexts = None
-
-            def plan(self, retrieval_request, retrieval_decision, retrieval_context, freshness_context, **kwargs):
-                self.decision = retrieval_decision
-                self.contexts = (retrieval_context, freshness_context)
-                return _make_planner().plan(
-                    retrieval_request,
-                    retrieval_decision,
-                    retrieval_context,
-                    freshness_context,
-                    **kwargs,
-                )
-
-        planner = CapturingPlanner()
-        orchestrator = self.module.SearchOrchestrator(
-            request_analyzer=_RecordingRequestAnalyzer(analysis),
-            router=__import__("src.search.router", fromlist=["RetrievalBenefitRouter"]).RetrievalBenefitRouter(),
-            planner=planner,
-            judge=StaticEvidenceJudge({}),
-            providers=(),
-            extractor=_FakeExtractor(),
-            clock=FakeClock(),
-        )
-        result = orchestrator.run(request("FDA 是什么机构？"))
-
-        self.assertIs(planner.decision.freshness, Freshness.NONE)
-        self.assertIs(planner.decision.risk, RiskLevel.LOW)
-        self.assertEqual((analysis.retrieval, analysis.freshness), planner.contexts)
-        self.assertIs(result.decision.route, SearchTier.LIGHT)
-        self.assertIs(result.decision.freshness, Freshness.HIGH)
-        self.assertIs(result.decision.risk, RiskLevel.HIGH)
-
     def test_planner_receives_only_retrieval_and_freshness_contexts_and_trace_counts_dispatch(self):
         m = importlib.import_module("src.search.models")
         retrieval = m.RetrievalContext(
@@ -486,10 +436,7 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
             m.RiskContext(True, True, True),
         )
         standard = m.RetrievalDecision(
-            m.SearchTier.STANDARD, None, False, (), frozenset(),
-            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
-            m.Actionability.NONE, m.PotentialHarm.NONE,
-            m.SearchTier.STANDARD, None, (),
+            route=m.SearchTier.STANDARD, skip_reason=None, must_search=True, reason_codes=(),
         )
 
         class Router:
@@ -625,85 +572,6 @@ class OrchestratorLightTests(unittest.TestCase):
         self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIsNone(result.failure_code)
 
-    def test_legacy_deep_router_raises_before_trace_route_can_change(self):
-        legacy_decision = RetrievalDecision(
-            route=SearchTier.DEEP,
-            skip_reason=None,
-            forced_search=False,
-            trigger_codes=(TriggerCode.FACTUAL_DEFAULT,),
-            benefit_dimensions=frozenset(),
-            factuality=Factuality.FACTUAL,
-            external_fact_required=True,
-            freshness=Freshness.NONE,
-            risk=RiskLevel.LOW,
-            actionability=Actionability.NONE,
-            potential_harm=PotentialHarm.NONE,
-            program_minimum_tier=SearchTier.DEEP,
-            model_recommended_tier=None,
-            final_reason_codes=(TriggerCode.FACTUAL_DEFAULT,),
-        )
-
-        class LegacyDeepRouter:
-            def __init__(self):
-                self.contexts = []
-
-            def decide(self, context):
-                self.contexts.append(context)
-                return legacy_decision
-
-        class RecordingTrace:
-            instances = []
-
-            def __init__(self, **kwargs):
-                self.request_id = kwargs["request_id"]
-                self.request_source = kwargs["request_source"]
-                self._route = kwargs["route"]
-                self.response_started_at = kwargs["response_started_at"]
-                self.__class__.instances.append(self)
-
-            @property
-            def route(self):
-                return self._route
-
-            @route.setter
-            def route(self, _value):
-                raise AssertionError("retired deep decision must not update the trace route")
-
-        class Planner:
-            def __init__(self):
-                self.calls = 0
-
-            def plan(self, *_args, **_kwargs):
-                self.calls += 1
-                raise AssertionError("retired deep decision must not reach planning")
-
-        router = LegacyDeepRouter()
-        planner = Planner()
-        analysis = _task3_analysis()
-        orchestrator = self.module.SearchOrchestrator(
-            request_analyzer=_RecordingRequestAnalyzer(analysis),
-            router=router,
-            planner=planner,
-            judge=_FakeJudge(),
-            providers=(),
-            extractor=_FakeExtractor(),
-            clock=FakeClock(),
-        )
-        retrieval_request = request("北京今天有什么新闻？")
-
-        with mock.patch.object(self.module, "SearchTrace", RecordingTrace):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "^production router emitted retired deep route$",
-            ):
-                orchestrator.run(retrieval_request)
-
-        self.assertEqual(router.contexts, [analysis.retrieval])
-        self.assertEqual(planner.calls, 0)
-        self.assertEqual(len(RecordingTrace.instances), 1)
-        self.assertIs(RecordingTrace.instances[0].route, SearchTier.LIGHT)
-
-
 class OrchestratorStandardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = orchestrator_module()
@@ -792,10 +660,7 @@ class OrchestratorFailureTests(unittest.TestCase):
     def test_empty_bundle_marks_only_material_topics_missing(self):
         m = importlib.import_module("src.search.models")
         decision = m.RetrievalDecision(
-            m.SearchTier.STANDARD, None, False, (), frozenset(),
-            m.Factuality.FACTUAL, True, m.Freshness.NONE, m.RiskLevel.LOW,
-            m.Actionability.NONE, m.PotentialHarm.NONE,
-            m.SearchTier.STANDARD, None, (),
+            route=m.SearchTier.STANDARD, skip_reason=None, must_search=True, reason_codes=(),
         )
         search_plan = m.SearchPlan(
             decision,
@@ -1602,10 +1467,10 @@ class OrchestratorTraceTests(unittest.TestCase):
 
         clock = ManualClock()
         d = RetrievalDecision(
-            SearchTier.STANDARD, None, False, (TriggerCode.FACTUAL_DEFAULT,),
-            frozenset(), Factuality.FACTUAL, True, Freshness.NONE,
-            RiskLevel.LOW, m.Actionability.NONE, m.PotentialHarm.NONE,
-            SearchTier.STANDARD, None, (TriggerCode.FACTUAL_DEFAULT,),
+            route=SearchTier.STANDARD,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
         )
         initial_query = m.SearchQuery(
             "initial-1", m.SearchRoundKind.INITIAL, m.QueryPurpose.DIRECT, "topic",
@@ -1951,9 +1816,10 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         m = importlib.import_module("src.search.models")
 
         d = RetrievalDecision(
-            SearchTier.STANDARD, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
-            m.PotentialHarm.NONE, SearchTier.STANDARD, None, (),
+            route=SearchTier.STANDARD,
+            skip_reason=None,
+            must_search=True,
+            reason_codes=(),
         )
         topics = (
             m.RequiredTopic("topic-1", "background", False, m.FreshnessRequirement.NOT_REQUIRED),

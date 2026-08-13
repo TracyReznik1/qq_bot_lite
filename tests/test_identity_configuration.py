@@ -77,10 +77,7 @@ class IdentityConfigurationTests(unittest.TestCase):
             # A social/emotional skip uses a single plain answer call.
             from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
             skip = RetrievalDecision(
-                SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
-                frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
-                RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
-                None, None, (),
+                route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
             )
             chat_service._search_orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
                 skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
@@ -112,9 +109,7 @@ class IdentityConfigurationTests(unittest.TestCase):
             SearchFailureCode,
         )
         failed = RetrievalDecision(
-            SearchTier.LIGHT, None, True, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.NONE, RiskLevel.LOW, Actionability.NONE,
-            PotentialHarm.NONE, SearchTier.LIGHT, None, (),
+            route=SearchTier.LIGHT, skip_reason=None, must_search=True, reason_codes=(),
         )
         empty_plan = None
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
@@ -151,10 +146,7 @@ class IdentityConfigurationTests(unittest.TestCase):
             PotentialHarm,
         )
         skip = RetrievalDecision(
-            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
-            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
-            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
-            None, None, (),
+            route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
         )
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
@@ -182,10 +174,7 @@ class IdentityConfigurationTests(unittest.TestCase):
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
         from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
         skip = RetrievalDecision(
-            SearchTier.SKIP, SkipReason.SOCIAL_OR_EMOTIONAL, False, (),
-            frozenset(), Factuality.NON_FACTUAL, False, Freshness.NONE,
-            RiskLevel.LOW, Actionability.NONE, PotentialHarm.NONE,
-            None, None, (),
+            route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
         )
         orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
             skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,

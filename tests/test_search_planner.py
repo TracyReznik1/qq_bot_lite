@@ -42,9 +42,7 @@ def planner_module():
 def decision(tier: SearchTier) -> RetrievalDecision:
     m = __import__("src.search.models", fromlist=["RetrievalDecision"])
     return m.RetrievalDecision(
-        tier, None, False, (), frozenset(), Factuality.FACTUAL,
-        True, Freshness.NONE, RiskLevel.LOW, m.Actionability.NONE,
-        m.PotentialHarm.NONE, tier, None, (),
+        route=tier, skip_reason=None, must_search=True, reason_codes=(),
     )
 
 
@@ -129,8 +127,8 @@ def standard_decision():
     return decision(SearchTier.STANDARD)
 
 
-def deep_decision():
-    return decision(SearchTier.DEEP)
+def standard_decision():
+    return decision(SearchTier.STANDARD)
 
 
 def gap(missing=(), conflict=(), eligible=True, reason=RepairReasonCode.MISSING_TOPIC):
@@ -575,48 +573,6 @@ class PlannerStandardTests(unittest.TestCase):
         self.assertTrue(second.triggered)
 
 
-class PlannerDeepTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.module = planner_module()
-
-    def _plan(self):
-        model = StaticPlannerModel()
-        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        return plan_with_context(planner, request("北京今天有什么新闻"), deep_decision())
-
-    def test_deep_emits_at_most_five_with_time_bounded(self):
-        plan = self._plan()
-        self.assertLessEqual(len(plan.initial_queries), 5)
-        purposes = {q.purpose for q in plan.initial_queries}
-        self.assertIn(QueryPurpose.DIRECT, purposes)
-        self.assertIn(QueryPurpose.TIME_BOUNDED, purposes)
-
-    def test_deep_direct_preserves_original_cjk(self):
-        plan = self._plan()
-        direct = next(q for q in plan.initial_queries if q.purpose is QueryPurpose.DIRECT)
-        self.assertEqual(direct.text, "北京今天有什么新闻")
-
-    def test_deep_fallback_preserves_required_queries(self):
-        plan = self._plan()
-        texts = [q.text for q in plan.initial_queries]
-        self.assertIn("北京 2026-07-29 新闻 重要事件", texts)
-        self.assertIn("北京 2026-07-29 官方 通报", texts)
-        self.assertIn("北京 2026-07-29 新闻 重要事件 独立报道", texts)
-
-    def test_deep_repair_allows_one(self):
-        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(
-            planner,
-            request("北京今天有什么新闻"),
-            deep_decision(),
-            material_topic_label="事件细节",
-        )
-        repair = planner.plan_repair(plan, gap(missing=("topic-1",)))
-        self.assertTrue(repair.triggered)
-        self.assertEqual(plan.budget.max_total_queries, 6)
-        self.assertEqual(plan.budget.max_repair_queries, 1)
-
-
 class PlannerRedactionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = planner_module()
@@ -812,212 +768,10 @@ class PlannerDegradationTests(unittest.TestCase):
             supplements=(supplemental_query("primary", "机械关键词"),),
         ))
         planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("北京今天有什么新闻"), deep_decision())
+        plan = plan_with_context(planner, request("北京今天有什么新闻"), standard_decision())
         texts = [q.text for q in plan.initial_queries]
         self.assertIn("北京今天有什么新闻", texts)
         self.assertIn(QueryPurpose.DIRECT, {q.purpose for q in plan.initial_queries})
-
-    def test_deep_dynamic_plan_always_has_time_bounded_query(self):
-        from src.search.models import Freshness as F
-        model = StaticPlannerModel(strict_payload(
-            topics=(model_topic("北京新闻"),),
-            supplements=(
-                supplemental_query(
-                    "time_bounded",
-                    "北京 2026-07-29 新闻",
-                    date_from="2026-07-29",
-                    date_to="2026-07-29",
-                ),
-            ),
-        ))
-        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        d = decision(SearchTier.DEEP)
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, F.HIGH, RiskLevel.LOW, __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
-        plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
-        self.assertIn(QueryPurpose.TIME_BOUNDED, {q.purpose for q in plan.initial_queries})
-
-    def test_deep_high_freshness_replaces_a_full_model_slot_with_time_bounded_query(self):
-        model = StaticPlannerModel(strict_payload(
-            topics=(model_topic("北京新闻"),),
-            supplements=tuple(
-                supplemental_query("primary", f"北京新闻来源 {index}")
-                for index in range(3)
-            ) + (
-                supplemental_query(
-                    "time_bounded",
-                    "北京 2026-07-29 新闻",
-                    date_from="2026-07-29",
-                    date_to="2026-07-29",
-                ),
-                supplemental_query("primary", "北京新闻来源 额外槽位"),
-            ),
-        ))
-        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.HIGH, RiskLevel.LOW,
-            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
-        plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
-        self.assertEqual(len(plan.initial_queries), plan.budget.max_initial_queries)
-        self.assertEqual(plan.initial_queries[0].text, "北京今天有什么新闻")
-        time_bounded = [query for query in plan.initial_queries if query.purpose is QueryPurpose.TIME_BOUNDED]
-        self.assertEqual(len(time_bounded), 1)
-        self.assertEqual(time_bounded[0].date_from, date(2026, 7, 29))
-        self.assertEqual(time_bounded[0].date_to, date(2026, 7, 29))
-
-    def test_deep_high_freshness_validates_final_slots_for_genuine_time_bounds(self):
-        def model_queries(time_query):
-            return [
-                supplemental_query("primary", f"北京新闻来源 {index}")
-                for index in range(3)
-            ] + [time_query, supplemental_query("primary", "北京新闻来源 额外")]
-
-        cases = {
-            "fifth_slot": supplemental_query(
-                "time_bounded", "北京 2026-07-29 新闻",
-                date_from="2026-07-29", date_to="2026-07-29",
-            ),
-            "unbounded": supplemental_query("time_bounded", "北京新闻"),
-            "partial": supplemental_query(
-                "time_bounded", "北京 2026-07-29 新闻", date_from="2026-07-29",
-            ),
-            "reversed": supplemental_query(
-                "time_bounded", "北京 2026-07-28 至 2026-07-29 新闻",
-                date_from="2026-07-29", date_to="2026-07-28",
-            ),
-        }
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.HIGH, RiskLevel.LOW,
-            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
-        for name, time_query in cases.items():
-            with self.subTest(case=name):
-                model = StaticPlannerModel(strict_payload(
-                    topics=(model_topic("北京新闻"),),
-                    supplements=model_queries(time_query),
-                ))
-                planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-                plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
-                self.assertEqual(plan.initial_queries[0].text, "北京今天有什么新闻")
-                genuine = [
-                    query
-                    for query in plan.initial_queries
-                    if query.purpose is QueryPurpose.TIME_BOUNDED
-                    and query.date_from is not None
-                    and query.date_to is not None
-                    and query.date_from <= query.date_to
-                    and query.date_from.isoformat() in query.text
-                    and query.date_to.isoformat() in query.text
-                ]
-                self.assertEqual(len(genuine), 1 if name == "fifth_slot" else 0)
-
-    def test_deep_plan_assigns_unique_final_ids_after_dedupe_and_time_replacement(self):
-        model = StaticPlannerModel(strict_payload(
-            topics=(model_topic("北京新闻"),),
-            supplements=(
-                supplemental_query("primary", "北京官方来源"),
-                supplemental_query(
-                    "time_bounded",
-                    "北京 2026-07-29 新闻",
-                    date_from="2026-07-29",
-                    date_to="2026-07-29",
-                ),
-            ),
-        ))
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.HIGH, RiskLevel.LOW,
-            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
-        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
-        self.assertEqual("北京今天有什么新闻", plan.initial_queries[0].text)
-        self.assertEqual(
-            [f"initial-{index}" for index in range(1, len(plan.initial_queries) + 1)],
-            [query.query_id for query in plan.initial_queries],
-        )
-        time_bounded = next(query for query in plan.initial_queries if query.purpose is QueryPurpose.TIME_BOUNDED)
-        from src.search.models import ProviderHit
-        hit = ProviderHit(
-            "tavily", time_bounded.query_id, "title", "https://example.com/time",
-            "snippet", None, None, None, (),
-        )
-        orchestrator = importlib.import_module("src.search.orchestrator")
-        self.assertEqual(time_bounded, orchestrator._query_for_hit(plan, hit))
-        m = importlib.import_module("src.search.models")
-        trace = SearchTrace(
-            "req-ids", RequestSource.CHAT, SearchTier.DEEP,
-            executed_queries=tuple(
-                m.QueryTraceEntry(
-                    query.query_index,
-                    query.purpose,
-                    query.round_kind,
-                    "tavily",
-                    m.ProviderStatus.SUCCESS,
-                    1,
-                )
-                for query in plan.initial_queries
-            ),
-        )
-        self.assertEqual(len(plan.initial_queries), trace.to_log_dict()["semantic_query_count"])
-
-    def test_deep_plan_removes_every_invalid_selected_time_query_before_dispatch(self):
-        invalid_cases = {
-            "unbounded": supplemental_query("time_bounded", "北京错误无界窗口"),
-            "partial": supplemental_query(
-                "time_bounded", "北京错误单边窗口 2026-07-29",
-                date_from="2026-07-29",
-            ),
-            "reversed": supplemental_query(
-                "time_bounded", "北京错误倒序窗口 2026-07-30 2026-07-29",
-                date_from="2026-07-30", date_to="2026-07-29",
-            ),
-        }
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.HIGH, RiskLevel.LOW,
-            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
-        for name, invalid_query in invalid_cases.items():
-            with self.subTest(case=name):
-                model = StaticPlannerModel(strict_payload(
-                    topics=(model_topic("北京新闻"),),
-                    supplements=(
-                        supplemental_query("primary", "北京官方来源"),
-                        supplemental_query("primary", "北京官方来源"),
-                        invalid_query,
-                        supplemental_query("independent", "北京独立报道"),
-                    ),
-                ))
-                planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-                plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
-
-                self.assertEqual("北京今天有什么新闻", plan.initial_queries[0].text)
-                self.assertNotIn(invalid_query["text"], {query.text for query in plan.initial_queries})
-                time_queries = [
-                    query for query in plan.initial_queries
-                    if query.purpose is QueryPurpose.TIME_BOUNDED
-                ]
-                self.assertEqual(0, len(time_queries))
-                self.assertEqual(
-                    [f"initial-{index}" for index in range(1, len(plan.initial_queries) + 1)],
-                    [query.query_id for query in plan.initial_queries],
-                )
 
     def test_final_plan_never_keeps_malformed_date_metadata_on_any_query_purpose(self):
         model = StaticPlannerModel(strict_payload(
@@ -1033,13 +787,7 @@ class PlannerDegradationTests(unittest.TestCase):
                 supplemental_query("primary", "北京有效官方来源"),
             ),
         ))
-        d = __import__("src.search.models", fromlist=["RetrievalDecision"]).RetrievalDecision(
-            SearchTier.DEEP, None, False, (), frozenset(), Factuality.FACTUAL,
-            True, Freshness.HIGH, RiskLevel.LOW,
-            __import__("src.search.models", fromlist=["Actionability"]).Actionability.NONE,
-            __import__("src.search.models", fromlist=["PotentialHarm"]).PotentialHarm.NONE,
-            SearchTier.DEEP, None, (),
-        )
+        d = standard_decision()
         planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
         plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
 
@@ -1068,10 +816,10 @@ class PlannerQueryCapTests(unittest.TestCase):
             ),
         ))
         planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        plan = plan_with_context(planner, request("什么是光合作用"), deep_decision())
+        plan = plan_with_context(planner, request("什么是光合作用"), standard_decision())
         self.assertLessEqual(len(plan.initial_queries), 5)
         self.assertLessEqual(
-            len(plan.initial_queries) + (1 if plan.decision.route in (SearchTier.STANDARD, SearchTier.DEEP) else 0),
+            len(plan.initial_queries) + (1 if plan.decision.route in (SearchTier.STANDARD, SearchTier.STANDARD) else 0),
             plan.budget.max_total_queries,
         )
 
