@@ -620,7 +620,6 @@ class TierBudget:
     max_repair_queries: int
     max_total_queries: int
     max_retrieval_rounds: int
-    hard_timeout_seconds: int
 
     def __post_init__(self) -> None:
         values = self.__dict__.values()
@@ -631,14 +630,12 @@ class TierBudget:
         expected_rounds = 1 + int(self.max_repair_queries > 0)
         if self.max_retrieval_rounds != expected_rounds:
             raise ValueError("max_retrieval_rounds must match the repair budget")
-        if self.hard_timeout_seconds <= 0:
-            raise ValueError("hard_timeout_seconds must be positive")
 
 
 DEFAULT_TIER_BUDGETS: Mapping[SearchTier, TierBudget] = MappingProxyType(
     {
-        SearchTier.LIGHT: TierBudget(1, 5, 2, 0, 1, 1, 8),
-        SearchTier.STANDARD: TierBudget(3, 8, 5, 1, 4, 2, 20),
+        SearchTier.LIGHT: TierBudget(1, 5, 2, 0, 1, 1),
+        SearchTier.STANDARD: TierBudget(3, 8, 5, 1, 4, 2),
     }
 )
 

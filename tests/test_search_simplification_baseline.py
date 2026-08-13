@@ -64,14 +64,12 @@ class SearchSimplificationBaselineTests(unittest.TestCase):
         self.assertEqual(0, light.max_repair_queries)
         self.assertEqual(1, light.max_total_queries)
         self.assertEqual(1, light.max_retrieval_rounds)
-        self.assertEqual(8, light.hard_timeout_seconds)
         self.assertEqual(3, standard.max_initial_queries)
         self.assertEqual(8, standard.max_candidate_urls)
         self.assertEqual(5, standard.max_content_reads)
         self.assertEqual(1, standard.max_repair_queries)
         self.assertEqual(4, standard.max_total_queries)
         self.assertEqual(2, standard.max_retrieval_rounds)
-        self.assertEqual(20, standard.hard_timeout_seconds)
 
     def test_budget_baseline_source_does_not_depend_on_dataclass_field_order(self):
         source = Path(__file__).read_text(encoding="utf-8")

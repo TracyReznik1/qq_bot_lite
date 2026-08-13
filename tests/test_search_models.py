@@ -332,11 +332,11 @@ class SearchModelContractTests(unittest.TestCase):
         m = models()
 
         self.assertEqual(
-            (1, 5, 2, 0, 1, 1, 8),
+            (1, 5, 2, 0, 1, 1),
             tuple(m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT].__dict__.values()),
         )
         self.assertEqual(
-            (3, 8, 5, 1, 4, 2, 20),
+            (3, 8, 5, 1, 4, 2),
             tuple(m.DEFAULT_TIER_BUDGETS[m.SearchTier.STANDARD].__dict__.values()),
         )
         with self.assertRaises(TypeError):
@@ -344,7 +344,7 @@ class SearchModelContractTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             m.DEFAULT_TIER_BUDGETS[m.SearchTier.LIGHT].max_content_reads = 99
         with self.assertRaises(ValueError):
-            m.TierBudget(1, 5, 2, 1, 1, 2, 8)
+            m.TierBudget(1, 5, 2, 1, 1, 2)
 
     def test_provider_runtime_statuses_map_to_closed_failure_codes(self):
         m = models()
@@ -622,8 +622,8 @@ class SearchModelContractTests(unittest.TestCase):
         )
         reasons.append(m.RetrievalComplexityCode.MULTI_ENTITY)
         self.assertEqual((m.RetrievalComplexityCode.MULTI_FACT,), decision.reason_codes)
-        for index in range(7):
-            values = [1, 5, 2, 0, 1, 1, 8]
+        for index in range(6):
+            values = [1, 5, 2, 0, 1, 1]
             values[index] = True
             with self.subTest(index=index):
                 with self.assertRaises(ValueError):
