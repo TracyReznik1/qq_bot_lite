@@ -71,14 +71,8 @@ AttemptStartedObserver = Callable[[str, SearchQuery, ProviderReadiness, float], 
 AttemptFinishedObserver = Callable[[ProviderAttempt], None]
 
 
-_TAVILY_FALLBACK_RESERVE_SECONDS = {
-    SearchTier.LIGHT: 3.5,
-    SearchTier.STANDARD: 5.0,
-}
-
-
 class ProviderRegistry:
-    """Select DDGS first and use Tavily as the bounded fallback."""
+    """Ordered registry of search providers supporting direct named search and legacy fallback."""
 
     def __init__(self, providers: Iterable[SearchProvider] | None = None) -> None:
         self._providers: list[SearchProvider] = list(providers or ())
@@ -107,6 +101,64 @@ class ProviderRegistry:
             max_results=max_results,
             timeout_seconds=timeout_seconds,
         ).result
+
+    def search_provider_with_attempts(
+        self,
+        provider_name: str,
+        query: SearchQuery,
+        *,
+        tier: SearchTier,
+        max_results: int,
+        timeout_seconds: float,
+        on_attempt_started: AttemptStartedObserver | None = None,
+        on_attempt_finished: AttemptFinishedObserver | None = None,
+    ) -> ProviderSearchOutcome:
+        """Execute one named provider attempt under its full independent timeout."""
+        duration = max(float(timeout_seconds), 0.0)
+        deadline = time.monotonic() + duration
+        if duration <= 0:
+            return ProviderSearchOutcome(
+                ProviderResult(
+                    provider=provider_name,
+                    status=ProviderStatus.TIMEOUT,
+                    hits=(),
+                    latency_ms=0,
+                ),
+                (),
+            )
+        provider = self._provider_named(provider_name)
+        if provider is None or not provider.readiness().configured:
+            return ProviderSearchOutcome(
+                ProviderResult(
+                    provider=provider_name,
+                    status=ProviderStatus.NOT_CONFIGURED,
+                    hits=(),
+                    latency_ms=0,
+                ),
+                (),
+            )
+        if not provider.readiness().available:
+            return ProviderSearchOutcome(
+                ProviderResult(
+                    provider=provider_name,
+                    status=ProviderStatus.UNAVAILABLE,
+                    hits=(),
+                    latency_ms=0,
+                ),
+                (),
+            )
+
+        result, attempt = self._call_until_deadline(
+            provider,
+            query,
+            tier=tier,
+            max_results=max_results,
+            deadline=deadline,
+            on_attempt_started=on_attempt_started,
+            on_attempt_finished=on_attempt_finished,
+        )
+        attempts = (attempt,) if attempt is not None else ()
+        return ProviderSearchOutcome(result, attempts)
 
     def search_with_attempts(
         self,
@@ -147,7 +199,7 @@ class ProviderRegistry:
                 query,
                 tier=tier,
                 max_results=max_results,
-                deadline=self._primary_deadline(deadline, tier, fallback),
+                deadline=deadline,
                 on_attempt_started=on_attempt_started,
                 on_attempt_finished=on_attempt_finished,
             )
@@ -353,21 +405,6 @@ class ProviderRegistry:
             (provider for provider in self._providers if provider.name == name),
             None,
         )
-
-    def _primary_deadline(
-        self,
-        deadline: float,
-        tier: SearchTier,
-        fallback: SearchProvider | None,
-    ) -> float:
-        reserve = _TAVILY_FALLBACK_RESERVE_SECONDS[tier]
-        if (
-            fallback is not None
-            and fallback.readiness().available
-            and self._remaining(deadline) > reserve
-        ):
-            return deadline - reserve
-        return deadline
 
     def _readiness_provider_name(self) -> str:
         if self._providers:

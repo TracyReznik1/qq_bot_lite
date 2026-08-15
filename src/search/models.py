@@ -174,6 +174,20 @@ class ProviderStatus(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class QueryOutcomeStatus(StrEnum):
+    RESOLVED = "resolved"
+    EMPTY = "empty"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    UNAVAILABLE = "unavailable"
+
+
+class RetrievalBatchState(StrEnum):
+    SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
+    ALL_FAILED = "all_failed"
+
+
 class ExcerptOrigin(StrEnum):
     PROVIDER_SNIPPET = "provider_snippet"
     PAGE_EXTRACT = "page_extract"
@@ -1219,6 +1233,86 @@ class ProviderResult:
             raise ValueError("successful provider result requires hits")
         if self.status is not ProviderStatus.SUCCESS and self.hits:
             raise ValueError("non-success provider result cannot contain hits")
+
+
+@dataclass(frozen=True)
+class QueryOutcome:
+    query: SearchQuery
+    status: QueryOutcomeStatus
+    hits: tuple[ProviderHit, ...] = ()
+    attempts: tuple[ProviderAttempt, ...] = ()
+    readiness_failure: SearchFailureCode | None = None
+
+    def __post_init__(self) -> None:
+        _require_record(self.query, SearchQuery, "query")
+        _require_enum(self.status, QueryOutcomeStatus, "status")
+        _normalize_fields(
+            self,
+            hits=_records(self.hits, ProviderHit, "hits"),
+            attempts=_records(self.attempts, ProviderAttempt, "attempts"),
+        )
+        if self.readiness_failure is not None:
+            _require_enum(self.readiness_failure, SearchFailureCode, "readiness_failure")
+            if self.readiness_failure not in {
+                SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+                SearchFailureCode.PROVIDER_UNAVAILABLE,
+            }:
+                raise ValueError("readiness_failure must be PROVIDER_NOT_CONFIGURED or PROVIDER_UNAVAILABLE")
+        if self.status is QueryOutcomeStatus.RESOLVED:
+            if not self.hits:
+                raise ValueError("resolved QueryOutcome requires hits")
+        else:
+            if self.hits:
+                raise ValueError("non-resolved QueryOutcome cannot have hits")
+
+    @property
+    def query_index(self) -> int:
+        return self.query.query_index
+
+    @property
+    def round_kind(self) -> SearchRoundKind:
+        return self.query.round_kind
+
+    @property
+    def resolved(self) -> bool:
+        return self.status is QueryOutcomeStatus.RESOLVED
+
+
+@dataclass(frozen=True)
+class QueryBatchResult:
+    outcomes: tuple[QueryOutcome, ...]
+    state: RetrievalBatchState
+
+    def __post_init__(self) -> None:
+        outcomes = _records(self.outcomes, QueryOutcome, "outcomes")
+        _require_enum(self.state, RetrievalBatchState, "state")
+        if not outcomes:
+            raise ValueError("QueryBatchResult requires non-empty outcomes")
+        indexes = tuple(outcome.query_index for outcome in outcomes)
+        if len(set(indexes)) != len(indexes):
+            raise ValueError("QueryBatchResult outcomes must have unique query_index values")
+        if indexes != tuple(sorted(indexes)):
+            raise ValueError("QueryBatchResult outcomes must be sorted by query_index")
+        _normalize_fields(self, outcomes=outcomes)
+
+        resolved_count = sum(outcome.resolved for outcome in outcomes)
+        expected_state = (
+            RetrievalBatchState.SUCCESS
+            if resolved_count == len(outcomes)
+            else RetrievalBatchState.PARTIAL_SUCCESS
+            if resolved_count > 0
+            else RetrievalBatchState.ALL_FAILED
+        )
+        if self.state is not expected_state:
+            raise ValueError(f"QueryBatchResult state {self.state} does not match outcome resolution {expected_state}")
+
+    @property
+    def resolved_count(self) -> int:
+        return sum(outcome.resolved for outcome in self.outcomes)
+
+    @property
+    def unresolved_count(self) -> int:
+        return sum(not outcome.resolved for outcome in self.outcomes)
 
 
 @dataclass(frozen=True)

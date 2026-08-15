@@ -135,47 +135,12 @@ def _format_success(url: str, title: str, text: str, content_type: str) -> str:
     )
 
 
-def _is_unsafe_ip(ip_text: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_text)
-    except ValueError:
-        return True
-    return not ip.is_global or ip.is_multicast
+from src.search.url_policy import evaluate_public_http_url
 
 
 def _validate_url(url: str) -> tuple[bool, str, str]:
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return False, "unsupported_scheme", "只支持 http/https 网页。"
-    if not parsed.hostname:
-        return False, "invalid_url", "URL 缺少有效域名。"
-
-    hostname = parsed.hostname.strip().lower()
-    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
-        return False, "unsafe_url", "出于安全原因，不能读取本机或局域网地址。"
-
-    try:
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    except ValueError:
-        return False, "invalid_url", "URL 端口无效。"
-
-    try:
-        addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
-    except OSError:
-        return False, "dns_error", "域名解析失败。"
-
-    if not addr_infos:
-        return False, "dns_error", "域名解析失败。"
-
-    for info in addr_infos:
-        try:
-            ip_text = str(info[4][0])
-        except (IndexError, TypeError):
-            return False, "dns_error", "域名解析失败。"
-        if _is_unsafe_ip(ip_text):
-            return False, "unsafe_url", "出于安全原因，不能读取本机或局域网地址。"
-
-    return True, "", ""
+    decision = evaluate_public_http_url(url)
+    return decision.allowed, decision.status, decision.message
 
 
 def _content_type(headers: Mapping) -> str:

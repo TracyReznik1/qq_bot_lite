@@ -1812,5 +1812,74 @@ class RepairContractTests(unittest.TestCase):
             )
 
 
+class QueryOutcomeContractTests(unittest.TestCase):
+    def test_query_outcome_enums(self):
+        m = models()
+        self.assertEqual(
+            {"resolved", "empty", "timeout", "error", "unavailable"},
+            {item.value for item in m.QueryOutcomeStatus},
+        )
+        self.assertEqual(
+            {"success", "partial_success", "all_failed"},
+            {item.value for item in m.RetrievalBatchState},
+        )
+
+    def test_query_outcome_validation_and_resolved_property(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        query = fixtures.query()
+        hit = fixtures.hit()
+        attempt = m.ProviderAttempt("ddgs", m.ProviderStatus.SUCCESS, 1, 10)
+
+        outcome = m.QueryOutcome(
+            query=query,
+            status=m.QueryOutcomeStatus.RESOLVED,
+            hits=(hit,),
+            attempts=(attempt,),
+        )
+        self.assertTrue(outcome.resolved)
+        self.assertEqual(1, len(outcome.hits))
+
+        with self.assertRaises(TypeError):
+            m.QueryOutcome(
+                query="not_a_query",
+                status=m.QueryOutcomeStatus.RESOLVED,
+                hits=(),
+                attempts=(),
+            )
+        with self.assertRaises((TypeError, ValueError)):
+            m.QueryOutcome(
+                query=query,
+                status="resolved",
+                hits=(),
+                attempts=(),
+            )
+
+    def test_query_batch_result_properties(self):
+        m = models()
+        fixtures = SearchModelFixtures(m)
+        q1 = fixtures.query()
+        q2 = replace(q1, query_id="initial-2", query_index=2)
+
+        o1 = m.QueryOutcome(
+            query=q1,
+            status=m.QueryOutcomeStatus.RESOLVED,
+            hits=(fixtures.hit(),),
+            attempts=(),
+        )
+        o2 = m.QueryOutcome(
+            query=q2,
+            status=m.QueryOutcomeStatus.EMPTY,
+            hits=(),
+            attempts=(),
+        )
+        batch = m.QueryBatchResult(
+            outcomes=(o1, o2),
+            state=m.RetrievalBatchState.PARTIAL_SUCCESS,
+        )
+        self.assertEqual(2, batch.total_query_count)
+        self.assertEqual(1, batch.resolved_query_count)
+
+
 if __name__ == "__main__":
     unittest.main()

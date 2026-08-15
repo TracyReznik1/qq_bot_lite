@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import logging
 import inspect
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import replace
@@ -26,13 +26,18 @@ from src.search.models import (
     PlanningStatus,
     PotentialHarm,
     ProviderAttempt,
+    ProviderHit,
     ProviderResult,
     ProviderStatus,
+    QueryBatchResult,
+    QueryOutcome,
+    QueryOutcomeStatus,
     QueryPurpose,
     QueryTraceEntry,
     RequestAnalysis,
     RepairPlan,
     RequestSource,
+    RetrievalBatchState,
     RetrievalStopReason,
     RetrievalRequest,
     RiskLevel,
@@ -47,6 +52,7 @@ from src.search.models import (
     TopicFreshnessTraceEntry,
     TriggerCode,
 )
+from src.search.outcomes import aggregate_query_outcomes
 from src.search.planner import SearchPlanner, _query_fingerprint
 from src.search.providers import (
     DDGSSearchProvider,
@@ -175,9 +181,6 @@ class SearchOrchestrator:
             )
             return result
 
-        # Task 2 keeps the legacy post-analysis anchor runnable while moving its
-        # only duration source to the derived policy. Task 8 moves this anchor
-        # to response_started and removes the rolling deadline entirely.
         budget = DEFAULT_TIER_BUDGETS[retrieval_decision.route]
         deadline = self._monotonic() + float(
             DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(
@@ -226,11 +229,10 @@ class SearchOrchestrator:
         trace.initial_round_started = True
         trace.retrieval_round_count = 1
 
-        provider_results = self._run_initial_batch(
+        initial_batch = self._run_initial_batch(
             plan,
             retrieval_decision,
             budget,
-            deadline,
             trace,
         )
         trace.initial_provider_search_latency_ms = self._elapsed_ms(initial_round_started)
@@ -241,15 +243,17 @@ class SearchOrchestrator:
                 decision, plan, trace, retrieval_started, analysis=analysis,
             )
 
-        if not provider_results or all(
-            result.status in {ProviderStatus.NOT_CONFIGURED, ProviderStatus.UNAVAILABLE, ProviderStatus.ERROR, ProviderStatus.TIMEOUT, ProviderStatus.EMPTY}
-            for result in provider_results
-        ):
-            status = next(
-                (result.status for result in provider_results),
-                ProviderStatus.NOT_CONFIGURED,
-            )
-            failure = _failure_for_status(status)
+        if initial_batch.state is RetrievalBatchState.ALL_FAILED:
+            readiness = next((o.readiness_failure for o in initial_batch.outcomes if o.readiness_failure is not None), None)
+            if readiness is not None:
+                failure = readiness
+            elif any(o.status is QueryOutcomeStatus.TIMEOUT for o in initial_batch.outcomes):
+                failure = SearchFailureCode.PROVIDER_TIMEOUT
+            elif all(o.status is QueryOutcomeStatus.EMPTY for o in initial_batch.outcomes):
+                failure = SearchFailureCode.NO_RESULTS
+            else:
+                failure = SearchFailureCode.PROVIDER_UNAVAILABLE
+
             return self._failure_result(
                 decision,
                 plan,
@@ -261,9 +265,10 @@ class SearchOrchestrator:
                 analysis=analysis,
             )
 
+        initial_hits = [hit for outcome in initial_batch.outcomes for hit in outcome.hits]
         content_started = self._monotonic()
         candidates, candidate_keys, reads, unreadable_query_ids = self._extract_candidates(
-            plan, provider_results, budget, deadline, trace,
+            plan, initial_hits, budget, deadline, trace,
         )
         unreadable_topic_ids = _unreadable_topic_ids(plan, unreadable_query_ids)
         trace.initial_content_read_latency_ms = self._elapsed_ms(content_started)
@@ -349,20 +354,24 @@ class SearchOrchestrator:
                 trace.adaptive_repair_redaction_codes = repair.query_redaction_codes
                 trace.retrieval_round_count = 2
                 repair_provider_started = self._monotonic()
-                repair_result = self._run_repair_query(
+                repair_batch = self._run_repair_query(
                     repair,
                     retrieval_decision,
                     budget,
-                    deadline,
                     trace,
                 )
                 repair_provider_finished = self._monotonic()
                 trace.provider_search_total_latency_ms += self._elapsed_ms(
                     repair_provider_started
                 )
+                repair_hits = (
+                    [hit for outcome in repair_batch.outcomes for hit in outcome.hits]
+                    if repair_batch is not None
+                    else []
+                )
                 repair_candidates, repair_keys, more_reads, _repair_unreadable = self._extract_candidates(
                     plan,
-                    repair_result,
+                    repair_hits,
                     budget,
                     deadline,
                     trace,
@@ -450,7 +459,19 @@ class SearchOrchestrator:
             initial_canonical_urls=initial_canonical_urls,
         )
 
-        failure_code = _failure_for_state(bundle.evidence_state)
+        if bundle.evidence_state is not EvidenceState.SUFFICIENT:
+            if SearchFailureCode.PROVIDER_TIMEOUT in trace.provider_failures:
+                failure_code = SearchFailureCode.PROVIDER_TIMEOUT
+                if "hard_deadline_exceeded" not in bundle.limitations:
+                    bundle = replace(
+                        bundle,
+                        limitations=tuple(dict.fromkeys((*bundle.limitations, "hard_deadline_exceeded"))),
+                    )
+            else:
+                failure_code = _failure_for_state(bundle.evidence_state)
+        else:
+            failure_code = None
+
         return SearchPipelineResult(
             decision=decision,
             plan=plan,
@@ -467,12 +488,16 @@ class SearchOrchestrator:
         plan: SearchPlan,
         decision: RetrievalDecision,
         budget: Any,
-        deadline: float,
         trace: SearchTrace,
-    ) -> list[ProviderResult]:
+    ) -> QueryBatchResult:
         budget_cap = min(budget.max_initial_queries, len(plan.initial_queries))
         queries = plan.initial_queries[:budget_cap]
-        results = self._dispatch_queries(queries, decision, deadline, trace)
+        batch_result = self._run_provider_round(
+            queries,
+            decision.route,
+            SearchRoundKind.INITIAL,
+            trace,
+        )
         trace.initial_query_count = len(
             {
                 entry.query_index
@@ -480,120 +505,238 @@ class SearchOrchestrator:
                 if entry.round_kind is SearchRoundKind.INITIAL
             }
         )
-        return results
+        return batch_result
 
     def _run_repair_query(
         self,
         repair: RepairPlan,
         decision: RetrievalDecision,
         budget: Any,
-        deadline: float,
         trace: SearchTrace,
-    ) -> list[ProviderResult]:
+    ) -> QueryBatchResult | None:
         del budget
         query = repair.repair_query
         if query is None:
-            return []
-        result = self._dispatch_queries((query,), decision, deadline, trace)
-        return result
+            return None
+        return self._run_provider_round(
+            (query,),
+            decision.route,
+            SearchRoundKind.REPAIR,
+            trace,
+        )
 
-    def _dispatch_queries(
+    def _run_provider_round(
         self,
         queries: Sequence[SearchQuery],
-        decision: RetrievalDecision,
-        deadline: float,
+        route: SearchTier,
+        round_kind: SearchRoundKind,
         trace: SearchTrace,
-    ) -> list[ProviderResult]:
-        results: list[ProviderResult] = []
+    ) -> QueryBatchResult:
         if not queries:
-            return results
-        executor = ThreadPoolExecutor(max_workers=min(len(queries), 4), thread_name_prefix="search-provider")
-        futures: dict[Any, _QueryAttemptTracker] = {}
-        outcomes: dict[_QueryAttemptTracker, ProviderSearchOutcome] = {}
+            return QueryBatchResult((), RetrievalBatchState.ALL_FAILED)
+        budget_policy = DEFAULT_SEARCH_BUDGET_POLICY.for_route(route)
+        max_results = max(int(config.search_max_results or 1), 1)
+
+        if round_kind is SearchRoundKind.INITIAL:
+            ddgs_timeout = float(budget_policy.initial_ddgs_seconds)
+            tavily_timeout = float(budget_policy.initial_tavily_seconds)
+        else:
+            ddgs_timeout = float(budget_policy.repair_ddgs_seconds)
+            tavily_timeout = float(budget_policy.repair_tavily_seconds)
+
+        # Batch 1: DDGS for all queries concurrently
+        ddgs_trackers: dict[str, _QueryAttemptTracker] = {
+            query.query_id: _QueryAttemptTracker(query) for query in queries
+        }
+        ddgs_outcomes = self._dispatch_provider_batch(
+            "ddgs",
+            queries,
+            route,
+            max_results,
+            ddgs_timeout,
+            ddgs_trackers,
+        )
+
+        unresolved_queries: list[SearchQuery] = []
+        interim_outcomes: dict[str, tuple[QueryOutcomeStatus, tuple[Any, ...], tuple[ProviderAttempt, ...], SearchFailureCode | None]] = {}
+
+        now = self._monotonic()
+        for query in queries:
+            outcome = ddgs_outcomes.get(query.query_id)
+            tracker = ddgs_trackers[query.query_id]
+            attempts = outcome.attempts if outcome is not None else tracker.snapshot(now)
+            status = outcome.result.status if outcome is not None else ProviderStatus.TIMEOUT
+            hits = outcome.result.hits if outcome is not None and outcome.result.status is ProviderStatus.SUCCESS else ()
+
+            readiness_failure = None
+            if status is ProviderStatus.SUCCESS and hits:
+                query_status = QueryOutcomeStatus.RESOLVED
+            elif status is ProviderStatus.EMPTY:
+                query_status = QueryOutcomeStatus.EMPTY
+            elif status is ProviderStatus.TIMEOUT:
+                query_status = QueryOutcomeStatus.TIMEOUT
+            elif status is ProviderStatus.NOT_CONFIGURED:
+                query_status = QueryOutcomeStatus.UNAVAILABLE
+                readiness_failure = SearchFailureCode.PROVIDER_NOT_CONFIGURED
+            elif status is ProviderStatus.UNAVAILABLE:
+                query_status = QueryOutcomeStatus.UNAVAILABLE
+                readiness_failure = SearchFailureCode.PROVIDER_UNAVAILABLE
+            else:
+                query_status = QueryOutcomeStatus.ERROR
+
+            interim_outcomes[query.query_id] = (query_status, hits, attempts, readiness_failure)
+            if query_status is not QueryOutcomeStatus.RESOLVED:
+                unresolved_queries.append(query)
+
+        # Batch 2: Tavily ONLY for unresolved queries concurrently
+        tavily_trackers: dict[str, _QueryAttemptTracker] = {
+            query.query_id: _QueryAttemptTracker(query) for query in unresolved_queries
+        }
+        tavily_outcomes: dict[str, ProviderSearchOutcome] = {}
+        if unresolved_queries and tavily_timeout > 0:
+            tavily_outcomes = self._dispatch_provider_batch(
+                "tavily",
+                unresolved_queries,
+                route,
+                max_results,
+                tavily_timeout,
+                tavily_trackers,
+            )
+
+        now = self._monotonic()
+        final_query_outcomes: list[QueryOutcome] = []
+        for query in queries:
+            ddgs_status, ddgs_hits, ddgs_attempts, ddgs_readiness = interim_outcomes[query.query_id]
+            if ddgs_status is QueryOutcomeStatus.RESOLVED:
+                self._record_query_attempts(trace, query, ddgs_attempts)
+                final_query_outcomes.append(
+                    QueryOutcome(
+                        query=query,
+                        status=QueryOutcomeStatus.RESOLVED,
+                        hits=ddgs_hits,
+                        attempts=ddgs_attempts,
+                        readiness_failure=ddgs_readiness,
+                    )
+                )
+            else:
+                tavily_outcome = tavily_outcomes.get(query.query_id)
+                tavily_tracker = tavily_trackers.get(query.query_id)
+                tavily_attempts = (
+                    tavily_outcome.attempts
+                    if tavily_outcome is not None
+                    else tavily_tracker.snapshot(now)
+                    if tavily_tracker is not None
+                    else ()
+                )
+                tavily_status = (
+                    tavily_outcome.result.status
+                    if tavily_outcome is not None
+                    else ProviderStatus.TIMEOUT
+                )
+                tavily_hits = (
+                    tavily_outcome.result.hits
+                    if tavily_outcome is not None and tavily_outcome.result.status is ProviderStatus.SUCCESS
+                    else ()
+                )
+                combined_attempts = (*ddgs_attempts, *tavily_attempts)
+                self._record_query_attempts(trace, query, combined_attempts)
+
+                readiness_failure = None
+                if tavily_status is ProviderStatus.SUCCESS and tavily_hits:
+                    final_status = QueryOutcomeStatus.RESOLVED
+                    final_hits = tavily_hits
+                elif tavily_status is ProviderStatus.EMPTY:
+                    final_status = QueryOutcomeStatus.EMPTY
+                    final_hits = ()
+                elif tavily_status is ProviderStatus.TIMEOUT:
+                    final_status = QueryOutcomeStatus.TIMEOUT
+                    final_hits = ()
+                elif tavily_status is ProviderStatus.NOT_CONFIGURED:
+                    final_status = QueryOutcomeStatus.UNAVAILABLE
+                    final_hits = ()
+                    readiness_failure = SearchFailureCode.PROVIDER_NOT_CONFIGURED
+                elif tavily_status is ProviderStatus.UNAVAILABLE:
+                    final_status = QueryOutcomeStatus.UNAVAILABLE
+                    final_hits = ()
+                    readiness_failure = SearchFailureCode.PROVIDER_UNAVAILABLE
+                else:
+                    final_status = QueryOutcomeStatus.ERROR
+                    final_hits = ()
+
+                final_query_outcomes.append(
+                    QueryOutcome(
+                        query=query,
+                        status=final_status,
+                        hits=final_hits,
+                        attempts=combined_attempts,
+                        readiness_failure=readiness_failure,
+                    )
+                )
+
+        return aggregate_query_outcomes(final_query_outcomes)
+
+    def _dispatch_provider_batch(
+        self,
+        provider_name: str,
+        queries: Sequence[SearchQuery],
+        route: SearchTier,
+        max_results: int,
+        timeout_seconds: float,
+        trackers: dict[str, _QueryAttemptTracker],
+    ) -> dict[str, ProviderSearchOutcome]:
+        if not queries or timeout_seconds <= 0:
+            return {}
+        executor = ThreadPoolExecutor(
+            max_workers=min(len(queries), 4),
+            thread_name_prefix=f"search-provider-{provider_name}",
+        )
+        futures: dict[Any, SearchQuery] = {}
+        outcomes: dict[str, ProviderSearchOutcome] = {}
         try:
             for query in queries:
-                remaining = self._remaining(deadline)
-                if remaining <= 0:
-                    break
-                tracker = _QueryAttemptTracker(query)
+                tracker = trackers[query.query_id]
                 future = executor.submit(
-                    self._search_one,
+                    self._registry.search_provider_with_attempts,
+                    provider_name,
                     query,
-                    decision,
-                    deadline,
-                    tracker,
+                    tier=route,
+                    max_results=max_results,
+                    timeout_seconds=timeout_seconds,
+                    on_attempt_started=tracker.on_started,
+                    on_attempt_finished=tracker.on_finished,
                 )
-                futures[future] = tracker
+                futures[future] = query
             try:
-                for future in as_completed(futures, timeout=self._remaining(deadline)):
-                    tracker = futures[future]
+                for future in as_completed(futures, timeout=timeout_seconds):
+                    query = futures[future]
                     try:
                         outcome = future.result()
                     except Exception:
-                        logger.debug(
-                            "query dispatch failed for %s",
-                            tracker.query.query_id,
-                            exc_info=True,
-                        )
+                        logger.debug("provider dispatch failed for %s", query.query_id, exc_info=True)
                         continue
                     if isinstance(outcome, ProviderSearchOutcome):
-                        outcomes[tracker] = outcome
+                        outcomes[query.query_id] = outcome
             except FuturesTimeoutError:
                 for future in futures:
-                    if future.done():
-                        continue
-                    future.cancel()
+                    if not future.done():
+                        future.cancel()
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        observed_at = self._monotonic()
-        for future, tracker in futures.items():
-            outcome = outcomes.get(tracker)
-            if outcome is None and future.done() and not future.cancelled():
+        for future, query in futures.items():
+            if query.query_id not in outcomes and future.done() and not future.cancelled():
                 try:
                     completed = future.result(timeout=0)
                 except Exception:
                     completed = None
                 if isinstance(completed, ProviderSearchOutcome):
-                    outcome = completed
-            attempts = outcome.attempts if outcome is not None else tracker.snapshot(observed_at)
-            if attempts:
-                self._record_query_attempts(trace, tracker.query, attempts)
-            if outcome is not None:
-                results.append(outcome.result)
-            elif attempts:
-                last = attempts[-1]
-                results.append(
-                    ProviderResult(
-                        provider=last.provider,
-                        status=ProviderStatus.TIMEOUT,
-                        hits=(),
-                        latency_ms=sum(attempt.latency_ms for attempt in attempts),
-                    )
-                )
-        return results
-
-    def _search_one(
-        self,
-        query: SearchQuery,
-        decision: Any,
-        deadline: float,
-        tracker: _QueryAttemptTracker,
-    ) -> ProviderSearchOutcome:
-        max_results = max(int(config.search_max_results or 1), 1)
-        return self._registry.search_with_attempts(
-            query,
-            tier=decision.route,
-            max_results=max_results,
-            timeout_seconds=min(config.request_timeout, self._remaining(deadline)),
-            on_attempt_started=tracker.on_started,
-            on_attempt_finished=tracker.on_finished,
-        )
+                    outcomes[query.query_id] = completed
+        return outcomes
 
     def _extract_candidates(
         self,
         plan: SearchPlan,
-        results: Sequence[ProviderResult],
+        results: Sequence[Any],
         budget: Any,
         deadline: float,
         trace: SearchTrace,
@@ -603,9 +746,13 @@ class SearchOrchestrator:
         existing_read_count: int = 0,
     ) -> tuple[list[Any], set[str], int, set[str]]:
         hits: list[Any] = []
-        for result in results:
-            if result.status is ProviderStatus.SUCCESS:
-                hits.extend(result.hits)
+        for item in results:
+            if isinstance(item, ProviderHit):
+                hits.append(item)
+            elif isinstance(item, ProviderResult) and item.status is ProviderStatus.SUCCESS:
+                hits.extend(item.hits)
+            elif hasattr(item, "hits"):
+                hits.extend(item.hits)
         existing_keys = set(existing_candidate_keys or ())
         new_keys: set[str] = set()
         unique_hits: list[Any] = []

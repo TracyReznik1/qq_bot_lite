@@ -956,78 +956,45 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(results[0].attempts, tuple)
         self.assertIsInstance(results[1].attempts, tuple)
 
-    def test_reserve_capped_primary_preserves_fallback_window(self):
-        observed_timeouts = []
-
-        def ddgs_search(_query, **kwargs):
-            observed_timeouts.append(("ddgs", kwargs["timeout_seconds"]))
-            time.sleep(0.03)
-            from src.search.models import ProviderResult
-            return ProviderResult("ddgs", ProviderStatus.ERROR, (), 0)
-
-        def tavily_search(search_query, **kwargs):
-            observed_timeouts.append(("tavily", kwargs["timeout_seconds"]))
-            time.sleep(0.01)
-            from src.search.models import ProviderHit, ProviderResult
-            provider_hit = ProviderHit(
-                "tavily", search_query.query_id, "ok", "https://example.com/ok",
-                "ok", None, None, None, ("availability_fallback",),
-            )
-            return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 0)
-
-        tavily = mock.Mock(name="tavily")
-        tavily.name = "tavily"
-        tavily.readiness.return_value = ProviderReadiness("tavily", True, True, None)
-        tavily.search.side_effect = tavily_search
-        ddgs = mock.Mock(name="ddgs")
-        ddgs.name = "ddgs"
-        ddgs.readiness.return_value = ProviderReadiness("ddgs", True, True, None)
-        ddgs.search.side_effect = ddgs_search
-
-        result = self._registry(tavily, ddgs).search_with_attempts(
-            query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=4.0
-        )
-
-        self.assertIsInstance(result.attempts, tuple)
-        self.assertEqual([attempt.provider for attempt in result.attempts], ["ddgs", "tavily"])
-        self.assertGreaterEqual(result.attempts[0].latency_ms, 20)
-        self.assertGreaterEqual(result.attempts[1].latency_ms, 5)
-        self.assertLessEqual(observed_timeouts[0][1], 0.55)
-        self.assertGreater(observed_timeouts[1][1], observed_timeouts[0][1])
-        self.assertTrue(all(attempt.invocation_started for attempt in result.attempts))
-
-    def test_ddgs_primary_timeout_preserves_tavily_fallback_window(self):
+    def test_search_provider_with_attempts_dispatches_exact_provider_without_reserve(self):
         observed = []
         tavily = self._ready_provider("tavily")
         ddgs = self._ready_provider("ddgs")
 
-        def slow_ddgs(_query, **kwargs):
+        def ddgs_search(_query, **kwargs):
             observed.append(("ddgs", kwargs["timeout_seconds"]))
-            time.sleep(0.2)
-            return ProviderResult("ddgs", ProviderStatus.ERROR, (), 0)
+            return _provider_result("ddgs", query_id=_query.query_id)
 
-        def fast_tavily(search_query, **kwargs):
-            observed.append(("tavily", kwargs["timeout_seconds"]))
-            return _provider_result("tavily", query_id=search_query.query_id)
+        ddgs.search.side_effect = ddgs_search
+        registry = self._registry(tavily, ddgs)
 
-        ddgs.search.side_effect = slow_ddgs
-        tavily.search.side_effect = fast_tavily
-        reserve = {
-            SearchTier.LIGHT: 0.08,
-            SearchTier.STANDARD: 0.08,
-            SearchTier.STANDARD: 0.08,
-        }
-        with mock.patch.object(
-            self.base, "_TAVILY_FALLBACK_RESERVE_SECONDS", reserve,
-        ):
-            outcome = self._registry(tavily, ddgs).search_with_attempts(
-                query(), tier=SearchTier.LIGHT, max_results=1, timeout_seconds=0.2,
-            )
-
+        outcome = registry.search_provider_with_attempts(
+            "ddgs",
+            query(),
+            tier=SearchTier.LIGHT,
+            max_results=1,
+            timeout_seconds=4.0,
+        )
         self.assertEqual(outcome.status, ProviderStatus.SUCCESS)
-        self.assertEqual([name for name, _ in observed], ["ddgs", "tavily"])
-        self.assertLessEqual(observed[0][1], 0.125)
-        self.assertGreater(observed[1][1], 0.04)
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].provider, "ddgs")
+        self.assertEqual(observed[0][0], "ddgs")
+        self.assertAlmostEqual(observed[0][1], 4.0, delta=0.1)
+        tavily.search.assert_not_called()
+
+    def test_search_provider_with_attempts_returns_not_configured_for_missing_provider(self):
+        tavily = self._ready_provider("tavily")
+        registry = self._registry(tavily, None)
+
+        outcome = registry.search_provider_with_attempts(
+            "ddgs",
+            query(),
+            tier=SearchTier.LIGHT,
+            max_results=1,
+            timeout_seconds=4.0,
+        )
+        self.assertEqual(outcome.status, ProviderStatus.NOT_CONFIGURED)
+        self.assertEqual(outcome.attempts, ())
 
     def test_attempt_retains_invocation_start_readiness_without_completion_reprobe(self):
         class FlippingReadinessProvider:

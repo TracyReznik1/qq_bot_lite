@@ -111,14 +111,15 @@ def request(question="什么是光合作用", force_search=False):
 
 def short_watchdog_policy(route, seconds):
     """Keep data caps unchanged while deriving a short interim watchdog."""
-
+    count = len(fields(RouteStageBudget))
+    per_stage = max(float(seconds) / float(count), 0.001)
     budgets = {
         tier: DEFAULT_SEARCH_BUDGET_POLICY.for_route(tier)
         for tier in (SearchTier.LIGHT, SearchTier.STANDARD)
     }
     budgets[route] = RouteStageBudget(
         **{
-            field.name: seconds if field.name == "scheduling_margin_seconds" else 0
+            field.name: per_stage
             for field in fields(RouteStageBudget)
         }
     )
