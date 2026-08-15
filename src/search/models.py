@@ -308,6 +308,7 @@ class RenderOutcome(StrEnum):
     CONFLICT = "conflict"
     FAILURE = "failure"
     VALIDATION_FAILURE = "validation_failure"
+    TIMEOUT = "timeout"
 
 
 PROVIDER_STATUS_FAILURE_CODES: Mapping[ProviderStatus, SearchFailureCode | None] = MappingProxyType(
@@ -1511,6 +1512,16 @@ class ValidationReport:
 
 
 @dataclass(frozen=True)
+class ValidationStageResult:
+    report: ValidationReport
+    structural_latency_ms: float = 0.0
+    semantic_latency_ms: float = 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.report, name)
+
+
+@dataclass(frozen=True)
 class RenderState:
     outcome: RenderOutcome
     visible_blocks: tuple[AnswerBlock, ...]
@@ -1991,7 +2002,7 @@ class SearchPipelineResult:
             EvidenceState.CONFLICTING,
         }:
             allowed.add(SearchFailureCode.VALIDATION_FAILED)
-        if "hard_deadline_exceeded" in getattr(self.evidence, "limitations", ()):
+        if any(lim in getattr(self.evidence, "limitations", ()) for lim in ("hard_deadline_exceeded", "provider_timeout", "watchdog_timeout")):
             allowed.add(SearchFailureCode.PROVIDER_TIMEOUT)
         if evidence_state is EvidenceState.INSUFFICIENT:
             allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}

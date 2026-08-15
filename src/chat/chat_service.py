@@ -20,12 +20,14 @@ from src.search.models import (
     DisclosureCode,
     EvidenceState,
     RenderOutcome,
+    RenderedReply,
     RequestSource,
     RetrievalRequest,
     SearchFailureCode,
     SearchPipelineResult,
     SearchTier,
     SkipReason,
+    SupportLabel,
     ValidatorRequirement,
     ValidatorStatus,
     WarningCode,
@@ -272,11 +274,18 @@ def _system_prompt_for(mem_ctx: MemoryContext, evidence_payload: str) -> str:
     return build_system_prompt(mem_ctx, evidence_payload=evidence_payload)
 
 
-def _generate_answer(trace, messages, *, temperature: float) -> ChatResponse:
+def _generate_answer(trace, messages, *, temperature: float, timeout_seconds: float = 4.0) -> ChatResponse:
     """Time the answer-model stage even when the provider raises."""
+    from src.search.stage_runner import run_stage
     answer_started = time.monotonic()
     try:
-        return llm.chat(messages, temperature=temperature)
+        call_res = run_stage(
+            lambda: llm.chat(messages, temperature=temperature),
+            timeout_seconds=float(timeout_seconds),
+        )
+        if not call_res.completed or not isinstance(call_res.value, ChatResponse):
+            raise TimeoutError("answer model timed out")
+        return call_res.value
     finally:
         trace.answer_generation_latency_ms += max(
             (time.monotonic() - answer_started) * 1000.0,
@@ -287,9 +296,18 @@ def _generate_answer(trace, messages, *, temperature: float) -> ChatResponse:
 def _grounded_generation(
     mem_ctx, text, images, result, answer_state
 ) -> tuple[str, SearchPipelineResult]:
+    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
+    from src.search.models import SearchTier
+    route = result.plan.decision.route if result.plan else SearchTier.LIGHT
+    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(route)
     evidence_payload = _build_evidence_payload(result)
     messages = _build_messages(mem_ctx, text, images, evidence_payload=evidence_payload, include_memories=True)
-    response = _generate_answer(result.trace, messages, temperature=0.2)
+    response = _generate_answer(
+        result.trace,
+        messages,
+        temperature=0.2,
+        timeout_seconds=float(budget.answer_seconds),
+    )
     structural_started = time.monotonic()
     try:
         draft = _parse_draft(response.content)
@@ -304,15 +322,25 @@ def _grounded_generation(
         0.0,
     )
     try:
-        report = _validate_draft(draft, result, answer_state)
+        validation_res = _validate_draft(
+            draft,
+            result,
+            answer_state,
+            timeout_seconds=float(budget.validator_seconds),
+        )
     except Exception:
         logger.debug("grounded draft validation failed", exc_info=True)
         return _handle_draft_failure(result, answer_state)
-    if report is None:
+    if validation_res is None:
         return _handle_draft_failure(result, answer_state)
+    report = getattr(validation_res, "report", validation_res)
     _record_validation_trace(result.trace, report)
+    if hasattr(validation_res, "structural_latency_ms"):
+        result.trace.structural_validation_latency_ms += validation_res.structural_latency_ms
+    if hasattr(validation_res, "semantic_latency_ms"):
+        result.trace.semantic_validation_latency_ms += validation_res.semantic_latency_ms
     render_state = build_render_state(answer_state, report, result.evidence)
-    rendered = _render_view(render_state, result)
+    rendered = _render_view(render_state, result, timeout_seconds=float(budget.renderer_seconds))
     return rendered.text, result
 
 
@@ -430,8 +458,16 @@ def generate_reply(
 
 def _handle_plain(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
     # Ordinary closed tasks: normal answer call, no search tool, no citations.
+    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
+    from src.search.models import SearchTier
+    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT)
     messages = _build_messages(mem_ctx, text, images, evidence_payload="", include_memories=True)
-    response = _generate_answer(result.trace, messages, temperature=0.75)
+    response = _generate_answer(
+        result.trace,
+        messages,
+        temperature=0.75,
+        timeout_seconds=float(budget.answer_seconds),
+    )
     rendered = render_plain_reply(
         response.content,
         trace=result.trace,
@@ -453,21 +489,37 @@ def _handle_fixed(
     # Fixed output (no-web limitation or external-fact failure): never invoke the
     # ordinary answer model to invent facts.
     del mem_ctx, text, images
+    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
+    from src.search.models import SearchTier
+    route = result.plan.decision.route if result.plan else SearchTier.LIGHT
+    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(route)
     render_state = build_render_state(answer_state, None, result.evidence)
-    rendered = _render_view(render_state, result)
+    rendered = _render_view(render_state, result, timeout_seconds=float(budget.renderer_seconds))
     return rendered.text, result
 
 
 def _render_view(
     render_state,
     result: SearchPipelineResult,
+    *,
+    timeout_seconds: float = 1.0,
 ) -> "RenderedReply":
+    from src.search.stage_runner import run_stage
     started = time.monotonic()
-    rendered = render_search_reply(render_state, qq_limit=_qq_limit())
+    call_res = run_stage(
+        lambda: render_search_reply(render_state, qq_limit=_qq_limit()),
+        timeout_seconds=float(timeout_seconds),
+    )
     result.trace.qq_render_latency_ms = max(
         (time.monotonic() - started) * 1000.0,
         0.0,
     )
+    if not call_res.completed or not isinstance(call_res.value, RenderedReply):
+        result.trace.render_outcome = RenderOutcome.TIMEOUT
+        result.trace.render_citation_count = 0
+        result.trace.render_source_count = 0
+        return RenderedReply("回复格式化超时，请稍后重试。", (), (), (), ())
+    rendered = call_res.value
     result.trace.citation_count = len(rendered.shown_source_urls)
     result.trace.render_outcome = render_state.outcome
     result.trace.render_citation_count = len(rendered.used_evidence_ids)
@@ -487,6 +539,13 @@ def _record_validation_trace(trace, report) -> None:
     trace.validator_status = report.status
     trace.validator_retained_claim_count = len(report.retained_claims)
     trace.validator_removed_block_count = len(report.removed_block_ids)
+    if hasattr(report, "draft") and report.draft is not None:
+        trace.claim_count = len(report.draft.claims)
+    trace.supported_claim_count = sum(
+        1
+        for claim in getattr(report, "retained_claims", ())
+        if getattr(report, "claim_labels", {}).get(claim.claim_id) is SupportLabel.SUPPORTED
+    )
 
 
 def _fixed_answer_state(
@@ -509,17 +568,30 @@ def _parse_draft(content: str):
     return parse_grounded_draft(content)
 
 
-def _validate_draft(draft, result, answer_state):
+def _validate_draft(draft, result, answer_state, *, timeout_seconds: float = 4.0):
+    from src.search.stage_runner import run_stage
     from src.search.validation import LLMClaimDiscoverer, validate_and_filter
     verifier = _Verifier()
-    return validate_and_filter(
-        draft,
-        result.evidence,
-        answer_state,
-        claim_discoverer=LLMClaimDiscoverer(llm),
-        semantic_verifier=verifier,
-        trace=result.trace,
-    )
+    started = time.monotonic()
+    result.trace.claim_count = len(draft.claims)
+    result.trace.supported_claim_count = 0
+    try:
+        call_res = run_stage(
+            lambda: validate_and_filter(
+                draft,
+                result.evidence,
+                answer_state,
+                claim_discoverer=LLMClaimDiscoverer(llm),
+                semantic_verifier=verifier,
+                timeout_seconds=timeout_seconds,
+            ),
+            timeout_seconds=float(timeout_seconds),
+        )
+    finally:
+        result.trace.semantic_validation_latency_ms += max((time.monotonic() - started) * 1000.0, 0.0)
+    if not call_res.completed:
+        return None
+    return call_res.value
 
 
 def finalize_search_trace(result: SearchPipelineResult, history_text: str | None) -> None:

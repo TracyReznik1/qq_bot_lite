@@ -549,11 +549,11 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
 
         self.assertIs(retrieval, router.context)
         self.assertEqual((retrieval, freshness), planner.contexts)
-        self.assertEqual(len(provider.calls), result.trace.initial_query_count)
+        self.assertEqual(len(provider.calls), len(result.trace.executed_queries))
         self.assertIs(QueryPurpose.DIRECT, result.plan.initial_queries[0].purpose)
         self.assertIn(QueryPurpose.DIRECT, [query.purpose for query in provider.calls])
 
-    def test_interim_watchdog_starts_after_analysis_until_task_8_moves_anchor(self):
+    def test_watchdog_starts_at_response_started_and_anchors_maximum_request_seconds(self):
         clock = FakeClock()
         analysis = _task3_analysis()
 
@@ -561,18 +561,18 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def analyze(self, retrieval_request):
-                del retrieval_request
+            def analyze(self, retrieval_request, **kwargs):
+                del retrieval_request, kwargs
                 self.calls += 1
                 clock.advance(17)
                 return analysis
 
         class CapturingPlanner:
             def __init__(self):
-                self.deadline = None
+                self.timeout_seconds = None
 
             def plan(self, retrieval_request, retrieval_decision, retrieval_context, freshness_context, **kwargs):
-                self.deadline = kwargs["deadline"]
+                self.timeout_seconds = kwargs.get("timeout_seconds")
                 return _make_planner().plan(
                     retrieval_request,
                     retrieval_decision,
@@ -596,8 +596,8 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
 
         self.assertEqual(1, analyzer.calls)
         self.assertEqual(
-            DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.LIGHT),
-            planner.deadline - clock.monotonic(),
+            DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT).planner_seconds,
+            planner.timeout_seconds,
         )
         self.assertEqual(17_000, result.trace.route_latency_ms)
 
@@ -1228,7 +1228,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertLess(elapsed, 0.18)
         self.assertIsNotNone(result.plan)
         self.assertEqual(result.plan.planning_status.value, "degraded")
-        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_NOT_CONFIGURED)
 
     def test_judge_is_bounded_by_same_deadline_and_cannot_admit(self):
         class SlowJudge:
@@ -1248,7 +1248,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
-        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(result.failure_code, SearchFailureCode.INSUFFICIENT_EVIDENCE)
         self.assertEqual(result.evidence.evidence_items, ())
 
     def test_reader_is_bounded_and_cleanup_does_not_delay_return(self):

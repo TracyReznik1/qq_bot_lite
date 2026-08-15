@@ -1233,10 +1233,19 @@ class LLMRequestAnalyzer:
         self._llm = llm
         self._max_tokens = max_tokens
 
-    def analyze(self, request: RetrievalRequest) -> RequestAnalysis:
-        return _build_request_analysis(request, _validated_request_classification(self._call(request)))
+    def analyze(
+        self,
+        request: RetrievalRequest,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> RequestAnalysis:
+        from src.search.stage_runner import run_stage
+        timeout = float(timeout_seconds) if timeout_seconds is not None else 3.0
+        call_res = run_stage(lambda: self._call(request, timeout_seconds=timeout), timeout_seconds=timeout)
+        payload = call_res.value if call_res.completed and isinstance(call_res.value, dict) else {}
+        return _build_request_analysis(request, _validated_request_classification(payload))
 
-    def _call(self, request: RetrievalRequest) -> dict[str, Any]:
+    def _call(self, request: RetrievalRequest, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         payload = {
             "question": request.question,
             "has_images": request.has_images,
@@ -1249,16 +1258,27 @@ class LLMRequestAnalyzer:
             },
         ]
         try:
-            response = self._llm.chat(
-                messages,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
-                tools=None,
-                tool_choice="none",
-            )
+            kwargs: dict[str, Any] = {
+                "temperature": 0.0,
+                "max_tokens": self._max_tokens,
+                "tools": None,
+                "tool_choice": "none",
+            }
+            if timeout_seconds is not None:
+                kwargs["timeout_seconds"] = timeout_seconds
+            try:
+                response = self._llm.chat(messages, **kwargs)
+            except TypeError:
+                response = self._llm.chat(
+                    messages,
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                    tools=None,
+                    tool_choice="none",
+                )
         except Exception:
             return {}
-        return parse_advisor_json(response.content)
+        return parse_advisor_json(getattr(response, "content", ""))
 
 
 # ── decision construction ───────────────────────────────────────────────

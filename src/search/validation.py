@@ -20,6 +20,7 @@ from src.search.models import (
     GroundedDraft,
     SupportLabel,
     ValidationReport,
+    ValidationStageResult,
     ValidatorRequirement,
     ValidatorStatus,
 )
@@ -94,6 +95,8 @@ class LLMClaimDiscoverer:
         self,
         draft: GroundedDraft,
         evidence: EvidenceBundle,
+        *,
+        timeout_seconds: float | None = None,
     ) -> tuple[DiscoveredClaimSpan, ...]:
         _require_discovery_input_within_bounds(draft, evidence)
         payload = {
@@ -133,17 +136,28 @@ class LLMClaimDiscoverer:
             },
         ]
         try:
-            response = self._llm.chat(
-                messages,
-                temperature=0.0,
-                max_tokens=self._max_tokens,
-                tools=None,
-                tool_choice="none",
-            )
+            kwargs: dict[str, Any] = {
+                "temperature": 0.0,
+                "max_tokens": self._max_tokens,
+                "tools": None,
+                "tool_choice": "none",
+            }
+            if timeout_seconds is not None:
+                kwargs["timeout_seconds"] = float(timeout_seconds)
+            try:
+                response = self._llm.chat(messages, **kwargs)
+            except TypeError:
+                response = self._llm.chat(
+                    messages,
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                    tools=None,
+                    tool_choice="none",
+                )
         except Exception as exc:
             raise ClaimDiscoveryUnavailable("claim discovery call failed") from exc
         try:
-            return _parse_discovery_output(response.content, draft)
+            return _parse_discovery_output(getattr(response, "content", ""), draft)
         except ClaimDiscoveryUnavailable:
             raise
         except Exception as exc:
@@ -503,13 +517,21 @@ def _semantic_verify(
     bundle: EvidenceBundle,
     verifier: Any,
     report: _StructuralReport,
+    *,
+    timeout_seconds: float | None = None,
 ) -> None:
     claims = list(report.kept_claims)
     if not claims:
         return
-    verdict = verifier.verify(
-        {"draft": _draft_to_dict(draft), "evidence": _evidence_to_dict(bundle)},
-    )
+    try:
+        verdict = verifier.verify(
+            {"draft": _draft_to_dict(draft), "evidence": _evidence_to_dict(bundle)},
+            timeout_seconds=timeout_seconds,
+        )
+    except TypeError:
+        verdict = verifier.verify(
+            {"draft": _draft_to_dict(draft), "evidence": _evidence_to_dict(bundle)},
+        )
 
     if not isinstance(verdict, dict):
         verdict = {}
@@ -594,38 +616,64 @@ def validate_and_filter(
     *,
     claim_discoverer: Any,
     semantic_verifier: Any,
+    timeout_seconds: float | None = None,
     trace: Any = None,
     clock: Any = None,
-) -> ValidationReport:
+) -> ValidationStageResult:
     monotonic = clock.monotonic if clock is not None else time.monotonic
+    stage_started = monotonic()
     report = _StructuralReport()
     structural_started = monotonic()
     _apply_structural_checks(draft, bundle, report)
+    structural_latency_ms = max((monotonic() - structural_started) * 1000.0, 0.0)
     if trace is not None:
-        trace.structural_validation_latency_ms += max(
-            (monotonic() - structural_started) * 1000.0,
-            0.0,
-        )
+        trace.structural_validation_latency_ms += structural_latency_ms
 
-    # Run claim discovery over the entire draft. Any material external-fact
-    # span that was not already mapped to a Claim marks its block uncovered.
     semantic_started = monotonic()
     if trace is not None:
         trace.claim_count = len(draft.claims)
         trace.supported_claim_count = 0
     try:
-        discovered = _discover_factual_spans(claim_discoverer, draft, bundle)
+        discovery_timeout = (
+            max(float(timeout_seconds) - (monotonic() - stage_started), 0.0)
+            if timeout_seconds is not None
+            else None
+        )
+        if discovery_timeout is not None and discovery_timeout <= 0:
+            raise ClaimDiscoveryUnavailable("claim discovery timed out")
+
+        discovered = _discover_factual_spans(
+            claim_discoverer,
+            draft,
+            bundle,
+            timeout_seconds=discovery_timeout,
+        )
         _apply_discovered_spans(draft, bundle, report, discovered)
 
+        verifier_timeout = (
+            max(float(timeout_seconds) - (monotonic() - stage_started), 0.0)
+            if timeout_seconds is not None
+            else None
+        )
         verifier_unavailable = False
-        try:
-            _semantic_verify(draft, bundle, semantic_verifier, report)
-        except SemanticVerificationUnavailable:
+        if verifier_timeout is not None and verifier_timeout <= 0:
             verifier_unavailable = True
             _apply_verifier_unavailable(draft, bundle, answer_state, report)
-        except Exception:
-            verifier_unavailable = True
-            _apply_verifier_unavailable(draft, bundle, answer_state, report)
+        else:
+            try:
+                _semantic_verify(
+                    draft,
+                    bundle,
+                    semantic_verifier,
+                    report,
+                    timeout_seconds=verifier_timeout,
+                )
+            except SemanticVerificationUnavailable:
+                verifier_unavailable = True
+                _apply_verifier_unavailable(draft, bundle, answer_state, report)
+            except Exception:
+                verifier_unavailable = True
+                _apply_verifier_unavailable(draft, bundle, answer_state, report)
 
         # non_factual blocks may omit claims only when discovery finds no factual span
         for block in draft.answer_blocks:
@@ -674,7 +722,7 @@ def validate_and_filter(
             effective_certainty = AnswerCertainty.UNVERIFIED
             effective_claim_scope = AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS
 
-        return ValidationReport(
+        val_report = ValidationReport(
             draft=draft,
             retained_blocks=retained_blocks,
             retained_claims=retained_claims,
@@ -685,6 +733,12 @@ def validate_and_filter(
             effective_certainty=effective_certainty,
             effective_claim_scope=effective_claim_scope,
         )
+        semantic_latency_ms = max((monotonic() - semantic_started) * 1000.0, 0.0)
+        return ValidationStageResult(
+            report=val_report,
+            structural_latency_ms=structural_latency_ms,
+            semantic_latency_ms=semantic_latency_ms,
+        )
     finally:
         if trace is not None:
             trace.semantic_validation_latency_ms += max(
@@ -693,12 +747,15 @@ def validate_and_filter(
             )
 
 
-def _discover_factual_spans(claim_discoverer: Any, draft: GroundedDraft, bundle: EvidenceBundle) -> tuple[str, ...]:
+def _discover_factual_spans(claim_discoverer: Any, draft: GroundedDraft, bundle: EvidenceBundle, *, timeout_seconds: float | None = None) -> tuple[str, ...]:
     """Return the block_ids that contain material external-fact spans the draft
     failed to map to a Claim. The discoverer's output is advisory: it only flags
     uncovered spans; it never invents claims or Evidence IDs."""
     try:
-        spans = claim_discoverer.discover(draft, bundle)
+        try:
+            spans = claim_discoverer.discover(draft, bundle, timeout_seconds=timeout_seconds)
+        except TypeError:
+            spans = claim_discoverer.discover(draft, bundle)
     except ClaimDiscoveryUnavailable:
         raise
     except Exception as exc:

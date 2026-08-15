@@ -20,6 +20,7 @@ from src.search.models import (
     DEFAULT_TIER_BUDGETS,
     EvidenceBundle,
     EvidenceCandidate,
+    EvidenceGapAnalysis,
     EvidenceState,
     ExcerptOrigin,
     Freshness,
@@ -65,6 +66,7 @@ from src.search.providers import (
 )
 from src.search.providers.base import ProviderSearchOutcome
 from src.search.router import LLMRequestAnalyzer, RetrievalBenefitRouter
+from src.search.stage_runner import run_stage
 from src.search.url_policy import canonicalize_public_http_url
 
 logger = logging.getLogger("qq-bot")
@@ -186,8 +188,9 @@ class SearchOrchestrator:
             )
             return result
 
+        budget_policy = DEFAULT_SEARCH_BUDGET_POLICY.for_route(retrieval_decision.route)
         budget = DEFAULT_TIER_BUDGETS[retrieval_decision.route]
-        deadline = self._monotonic() + float(
+        watchdog_deadline = response_started + float(
             DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(
                 retrieval_decision.route
             )
@@ -196,16 +199,31 @@ class SearchOrchestrator:
         trace.orchestrator_started = True
         retrieval_started = self._monotonic()
         plan_started = retrieval_started
-        plan_completed, plan = self._call_until_deadline(
-            self._invoke_planner,
-            deadline,
-            request,
-            retrieval_decision,
-            analysis.retrieval,
-            analysis.freshness,
-            deadline,
-        )
-        if not plan_completed or not isinstance(plan, SearchPlan):
+        if budget_policy.planner_seconds > 0:
+            planner_res = run_stage(
+                lambda: self._invoke_planner(
+                    request,
+                    retrieval_decision,
+                    analysis.retrieval,
+                    analysis.freshness,
+                    timeout_seconds=float(budget_policy.planner_seconds),
+                ),
+                timeout_seconds=float(budget_policy.planner_seconds),
+            )
+            plan = (
+                planner_res.value
+                if planner_res.completed and isinstance(planner_res.value, SearchPlan)
+                else None
+            )
+        else:
+            plan = self._invoke_planner(
+                request,
+                retrieval_decision,
+                analysis.retrieval,
+                analysis.freshness,
+                timeout_seconds=0.0,
+            )
+        if plan is None or not isinstance(plan, SearchPlan):
             plan = self._degraded_plan(
                 request,
                 retrieval_decision,
@@ -221,7 +239,7 @@ class SearchOrchestrator:
         trace.query_planning_latency_ms = self._elapsed_ms(plan_started)
         trace.initial_query_redaction_codes = plan.query_redaction_codes
 
-        if self._expired(deadline):
+        if self._monotonic() > watchdog_deadline:
             return self._timeout_result(
                 decision, plan, trace, retrieval_started, analysis=analysis,
             )
@@ -243,7 +261,7 @@ class SearchOrchestrator:
         trace.initial_provider_search_latency_ms = self._elapsed_ms(initial_round_started)
         trace.provider_search_total_latency_ms = trace.initial_provider_search_latency_ms
 
-        if self._expired(deadline):
+        if self._monotonic() > watchdog_deadline:
             return self._timeout_result(
                 decision, plan, trace, retrieval_started, analysis=analysis,
             )
@@ -266,7 +284,6 @@ class SearchOrchestrator:
             plan,
             initial_batch,
             budget,
-            deadline,
             trace,
             round_kind=SearchRoundKind.INITIAL,
         )
@@ -275,20 +292,23 @@ class SearchOrchestrator:
         trace.content_read_total_latency_ms = trace.initial_content_read_latency_ms
         trace.candidate_url_count = len(candidate_keys)
 
-        if self._expired(deadline):
+        if self._monotonic() > watchdog_deadline:
             return self._timeout_result(
                 decision, plan, trace, retrieval_started, analysis=analysis,
             )
 
         evidence_started = self._monotonic()
-        assembled, bundle = self._call_until_deadline(
-            self._assembler().assemble,
-            deadline,
-            plan,
-            candidates,
-            timeout_seconds=self._remaining(deadline),
+        assembly_res = run_stage(
+            lambda: self._assembler().assemble(
+                plan,
+                candidates,
+                timeout_seconds=float(budget_policy.initial_judge_seconds),
+            ),
+            timeout_seconds=float(budget_policy.initial_judge_seconds),
         )
-        if not assembled or not isinstance(bundle, EvidenceBundle):
+        if assembly_res.completed and isinstance(assembly_res.value, EvidenceBundle):
+            bundle = assembly_res.value
+        else:
             bundle = self._assembler_with_rejecting_judge().assemble(plan, candidates, timeout_seconds=0.0)
         trace.initial_evidence_assembly_latency_ms = self._elapsed_ms(evidence_started)
         trace.evidence_assembly_total_latency_ms = trace.initial_evidence_assembly_latency_ms
@@ -296,7 +316,7 @@ class SearchOrchestrator:
         trace.evidence_state = bundle.evidence_state
         self._record_evidence_trace(trace, bundle)
 
-        if self._expired(deadline):
+        if self._monotonic() > watchdog_deadline:
             return self._timeout_result(
                 decision,
                 plan,
@@ -307,11 +327,26 @@ class SearchOrchestrator:
             )
 
         gap_started = self._monotonic()
-        gap = self._assembler().analyze_gap(
-            plan,
-            bundle,
-            content_unreadable_topic_ids=unreadable_topic_ids,
-        )
+        if budget_policy.gap_seconds > 0:
+            gap_res = run_stage(
+                lambda: self._assembler().analyze_gap(
+                    plan,
+                    bundle,
+                    content_unreadable_topic_ids=unreadable_topic_ids,
+                ),
+                timeout_seconds=float(budget_policy.gap_seconds),
+            )
+            gap = (
+                gap_res.value
+                if gap_res.completed and isinstance(gap_res.value, EvidenceGapAnalysis)
+                else self._assembler().analyze_gap(plan, bundle, content_unreadable_topic_ids=unreadable_topic_ids)
+            )
+        else:
+            gap = self._assembler().analyze_gap(
+                plan,
+                bundle,
+                content_unreadable_topic_ids=unreadable_topic_ids,
+            )
         trace.gap_analysis_latency_ms = self._elapsed_ms(gap_started)
         initial_canonical_urls = {
             item.canonical_url for item in bundle.evidence_items if item.canonical_url
@@ -326,7 +361,6 @@ class SearchOrchestrator:
             candidate_url_count=trace.candidate_url_count,
             content_read_count=trace.content_read_count,
             retrieval_round_count=trace.retrieval_round_count,
-            remaining_seconds=self._remaining(deadline),
             budget=budget,
         )
         repair_dispatched = False
@@ -336,16 +370,17 @@ class SearchOrchestrator:
             prior_fingerprints = tuple(
                 _query_fingerprint(query.text) for query in plan.initial_queries
             )
-            repair_completed, planned_repair = self._call_until_deadline(
-                self._invoke_repair_planner,
-                deadline,
-                plan,
-                gap,
-                prior_fingerprints,
-                deadline,
+            repair_res = run_stage(
+                lambda: self._invoke_repair_planner(
+                    plan,
+                    gap,
+                    prior_fingerprints,
+                    timeout_seconds=float(budget_policy.repair_planner_seconds),
+                ),
+                timeout_seconds=float(budget_policy.repair_planner_seconds),
             )
-            if repair_completed and isinstance(planned_repair, RepairPlan):
-                repair = planned_repair
+            if repair_res.completed and isinstance(repair_res.value, RepairPlan):
+                repair = repair_res.value
             if repair.triggered and repair.repair_query is not None:
                 trace.repair_reason_codes = repair.reason_codes
                 trace.repair_target_topic_ids = repair.target_topic_ids
@@ -368,7 +403,6 @@ class SearchOrchestrator:
                     plan,
                     repair_batch if repair_batch is not None else (),
                     budget,
-                    deadline,
                     trace,
                     round_kind=SearchRoundKind.REPAIR,
                     additional_queries=(repair.repair_query,),
@@ -391,16 +425,17 @@ class SearchOrchestrator:
                 trace.content_read_count = reads
                 trace.content_read_total_latency_ms += self._elapsed_ms(repair_provider_finished)
                 repair_evidence_started = self._monotonic()
-                assembled, repaired_bundle = self._call_until_deadline(
-                    self._assembler().assemble,
-                    deadline,
-                    plan,
-                    (*candidates, *repair_candidates),
-                    previous=bundle,
-                    timeout_seconds=self._remaining(deadline),
+                repaired_assembly_res = run_stage(
+                    lambda: self._assembler().assemble(
+                        plan,
+                        (*candidates, *repair_candidates),
+                        previous=bundle,
+                        timeout_seconds=float(budget_policy.repair_judge_seconds),
+                    ),
+                    timeout_seconds=float(budget_policy.repair_judge_seconds),
                 )
-                if assembled and isinstance(repaired_bundle, EvidenceBundle):
-                    bundle = repaired_bundle
+                if repaired_assembly_res.completed and isinstance(repaired_assembly_res.value, EvidenceBundle):
+                    bundle = repaired_assembly_res.value
                 trace.evidence_assembly_total_latency_ms += self._elapsed_ms(repair_evidence_started)
                 trace.evidence_state = bundle.evidence_state
                 self._record_evidence_trace(trace, bundle)
@@ -416,7 +451,7 @@ class SearchOrchestrator:
                 trace.retrieval_stop_reason = RetrievalStopReason.POST_REPAIR_STOP
             trace.adaptive_repair_latency_ms = self._elapsed_ms(repair_started)
 
-        if self._expired(deadline):
+        if self._monotonic() > watchdog_deadline:
             return self._timeout_result(
                 decision,
                 plan,
@@ -739,7 +774,6 @@ class SearchOrchestrator:
         plan: SearchPlan,
         results: Sequence[Any] | QueryBatchResult,
         budget: Any,
-        deadline: float,
         trace: SearchTrace,
         *,
         round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
@@ -875,7 +909,8 @@ class SearchOrchestrator:
         decision: Any,
         retrieval_context: Any,
         freshness_context: Any,
-        deadline: float,
+        *,
+        timeout_seconds: float | None = None,
     ) -> SearchPlan:
         return _call_with_supported_kwargs(
             self._planner.plan,
@@ -883,8 +918,7 @@ class SearchOrchestrator:
             decision,
             retrieval_context,
             freshness_context,
-            deadline=deadline,
-            timeout_seconds=self._remaining(deadline),
+            timeout_seconds=timeout_seconds,
         )
 
     def _invoke_repair_planner(
@@ -892,15 +926,15 @@ class SearchOrchestrator:
         plan: SearchPlan,
         gap: Any,
         prior_fingerprints: Sequence[str],
-        deadline: float,
+        *,
+        timeout_seconds: float | None = None,
     ) -> RepairPlan:
         return _call_with_supported_kwargs(
             self._planner.plan_repair,
             plan,
             gap,
             prior_fingerprints=prior_fingerprints,
-            deadline=deadline,
-            timeout_seconds=self._remaining(deadline),
+            timeout_seconds=timeout_seconds,
         )
 
     def _degraded_plan(
@@ -912,39 +946,16 @@ class SearchOrchestrator:
     ) -> SearchPlan:
         class _UnavailableModel:
             def chat(self, *_args: Any, **_kwargs: Any) -> Any:
-                raise TimeoutError("planner deadline expired")
+                raise TimeoutError("planner unavailable")
 
         fallback = SearchPlanner(_UnavailableModel()).plan(
             request,
             decision,
             retrieval_context,
             freshness_context,
-            deadline=self._monotonic(),
+            timeout_seconds=0.0,
         )
         return replace(fallback, planning_status=PlanningStatus.DEGRADED)
-
-    def _call_until_deadline(
-        self,
-        method: Callable[..., Any],
-        deadline: float,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[bool, Any]:
-        remaining = self._remaining(deadline)
-        if remaining <= 0:
-            return False, None
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-bounded")
-        future = executor.submit(method, *args, **kwargs)
-        try:
-            return True, future.result(timeout=remaining)
-        except FuturesTimeoutError:
-            future.cancel()
-            return False, None
-        except Exception:
-            logger.debug("bounded retrieval stage failed", exc_info=True)
-            return True, None
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def _record_query_attempts(
         self,
@@ -1222,7 +1233,6 @@ def _repair_gates_pass(
     candidate_url_count: int,
     content_read_count: int,
     retrieval_round_count: int,
-    remaining_seconds: float,
     budget: Any,
 ) -> bool:
     """Deterministic, program-only pre-repair budget gate."""
@@ -1233,7 +1243,6 @@ def _repair_gates_pass(
         and candidate_url_count < budget.max_candidate_urls
         and content_read_count < budget.max_content_reads
         and retrieval_round_count < budget.max_retrieval_rounds
-        and remaining_seconds > 0
     )
 
 

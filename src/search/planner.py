@@ -402,7 +402,6 @@ class SearchPlanner:
         retrieval_context: RetrievalContext,
         freshness_context: FreshnessContext,
         *,
-        deadline: float | None = None,
         timeout_seconds: float | None = None,
     ) -> SearchPlan:
         if not isinstance(retrieval_context, RetrievalContext):
@@ -453,8 +452,7 @@ class SearchPlanner:
             decision,
             retrieval_context,
             effective_freshness,
-            deadline=deadline,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else 4.0,
         )
         required_relations = frozenset(
             {
@@ -591,6 +589,8 @@ class SearchPlanner:
         plan: SearchPlan,
         gap: EvidenceGapAnalysis,
         prior_fingerprints: Sequence[str] = (),
+        *,
+        timeout_seconds: float | None = None,
     ) -> RepairPlan:
         if not gap.repair_eligible or not gap.repair_target_topic_ids:
             return RepairPlan(False, (), (), None)
@@ -666,7 +666,6 @@ class SearchPlanner:
         retrieval_context: RetrievalContext,
         freshness_context: FreshnessContext,
         *,
-        deadline: float | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any] | None:
         budget = DEFAULT_TIER_BUDGETS[decision.route]
@@ -698,12 +697,7 @@ class SearchPlanner:
             },
         ]
         try:
-            remaining = timeout_seconds
-            if deadline is not None:
-                remaining = max(deadline - time.monotonic(), 0.0)
-                if timeout_seconds is not None:
-                    remaining = min(remaining, timeout_seconds)
-            if remaining is not None and remaining <= 0:
+            if timeout_seconds is not None and timeout_seconds <= 0:
                 return None
             kwargs: dict[str, Any] = {
                 "temperature": 0.0,
@@ -711,15 +705,21 @@ class SearchPlanner:
                 "tools": None,
                 "tool_choice": "none",
             }
-            if remaining is not None:
-                kwargs["timeout_seconds"] = max(float(remaining), 0.001)
-            response = self._model.chat(
-                messages,
-                **kwargs,
-            )
+            if timeout_seconds is not None:
+                kwargs["timeout_seconds"] = float(timeout_seconds)
+            try:
+                response = self._model.chat(messages, **kwargs)
+            except TypeError:
+                response = self._model.chat(
+                    messages,
+                    temperature=0.0,
+                    max_tokens=1024,
+                    tools=None,
+                    tool_choice="none",
+                )
         except Exception:
             return None
-        return _parse_planner_payload(response.content)
+        return _parse_planner_payload(getattr(response, "content", ""))
 
     def _deterministic_plan(
         self,
