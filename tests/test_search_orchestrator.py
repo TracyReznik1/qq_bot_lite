@@ -434,6 +434,57 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
             SearchFailureCode.PROVIDER_NOT_CONFIGURED,
         )
 
+    def test_orchestrator_routes_only_the_retrieval_context_once(self):
+        m = importlib.import_module("src.search.models")
+        retrieval = m.RetrievalContext(
+            must_search=True,
+            skip_reason=None,
+            factuality=m.Factuality.FACTUAL,
+            external_fact_required=True,
+            complexity_codes=(),
+            source_requirement=m.SourceRequirement.ANY_RELEVANT,
+        )
+        analysis = m.RequestAnalysis(
+            retrieval,
+            m.FreshnessContext(
+                m.FreshnessRequirement.CURRENT,
+                None,
+                None,
+                None,
+                None,
+            ),
+            m.RiskContext(True, True, True),
+        )
+
+        class RecordingRouter:
+            def __init__(self):
+                self.contexts = []
+
+            def decide(self, context):
+                self.contexts.append(context)
+                return __import__(
+                    "src.search.router", fromlist=["RetrievalBenefitRouter"]
+                ).RetrievalBenefitRouter().decide(context)
+
+        analyzer = _RecordingRequestAnalyzer(analysis)
+        router = RecordingRouter()
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=analyzer,
+            router=router,
+            planner=_make_planner(),
+            judge=_FakeJudge(),
+            providers=(),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+
+        result = orchestrator.run(request("什么是光合作用"))
+
+        self.assertEqual(1, len(analyzer.calls))
+        self.assertEqual([retrieval], router.contexts)
+        self.assertIs(result.analysis, analysis)
+        self.assertIs(result.decision.route, SearchTier.LIGHT)
+
     def test_planner_receives_only_retrieval_and_freshness_contexts_and_trace_counts_dispatch(self):
         m = importlib.import_module("src.search.models")
         retrieval = m.RetrievalContext(
@@ -1382,7 +1433,7 @@ class OrchestratorAccountingTests(unittest.TestCase):
             extractor=extractor,
         )
 
-        result = orchestrator.run(request("什么是光合作用"))
+        result = orchestrator.run(request("光合作用和呼吸作用有什么区别"))
 
         self.assertEqual(len(extractor.calls), DEFAULT_TIER_BUDGETS[SearchTier.STANDARD].max_content_reads)
         self.assertEqual(result.trace.content_read_count, DEFAULT_TIER_BUDGETS[SearchTier.STANDARD].max_content_reads)
@@ -1548,7 +1599,10 @@ class OrchestratorTraceTests(unittest.TestCase):
         )
         secret = "abcdef123456"
         result = orchestrator.run(
-            request(f"[CQ:image,file=x.png] data:image/png;base64,AAAA 回调签名 {secret} 什么是光合作用")
+            request(
+                f"[CQ:image,file=x.png] data:image/png;base64,AAAA 回调签名 "
+                f"{secret} 光合作用和呼吸作用有什么区别"
+            )
         )
         self.assertTrue(result.trace.adaptive_repair_round_started)
         self.assertEqual(result.plan.query_redaction_codes, result.trace.initial_query_redaction_codes)

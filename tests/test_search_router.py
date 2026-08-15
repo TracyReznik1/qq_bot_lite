@@ -907,6 +907,66 @@ class RequestAnalysisRouterTests(unittest.TestCase):
             SearchTier.LIGHT,
         )
 
+    def test_model_multi_entity_only_uses_bounded_structural_complexity(self):
+        payload = {**NEUTRAL, "complexity_codes": ["multi_entity"]}
+        cases = (
+            ("Nova V4 Pro 正式版什么时候发布？", SearchTier.LIGHT),
+            ("Aster CN赛区上一场谁赢了？", SearchTier.LIGHT),
+            ("列出 Aster CN赛区季后赛完整赛程", SearchTier.STANDARD),
+            ("比较 Nova Pro 和 Orbit Max 的续航", SearchTier.STANDARD),
+            ("推荐两款适合出差的轻薄本并解释理由", SearchTier.STANDARD),
+            ("请用两个独立来源核验 Nova 的发布日期", SearchTier.STANDARD),
+        )
+
+        for question, expected_route in cases:
+            with self.subTest(question=question):
+                _analysis, decision = self._route(question, payload)
+                self.assertIs(decision.route, expected_route)
+
+    def test_standalone_model_multi_entity_is_not_kept(self):
+        payload = {**NEUTRAL, "complexity_codes": ["multi_entity"]}
+        analysis, decision = self._route("Nova V4 Pro 正式版什么时候发布？", payload)
+
+        self.assertNotIn(
+            RetrievalComplexityCode.MULTI_ENTITY,
+            analysis.retrieval.complexity_codes,
+        )
+        self.assertIs(decision.route, SearchTier.LIGHT)
+
+    def test_model_ambiguous_entity_requires_an_explicit_ambiguity_marker(self):
+        payload = {**NEUTRAL, "complexity_codes": ["ambiguous_entity"]}
+
+        unambiguous, unambiguous_route = self._route(
+            "Nova V4 Pro 什么时候发布？", payload
+        )
+        self.assertNotIn(
+            RetrievalComplexityCode.AMBIGUOUS_ENTITY,
+            unambiguous.retrieval.complexity_codes,
+        )
+        self.assertIs(unambiguous_route.route, SearchTier.LIGHT)
+
+        ambiguous, ambiguous_route = self._route(
+            "这个版本可能指哪个？", payload
+        )
+        self.assertIn(
+            RetrievalComplexityCode.AMBIGUOUS_ENTITY,
+            ambiguous.retrieval.complexity_codes,
+        )
+        self.assertIs(ambiguous_route.route, SearchTier.STANDARD)
+
+    def test_complete_scope_and_multiple_question_slots_are_multi_fact(self):
+        for question in (
+            "列出本届赛事完整赛程",
+            "这个版本什么时候发布，支持多少种系统？",
+        ):
+            with self.subTest(question=question):
+                analysis, decision = self._route(question)
+                self.assertIn(
+                    RetrievalComplexityCode.MULTI_FACT,
+                    analysis.retrieval.complexity_codes,
+                )
+                self.assertIs(decision.route, SearchTier.STANDARD)
+
     def test_fda_definition_is_low_risk_not_required_and_light(self):
         analysis, decision = self._route("FDA 是什么机构？")
         self.assertFalse(analysis.risk.high_consequence)

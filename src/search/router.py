@@ -1403,7 +1403,29 @@ _RECOMMENDATION_MARKERS = (
     "哪个更适合",
     "should i",
 )
-_MULTI_FACT_MARKERS = ("分别", "逐一", "一一", "同时说明")
+_COMPLETE_SCOPE_MARKERS = (
+    "完整赛程",
+    "全部赛程",
+    "完整日程",
+    "时间表",
+    "全部列出",
+    "完整列表",
+    "逐一",
+    "分别",
+    "complete schedule",
+    "list all",
+)
+_QUESTION_SLOT_PATTERN = re.compile(
+    r"什么时候|多少|哪天|谁|哪里|如何|what|when|where|who",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_ENTITY_MARKERS = (
+    "可能指",
+    "同名",
+    "具体哪个",
+    "哪个版本的",
+    "ambiguous",
+)
 _VERSION_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9.])(?P<prefix>[vV]\s*)?(?P<token>\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?![A-Za-z0-9.])"
 )
@@ -1461,20 +1483,20 @@ def _deterministic_complexity_codes(
     lowered = question.casefold()
     source_requirement, source_codes = _source_requirement_from_question(question)
     del source_requirement
-    codes = [
-        code
-        for code in model_codes
-        if code
-        not in {
-            RetrievalComplexityCode.MULTI_SOURCE_REQUIRED,
-            RetrievalComplexityCode.CROSS_VERIFICATION_REQUIRED,
-        }
-    ]
+    codes: list[RetrievalComplexityCode] = []
+    if (
+        RetrievalComplexityCode.AMBIGUOUS_ENTITY in model_codes
+        and any(marker in lowered for marker in _AMBIGUOUS_ENTITY_MARKERS)
+    ):
+        codes.append(RetrievalComplexityCode.AMBIGUOUS_ENTITY)
     if any(marker in lowered for marker in (*_COMPARISON_MARKERS, "比较", "比一比")):
         codes.append(RetrievalComplexityCode.COMPARISON)
     if any(marker in lowered for marker in _RECOMMENDATION_MARKERS):
         codes.append(RetrievalComplexityCode.RECOMMENDATION)
-    if any(marker in lowered for marker in _MULTI_FACT_MARKERS):
+    if (
+        any(marker in lowered for marker in _COMPLETE_SCOPE_MARKERS)
+        or len(_QUESTION_SLOT_PATTERN.findall(question)) >= 2
+    ):
         codes.append(RetrievalComplexityCode.MULTI_FACT)
     codes.extend(source_codes)
     return _dedupe_complexity_codes(codes)
