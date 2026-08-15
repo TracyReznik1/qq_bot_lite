@@ -18,6 +18,7 @@ from src.search.models import (
     EvidenceState,
     Factuality,
     Freshness,
+    PlanningStatus,
     PotentialHarm,
     ProviderReadiness,
     ProviderStatus,
@@ -2356,6 +2357,67 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         )
         result = orchestrator.run(request("什么是光合作用"))
         self.assertEqual(1, result.trace.content_read_count)
+        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
+
+
+class Task9ZeroLLMFallbackAndDegradationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = orchestrator_module()
+
+    def test_orchestrator_runs_end_to_end_when_analyzer_and_planner_fail(self):
+        from src.search.planner import SearchPlanner
+        from src.search.router import LLMRequestAnalyzer
+
+        class BrokenLLM:
+            def chat(self, *args, **kwargs):
+                raise RuntimeError("LLM down")
+
+        provider = _FakeProvider(hits=[_hit(raw_content="Python asyncio 与 threading 对比正文")])
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=LLMRequestAnalyzer(BrokenLLM()),
+            router=__import__("src.search.router", fromlist=["RetrievalBenefitRouter"]).RetrievalBenefitRouter(),
+            planner=SearchPlanner(BrokenLLM(), today_provider=lambda: date(2026, 7, 29)),
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+
+        result = orchestrator.run(request("比较 Python asyncio 与 threading 并发 API"))
+        self.assertIsNotNone(result.plan)
+        self.assertEqual(PlanningStatus.DEGRADED, result.plan.planning_status)
+        self.assertGreaterEqual(len(result.plan.initial_queries), 1)
+        self.assertEqual(QueryPurpose.DIRECT, result.plan.initial_queries[0].purpose)
+        self.assertGreater(len(provider.calls), 0)
+        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
+
+    def test_orchestrator_runs_when_planner_times_out(self):
+        class SlowPlanner:
+            def plan(self, *args, **kwargs):
+                time.sleep(0.2)
+                return _make_planner().plan(*args, **kwargs)
+
+        provider = _FakeProvider(hits=[_hit(raw_content="光合作用正文")])
+        orchestrator = self.module.SearchOrchestrator(
+            request_analyzer=_make_request_analyzer(router_payload("standard")),
+            router=_make_router(router_payload("standard")),
+            planner=SlowPlanner(),
+            judge=_FakeJudge(),
+            providers=(provider,),
+            extractor=_FakeExtractor(),
+            clock=FakeClock(),
+        )
+
+        with unittest.mock.patch("src.search.orchestrator.DEFAULT_SEARCH_BUDGET_POLICY") as mock_policy:
+            short_budget = replace(
+                DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.STANDARD),
+                planner_seconds=0.005,
+            )
+            mock_policy.for_route.return_value = short_budget
+            mock_policy.maximum_request_seconds.return_value = 65
+            result = orchestrator.run(request("比较 Python 并发 API"))
+
+        self.assertEqual(PlanningStatus.DEGRADED, result.plan.planning_status)
         self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
 
 

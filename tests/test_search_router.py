@@ -1089,6 +1089,29 @@ class RequestAnalysisRouterTests(unittest.TestCase):
         self.assertNotIn(".risk", source)
         self.assertNotIn(".freshness", source)
 
+    def test_analyzer_zero_llm_fallback_on_exception_timeout_or_malformed(self):
+        class FailingLLM:
+            def __init__(self, error):
+                self.error = error
+                self.calls = 0
+
+            def chat(self, messages, **kwargs):
+                self.calls += 1
+                raise self.error
+
+        for err in (RuntimeError("boom"), TimeoutError("timed out")):
+            with self.subTest(err=err):
+                analyzer = self.module.LLMRequestAnalyzer(FailingLLM(err))
+                analysis = analyzer.analyze(chat_request("比较 Rust 和 Go 的并发模型"))
+                decision = self.router.decide(analysis.retrieval)
+                self.assertIs(decision.route, SearchTier.STANDARD)
+                self.assertIn(RetrievalComplexityCode.COMPARISON, analysis.retrieval.complexity_codes)
+
+                skip_analysis = analyzer.analyze(chat_request("不要联网，写一首诗"))
+                skip_decision = self.router.decide(skip_analysis.retrieval)
+                self.assertIs(skip_decision.route, SearchTier.SKIP)
+                self.assertIs(skip_decision.skip_reason, SkipReason.USER_FORBID_WEB)
+
 
 if __name__ == "__main__":
     unittest.main()
