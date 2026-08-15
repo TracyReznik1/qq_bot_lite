@@ -87,7 +87,6 @@ class _FakeJudge:
             else:
                 result[f"C{index}"] = {
                     "candidate_id": f"C{index}",
-                    "relevance": "direct",
                     "source_relation": "independent",
                     "publisher_entity_match": False,
                     "ownership_basis": None,

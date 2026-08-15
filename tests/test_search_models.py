@@ -98,7 +98,7 @@ class SearchModelFixtures:
             "e1", "q1", "tavily", "title", "https://example.invalid",
             None, "example.invalid", "Example", m.SourceRelation.PRIMARY,
             None, None, None, "excerpt", m.ExcerptOrigin.PROVIDER_SNIPPET,
-            "ok", 1.0, 1.0, True, m.Freshness.NONE, True, (), ("question",), "source-1",
+            "ok", 1.0, m.Freshness.NONE, True, (), ("topic-1",), "source-1",
         )
 
     def gap_analysis(self):
@@ -262,7 +262,7 @@ class SearchModelContractTests(unittest.TestCase):
             "ProviderStatus": {
                 "success", "empty", "timeout", "error", "not_configured", "unavailable"
             },
-            "CandidateRelevance": {"direct", "contextual", "irrelevant"},
+            "JudgeBatchStatus": {"completed", "unavailable"},
             "QueryPurpose": {
                 "direct", "primary", "independent", "time_bounded", "disambiguation",
                 "counterevidence", "repair",
@@ -724,7 +724,7 @@ class SearchModelContractTests(unittest.TestCase):
             ("RepairPlan.target_topic_ids", fixtures.repair_plan(), "target_topic_ids"),
             ("ProviderHit.quality_flags", fixtures.hit(), "quality_flags"),
             ("EvidenceItem.safety_flags", fixtures.evidence_item(), "safety_flags"),
-            ("EvidenceItem.supported_topics", fixtures.evidence_item(), "supported_topics"),
+            ("EvidenceItem.supported_topic_ids", fixtures.evidence_item(), "supported_topic_ids"),
             ("EvidenceGapAnalysis.missing_topic_ids", fixtures.gap_analysis(), "missing_topic_ids"),
             ("EvidenceBundle.initial_evidence_ids", fixtures.bundle(), "initial_evidence_ids"),
             ("EvidenceBundle.limitations", fixtures.bundle(), "limitations"),
@@ -1427,34 +1427,27 @@ class TopicAssessmentContractTests(unittest.TestCase):
                         missing_claim_topics=(topic.label,),
                     )
 
-    def test_topic_support_requires_citable_relevance_gated_evidence(self):
+    def test_topic_support_requires_citable_evidence(self):
         m = models()
         fixtures = SearchModelFixtures(m)
-        for evidence in (
-            replace(fixtures.evidence_item(), citable=False),
-            replace(fixtures.evidence_item(), relevance_gate_passed=False),
-        ):
-            with self.subTest(
-                citable=evidence.citable,
-                relevance_gate_passed=evidence.relevance_gate_passed,
-            ):
-                with self.assertRaises(ValueError):
-                    replace(
-                        fixtures.bundle(),
-                        initial_evidence_ids=(evidence.evidence_id,),
-            evidence_items=(evidence,),
-            evidence_state=m.EvidenceState.SUFFICIENT,
-            missing_claim_topics=(),
-            topic_assessments=(
-                            m.TopicAssessment(
-                                "topic-1",
-                                m.FreshnessEligibility.NOT_REQUIRED,
-                                (evidence.evidence_id,),
-                            ),
-                        ),
-                        supported_topic_ids=("topic-1",),
-                        missing_topic_ids=(),
-                    )
+        evidence = replace(fixtures.evidence_item(), citable=False)
+        with self.assertRaises(ValueError):
+            replace(
+                fixtures.bundle(),
+                initial_evidence_ids=(evidence.evidence_id,),
+                evidence_items=(evidence,),
+                evidence_state=m.EvidenceState.SUFFICIENT,
+                missing_claim_topics=(),
+                topic_assessments=(
+                    m.TopicAssessment(
+                        "topic-1",
+                        m.FreshnessEligibility.NOT_REQUIRED,
+                        (evidence.evidence_id,),
+                    ),
+                ),
+                supported_topic_ids=("topic-1",),
+                missing_topic_ids=(),
+            )
 
     def test_supporting_evidence_ids_and_bundle_evidence_ids_must_be_unique(self):
         m = models()
@@ -1472,12 +1465,12 @@ class TopicAssessmentContractTests(unittest.TestCase):
                 evidence_items=(evidence, evidence),
             )
 
-    def test_topic_support_must_match_legacy_evidence_label_projection(self):
+    def test_topic_support_must_match_supported_topic_ids(self):
         m = models()
         fixtures = SearchModelFixtures(m)
         evidence = replace(
             fixtures.evidence_item(),
-            supported_topics=("unrelated label",),
+            supported_topic_ids=("unrelated-topic",),
         )
         with self.assertRaises(ValueError):
             replace(
@@ -1629,13 +1622,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
                     m.EvidenceConflictMember("E2", "2", None, "contradicts"),
                 ),
             ),
-            (
-                (replace(first, relevance_gate_passed=False), second),
-                (
-                    m.EvidenceConflictMember("e1", "1", None, "contradicts"),
-                    m.EvidenceConflictMember("E2", "2", None, "contradicts"),
-                ),
-            ),
+
         )
         for evidence_items, members in cases:
             conflict = m.EvidenceConflict("conflict-1", "version", members, topic_ids=("topic-1",))
@@ -1655,7 +1642,7 @@ class TopicAssessmentContractTests(unittest.TestCase):
         m = models()
         fixtures = SearchModelFixtures(m)
         first = fixtures.evidence_item()
-        second = replace(first, evidence_id="E2", supported_topics=())
+        second = replace(first, evidence_id="E2", supported_topic_ids=())
         conflict = m.EvidenceConflict(
             "conflict-1",
             "version",

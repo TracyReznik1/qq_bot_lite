@@ -149,8 +149,8 @@ def item(eid="E1", url="https://example.com/page"):
     return m.EvidenceItem(
         eid, "q1", "tavily", "Title", url, url, "example.com", "Example",
         SourceRelation.INDEPENDENT, None, None, None, "excerpt",
-        ExcerptOrigin.PROVIDER_SNIPPET, "ok", 1.0, 1.0, True, Freshness.NONE,
-        True, (), ("版本",), "g1",
+        ExcerptOrigin.PROVIDER_SNIPPET, "ok", 1.0, Freshness.NONE,
+        True, (), ("topic-1",), "g1",
     )
 
 

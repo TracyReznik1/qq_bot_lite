@@ -200,7 +200,6 @@ class _FakeJudge:
             else:
                 result[f"C{index}"] = {
                     "candidate_id": f"C{index}",
-                    "relevance": "direct",
                     "source_relation": "independent",
                     "publisher_entity_match": False,
                     "ownership_basis": None,
@@ -398,7 +397,6 @@ class OrchestratorRequestAnalysisPropagationTests(unittest.TestCase):
                 return {
                     f"C{index}": {
                         "candidate_id": f"C{index}",
-                        "relevance": "direct",
                         "source_relation": "independent",
                         "publisher_entity_match": False,
                         "ownership_basis": None,
@@ -1237,7 +1235,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         class SlowJudge:
             def judge(self, *_args, **_kwargs):
                 time.sleep(0.25)
-                return {"C1": {"relevance": "direct"}}
+                return {"C1": {"source_relation": "independent"}}
 
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("light")),
@@ -1364,7 +1362,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             request_analyzer=_make_request_analyzer(router_payload("standard")),
             router=_make_router(router_payload("standard")),
             planner=_make_planner(),
-            judge=_FakeJudge(supported_topic_ids=()),
+            judge=_FakeJudge(supported_topic_ids=("topic-1",)),
             providers=(RepairBlockingProvider(),),
             extractor=_FakeExtractor(),
         )
@@ -1545,7 +1543,6 @@ class OrchestratorTraceTests(unittest.TestCase):
         def row(candidate_id):
             return {
                 "candidate_id": candidate_id,
-                "relevance": "direct",
                 "source_relation": "independent",
                 "publisher_entity_match": False,
                 "ownership_basis": None,
@@ -1719,7 +1716,6 @@ class OrchestratorTraceTests(unittest.TestCase):
                 return {
                     f"C{index}": {
                         "candidate_id": f"C{index}",
-                        "relevance": "direct",
                         "source_relation": "independent",
                         "publisher_entity_match": False,
                         "ownership_basis": None,
@@ -1976,7 +1972,6 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         def verdict(candidate_id, topic_ids=()):
             return {
                 "candidate_id": candidate_id,
-                "relevance": "direct",
                 "source_relation": "independent",
                 "publisher_entity_match": False,
                 "ownership_basis": None,

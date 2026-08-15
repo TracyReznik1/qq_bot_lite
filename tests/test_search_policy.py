@@ -113,8 +113,8 @@ class AnswerStateMatrixTests(unittest.TestCase):
             ),
             supported_topic_ids=("topic-2",),
             evidence_items=(
-                SimpleNamespace(evidence_id="E1", supported_topics=("A", "B")),
-                SimpleNamespace(evidence_id="E2", supported_topics=("A",)),
+                SimpleNamespace(evidence_id="E1", supported_topic_ids=("A", "B")),
+                SimpleNamespace(evidence_id="E2", supported_topic_ids=("A",)),
             ),
             conflicts=(
                 SimpleNamespace(

@@ -114,8 +114,8 @@ def item(eid="E1", url="https://example.com/page", title="Title"):
     return m.EvidenceItem(
         eid, "q1", "tavily", title, url, url, "example.com", "Example",
         SourceRelation.INDEPENDENT, None, None, None, "光合作用定义",
-        ExcerptOrigin.PROVIDER_SNIPPET, "ok", 1.0, 1.0, True, Freshness.NONE,
-        True, (), ("定义",), "g1",
+        ExcerptOrigin.PROVIDER_SNIPPET, "ok", 1.0, Freshness.NONE,
+        True, (), ("topic-1",), "g1",
     )
 
 
@@ -649,8 +649,8 @@ class FailureFlowTests(unittest.TestCase):
             m.EvidenceGapAnalysis((), (), False, (), ()),
             m.RepairPlan(False, (), (), None), 1,
             (
-                replace(item("E1", "https://a.example.com", title="Source A"), supported_topics=("版本",)),
-                replace(item("E2", "https://b.example.com", title="Source B"), supported_topics=("版本",)),
+                replace(item("E1", "https://a.example.com", title="Source A"), supported_topic_ids=("topic-1",)),
+                replace(item("E2", "https://b.example.com", title="Source B"), supported_topic_ids=("topic-1",)),
             ),
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",),
             ("weak_source_topics",),
@@ -958,8 +958,8 @@ class PartialConflictFlowTests(unittest.TestCase):
             m.EvidenceGapAnalysis((), (), False, (), ()),
             m.RepairPlan(False, (), (), None), 1,
             (
-                replace(item("E1", "https://a.example.com", title="Source A"), supported_topics=("版本",)),
-                replace(item("E2", "https://b.example.com", title="Source B"), supported_topics=("版本",)),
+                replace(item("E1", "https://a.example.com", title="Source A"), supported_topic_ids=("topic-1",)),
+                replace(item("E2", "https://b.example.com", title="Source B"), supported_topic_ids=("topic-1",)),
             ),
             m.EvidenceState.CONFLICTING, ("版本",), (), ("conflict:版本",), (),
             (

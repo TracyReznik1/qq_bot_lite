@@ -193,6 +193,9 @@ def _build_evidence_payload(result: SearchPipelineResult) -> str:
     evidence = result.evidence
     if evidence is None:
         return ""
+    topic_labels = {
+        topic.topic_id: topic.label for topic in evidence.plan.required_topics
+    } if evidence.plan is not None and getattr(evidence.plan, "required_topics", None) else {}
     rows = []
     for item in evidence.evidence_items:
         rows.append(
@@ -203,7 +206,8 @@ def _build_evidence_payload(result: SearchPipelineResult) -> str:
                 "excerpt": (item.excerpt or "")[:400],
                 "published_at": item.published_at.isoformat() if item.published_at else None,
                 "source_relation": item.source_relation.value,
-                "supported_topics": list(item.supported_topics),
+                "supported_topic_ids": list(item.supported_topic_ids),
+                "supported_topics": [topic_labels.get(tid, tid) for tid in item.supported_topic_ids],
             }
         )
     payload = {

@@ -194,10 +194,9 @@ class ExcerptOrigin(StrEnum):
     DOCUMENT_EXTRACT = "document_extract"
 
 
-class CandidateRelevance(StrEnum):
-    DIRECT = "direct"
-    CONTEXTUAL = "contextual"
-    IRRELEVANT = "irrelevant"
+class JudgeBatchStatus(StrEnum):
+    COMPLETED = "completed"
+    UNAVAILABLE = "unavailable"
 
 
 class SourceRelation(StrEnum):
@@ -901,6 +900,40 @@ class ProviderHit:
 
 
 @dataclass(frozen=True)
+class JudgeVerdict:
+    candidate_id: str
+    supported_topic_ids: tuple[str, ...]
+    freshness_by_topic: Mapping[str, FreshnessEligibility] = ()
+    source_relation: SourceRelation = SourceRelation.UNKNOWN
+    publisher_match: bool = False
+    ownership_basis: str | None = None
+    publisher: str | None = None
+    publication_date: str | None = None
+    conflict_key: str | None = None
+    conflict_value: str | None = None
+    conflict_relation: str | None = None
+
+    def __post_init__(self) -> None:
+        _normalize_fields(
+            self,
+            supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"),
+        )
+        _require_enum(self.source_relation, SourceRelation, "source_relation")
+
+
+@dataclass(frozen=True)
+class JudgeBatchResult:
+    rows: Mapping[str, JudgeVerdict]
+    status: JudgeBatchStatus
+    anomaly_codes: tuple[JudgeAnomalyCode, ...] = ()
+    anomaly_count: int = 0
+    gap_hints: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_enum(self.status, JudgeBatchStatus, "status")
+
+
+@dataclass(frozen=True)
 class EvidenceItem:
     evidence_id: str
     query_id: str
@@ -918,19 +951,21 @@ class EvidenceItem:
     excerpt_origin: ExcerptOrigin | None
     extraction_status: str
     provider_score: float | None
-    relevance_score: float | None
-    relevance_gate_passed: bool
     freshness_state: Freshness
     citable: bool
     safety_flags: tuple[str, ...]
-    supported_topics: tuple[str, ...]
+    supported_topic_ids: tuple[str, ...]
     independence_group: str | None
     conflict_key: str | None = None
     conflict_value: str | None = None
     conflict_relation: str | None = None
 
     def __post_init__(self) -> None:
-        _normalize_fields(self, safety_flags=_strings(self.safety_flags, "safety_flags"), supported_topics=_strings(self.supported_topics, "supported_topics"))
+        _normalize_fields(
+            self,
+            safety_flags=_strings(self.safety_flags, "safety_flags"),
+            supported_topic_ids=_strings(self.supported_topic_ids, "supported_topic_ids"),
+        )
         _require_enum(self.source_relation, SourceRelation, "source_relation")
         if self.excerpt_origin is not None:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
@@ -1132,8 +1167,8 @@ class EvidenceBundle:
                 item = evidence_by_id.get(member.evidence_id)
                 if item is None:
                     raise ValueError("conflict members must reference bundle evidence")
-                if not item.citable or not item.relevance_gate_passed:
-                    raise ValueError("conflict members require citable relevant evidence")
+                if not item.citable:
+                    raise ValueError("conflict members require citable evidence")
             for topic_id in conflict.topic_ids:
                 topic = next(
                     topic for topic in material_topics if topic.topic_id == topic_id
@@ -1141,7 +1176,7 @@ class EvidenceBundle:
                 supporting_member_ids = {
                     member.evidence_id
                     for member in conflict.members
-                    if topic.label in evidence_by_id[member.evidence_id].supported_topics
+                    if topic.topic_id in evidence_by_id[member.evidence_id].supported_topic_ids
                 }
                 if len(supporting_member_ids) < 2:
                     raise ValueError(
@@ -1153,10 +1188,10 @@ class EvidenceBundle:
                 item = evidence_by_id.get(evidence_id)
                 if item is None:
                     raise ValueError("topic assessments must reference bundle evidence")
-                if not item.citable or not item.relevance_gate_passed:
-                    raise ValueError("topic support requires citable relevant evidence")
-                if topic.label not in item.supported_topics:
-                    raise ValueError("topic support must match the legacy label projection")
+                if not item.citable:
+                    raise ValueError("topic support requires citable evidence")
+                if topic.topic_id not in item.supported_topic_ids:
+                    raise ValueError("topic support must match the supported topic ids")
         if self.conflicts:
             expected_state = EvidenceState.CONFLICTING
         elif not self.missing_topic_ids:

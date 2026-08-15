@@ -11,7 +11,6 @@ from datetime import date, datetime, timezone
 from itertools import permutations
 
 from src.search.models import (
-    CandidateRelevance,
     EvidenceCandidate,
     EvidenceGapAnalysis,
     EvidenceState,
@@ -21,6 +20,9 @@ from src.search.models import (
     Freshness,
     FreshnessEligibility,
     FreshnessRequirement,
+    JudgeBatchResult,
+    JudgeBatchStatus,
+    JudgeVerdict,
     PlanningStatus,
     ProviderHit,
     QueryPurpose,
@@ -211,7 +213,6 @@ def topic_judge_ok(
         conflict_relation = "contradicts"
     return {
         "candidate_id": candidate_id,
-        "relevance": "direct",
         "source_relation": relation,
         "publisher_entity_match": relation == "primary",
         "ownership_basis": "publisher matches query entity" if relation == "primary" else None,
@@ -246,7 +247,6 @@ def hit(url="https://example.com/page", title="Title", provider="tavily", conten
 def candidate(
     url="https://example.com/page",
     title="Title",
-    relevance=None,
     provider="tavily",
     content="直接回答光合作用定义的正文。",
     published=None,
@@ -264,7 +264,6 @@ def candidate(
 
 def judge_ok(
     candidate_id="C1",
-    relevance="direct",
     relation="primary",
     supported=("topic-1",),
     freshness_by_topic=None,
@@ -284,7 +283,7 @@ def judge_ok(
             )
             for supported_topic in supported
         )
-    )
+    ) if supported else ()
     if freshness_by_topic is None:
         freshness_by_topic = {
             topic_id: "not_required" for topic_id in topic_ids
@@ -293,7 +292,6 @@ def judge_ok(
         conflict_relation = "contradicts"
     return {
         "candidate_id": candidate_id,
-        "relevance": relevance,
         "source_relation": relation,
         "publisher_entity_match": relation == "primary",
         "ownership_basis": "publisher matches query entity" if relation == "primary" else None,
@@ -310,11 +308,11 @@ class EvidenceAdmissionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = evidence_module()
 
-    def test_relevance_is_admission_gate_before_source_relation(self):
+    def test_topic_support_is_admission_gate_before_source_relation(self):
         judge = StaticEvidenceJudge(
             {
-                "C1": judge_ok("C1", relevance="irrelevant", relation="primary"),
-                "C2": judge_ok("C2", relevance="direct", relation="independent"),
+                "C1": judge_ok("C1", relation="primary", supported=()),
+                "C2": judge_ok("C2", relation="independent", supported=("topic-1",)),
             }
         )
         assembler = self.module.EvidenceAssembler(judge)
@@ -327,11 +325,11 @@ class EvidenceAdmissionTests(unittest.TestCase):
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0].url, "https://independent.example.com/note")
         self.assertIs(evidence[0].source_relation, SourceRelation.INDEPENDENT)
-        self.assertTrue(evidence[0].relevance_gate_passed)
+        self.assertEqual(("topic-1",), evidence[0].supported_topic_ids)
 
-    def test_irrelevant_official_docs_url_cannot_become_first_party(self):
+    def test_primary_official_docs_url_without_support_cannot_be_admitted(self):
         judge = StaticEvidenceJudge(
-            {"C1": judge_ok("C1", relevance="irrelevant", relation="primary")}
+            {"C1": judge_ok("C1", relation="primary", supported=())}
         )
         assembler = self.module.EvidenceAssembler(judge)
         candidates = (candidate(url="https://unrelated.example/docs", title="Docs"),)
@@ -344,7 +342,6 @@ class EvidenceAdmissionTests(unittest.TestCase):
             {
                 "C1": {
                     "candidate_id": "C1",
-                    "relevance": "direct",
                     "source_relation": "primary",
                     "publisher_entity_match": False,
                     "ownership_basis": None,
@@ -366,7 +363,6 @@ class EvidenceAdmissionTests(unittest.TestCase):
         assembler = self.module.EvidenceAssembler(judge)
         bundle = assembler.assemble(plan(), (candidate(url="https://x.example.com/docs/guide"),))
         self.assertEqual(len(bundle.evidence_items), 1)
-        # Even a primary claim cannot come from URL shape alone; judge controls it.
 
     def test_judge_failure_falls_back_deterministically_to_unknown(self):
         assembler = self.module.EvidenceAssembler(
@@ -376,31 +372,29 @@ class EvidenceAdmissionTests(unittest.TestCase):
         self.assertEqual(bundle.evidence_items, ())
         self.assertIs(bundle.evidence_state, EvidenceState.INSUFFICIENT)
 
-    def test_only_direct_relevance_is_admitted(self):
+    def test_empty_support_is_not_admitted(self):
         assembler = self.module.EvidenceAssembler(
-            StaticEvidenceJudge({"C1": judge_ok("C1", relevance="contextual")})
+            StaticEvidenceJudge({"C1": judge_ok("C1", supported=())})
         )
         bundle = assembler.assemble(plan(), (candidate(content="背景相关但不回答问题"),))
         self.assertEqual(bundle.evidence_items, ())
 
-    def test_closed_non_direct_rows_are_not_admitted_but_do_not_fail_parsing(self):
+    def test_closed_non_supported_rows_are_not_admitted_but_do_not_fail_parsing(self):
         judge = StaticEvidenceJudge(
             {
                 "C1": judge_ok(
                     "C1",
-                    relevance="irrelevant",
                     relation="unknown",
                     supported=(),
                     freshness_by_topic={},
                 ),
                 "C2": judge_ok(
                     "C2",
-                    relevance="contextual",
                     relation="unknown",
                     supported=(),
                     freshness_by_topic={},
                 ),
-                "C3": judge_ok("C3", relevance="direct", relation="independent"),
+                "C3": judge_ok("C3", relation="independent", supported=("topic-1",)),
             }
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
@@ -448,7 +442,7 @@ class EvidenceAdmissionTests(unittest.TestCase):
             def judge(self, *_args, **_kwargs):
                 return {
                     "C1": {
-                        "relevance": "direct",
+                        "source_relation": "independent",
                         "supported_topic_ids": ["topic-1"],
                     }
                 }
@@ -518,6 +512,14 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
             required_topics=({"topic_id": "topic-1", "label": "release"},),
         )
 
+    def test_supported_topic_ids_are_the_only_direct_support_signal(self):
+        row = topic_judge_ok("C1", supported_topic_ids=("topic-1",))
+        parsed = self._judge(
+            json.dumps({"candidates": {"C1": row}, "gap_hints": []}),
+            candidate_count=1,
+        )
+        self.assertEqual(("topic-1",), tuple(parsed["C1"]["supported_topic_ids"]))
+
     def test_llm_judge_accepts_only_closed_outer_topic_id_schema(self):
         row = topic_judge_ok(
             "C1",
@@ -560,7 +562,7 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
                 "gap_hints": [],
             },
             {"candidates": {"C1": {key: value for key, value in valid.items() if key != "candidate_id"}}, "gap_hints": []},
-            {"candidates": {"C1": {"candidate_id": "C1", "relevance": "direct"}}, "gap_hints": []},
+            {"candidates": {"C1": {"candidate_id": "C1", "source_relation": "independent"}}, "gap_hints": []},
         )
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
@@ -612,13 +614,13 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
             supported_topic_ids=(),
             freshness_by_topic={},
             relation="unknown",
-        ) | {"relevance": "irrelevant"}
+        )
         contextual = topic_judge_ok(
             "C2",
             supported_topic_ids=(),
             freshness_by_topic={},
             relation="unknown",
-        ) | {"relevance": "contextual"}
+        )
         direct = topic_judge_ok("C3")
 
         result = self._judge(
@@ -742,8 +744,8 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
         first = json.dumps(topic_judge_ok("C1"), ensure_ascii=False, separators=(",", ":"))
         malformed = json.dumps(topic_judge_ok("C2"), ensure_ascii=False, separators=(",", ":"))
         malformed = malformed.replace(
-            '"relevance":"direct"',
-            '"relevance":"direct","relevance":"irrelevant"',
+            '"source_relation":"primary"',
+            '"source_relation":"primary","source_relation":"secondary"',
             1,
         )
         content = (
@@ -785,6 +787,87 @@ class EvidenceJudgeSchemaTests(unittest.TestCase):
             result.judge_anomaly_codes,
         )
         self.assertEqual(8, result.judge_anomaly_count)
+
+    def test_empty_support_with_empty_freshness_is_valid_negative(self):
+        row = topic_judge_ok("C1", supported_topic_ids=(), freshness_by_topic={}, relation="unknown")
+        result = self._judge(
+            json.dumps({"candidates": {"C1": row}, "gap_hints": []}),
+            candidate_count=1,
+        )
+        self.assertEqual(row, result["C1"])
+        self.assertIs(result.status, self.module.JudgeBatchStatus.COMPLETED)
+        self.assertEqual((), result.judge_anomaly_codes)
+        self.assertEqual(0, result.judge_anomaly_count)
+
+    def test_damaged_root_or_call_failure_returns_unavailable(self):
+        class FailingLLM:
+            def chat(self, *_args, **_kwargs):
+                raise RuntimeError("LLM request failed")
+
+        result = self.module.LLMEvidenceJudge(FailingLLM()).judge(
+            "question",
+            self._candidates(2),
+            required_topics=({"topic_id": "topic-1", "label": "release"},),
+        )
+        self.assertIs(result.status, self.module.JudgeBatchStatus.UNAVAILABLE)
+        self.assertEqual({}, dict(result))
+
+    def test_all_negative_rows_completed_without_support(self):
+        row1 = topic_judge_ok("C1", supported_topic_ids=(), freshness_by_topic={}, relation="unknown")
+        row2 = topic_judge_ok("C2", supported_topic_ids=(), freshness_by_topic={}, relation="unknown")
+        result = self._judge(
+            json.dumps({"candidates": {"C1": row1, "C2": row2}, "gap_hints": []}),
+            candidate_count=2,
+        )
+        self.assertEqual({"C1": row1, "C2": row2}, result)
+        self.assertIs(result.status, self.module.JudgeBatchStatus.COMPLETED)
+        self.assertEqual((), result.judge_anomaly_codes)
+
+    def test_valid_root_with_all_malformed_rows_is_completed_with_anomalies(self):
+        malformed1 = topic_judge_ok("C1") | {"unreviewed_field": True}
+        malformed2 = topic_judge_ok("C2") | {"unreviewed_field": True}
+        result = self._judge(
+            json.dumps({"candidates": {"C1": malformed1, "C2": malformed2}, "gap_hints": []}),
+            candidate_count=2,
+        )
+        self.assertEqual({}, dict(result))
+        self.assertIs(result.status, self.module.JudgeBatchStatus.COMPLETED)
+        self.assertEqual(
+            (self.module.JudgeAnomalyCode.MALFORMED_CANDIDATE,),
+            result.judge_anomaly_codes,
+        )
+        self.assertEqual(2, result.judge_anomaly_count)
+
+    def test_llm_called_exactly_once_for_candidate_batch(self):
+        call_count = 0
+
+        class CountingLLM:
+            def chat(self, messages, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "content": json.dumps(
+                            {
+                                "candidates": {
+                                    "C1": topic_judge_ok("C1"),
+                                    "C2": topic_judge_ok("C2"),
+                                },
+                                "gap_hints": [],
+                            }
+                        )
+                    },
+                )()
+
+        result = self.module.LLMEvidenceJudge(CountingLLM()).judge(
+            "question",
+            self._candidates(2),
+            required_topics=({"topic_id": "topic-1", "label": "release"},),
+        )
+        self.assertEqual(1, call_count)
+        self.assertEqual(2, len(result))
 
 
 class MaterialTopicEvidenceTests(unittest.TestCase):
@@ -1271,7 +1354,7 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
             topic_judge_ok("C1", freshness_by_topic={"topic-1": "future"}),
             {
                 "candidate_id": "C1",
-                "relevance": "direct",
+                "source_relation": "independent",
                 "supported_topic_ids": ["topic-1"],
             },
             topic_judge_ok("C1") | {"unreviewed_field": True},
@@ -2016,18 +2099,7 @@ class EvidenceGapTests(unittest.TestCase):
 
     def test_zero_citable_evidence_is_unconditionally_insufficient(self):
         judge = StaticEvidenceJudge(
-            {"C1": {
-                "candidate_id": "C1",
-                "relevance": "direct",
-                "source_relation": "independent",
-                "publisher_entity_match": False,
-                "ownership_basis": None,
-                "publisher": None,
-                "supported_topics": ["定义"],
-                "conflict_key": None,
-                "conflict_value": None,
-                "conflict_relation": None,
-            }}
+            {"C1": topic_judge_ok("C1", supported_topic_ids=("topic-1",))}
         )
         assembler = self.module.EvidenceAssembler(judge)
         p = plan(required_topics=("定义",), route=SearchTier.STANDARD)

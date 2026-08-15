@@ -13,7 +13,6 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from src.search.models import (
-    CandidateRelevance,
     EvidenceBundle,
     EvidenceConflict,
     EvidenceConflictMember,
@@ -25,6 +24,9 @@ from src.search.models import (
     FreshnessEligibility,
     FreshnessRequirement,
     JudgeAnomalyCode,
+    JudgeBatchResult,
+    JudgeBatchStatus,
+    JudgeVerdict,
     ProviderAttempt,
     RepairReasonCode,
     RequiredTopic,
@@ -50,7 +52,6 @@ Return exactly this JSON object:
   "candidates": {
     "C1": {
     "candidate_id": "C1",
-    "relevance": "direct",
     "source_relation": "primary|independent|secondary|community|unknown",
     "publisher_entity_match": true or false,
     "ownership_basis": "non-empty only when the page publisher is the entity named in the query",
@@ -67,13 +68,10 @@ Return exactly this JSON object:
      "target_topic_id": "an exact topic_id that the candidates did not support"}
   ]
 }
-}
 
 Rules:
 - return exactly one candidate judgement for every supplied candidate_id
 - do not omit, merge, duplicate, rename, or invent candidate_id values
-- relevance is the admission gate; an irrelevant page cannot be rescued by
-  a primary-looking domain
 - primary requires the page publisher to actually be the query entity
 - a docs/developer domain or /docs path alone never proves ownership
 - use only supplied topic_id values; never invent IDs or return labels
@@ -91,7 +89,6 @@ Rules:
 _VERDICT_KEYS = frozenset(
     {
         "candidate_id",
-        "relevance",
         "source_relation",
         "publisher_entity_match",
         "ownership_basis",
@@ -124,25 +121,45 @@ class _JudgeParseResult(dict[str, Any]):
     def __init__(
         self,
         *args: Any,
+        status: JudgeBatchStatus = JudgeBatchStatus.COMPLETED,
         anomaly_codes: Sequence[JudgeAnomalyCode] = (),
         anomaly_count: int = 0,
+        gap_hints: tuple[tuple[str, str], ...] = (),
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self.status = status
         self.judge_anomaly_codes = tuple(anomaly_codes)
         self.judge_anomaly_count = anomaly_count
+        self.gap_hints = gap_hints
+
+    @property
+    def anomaly_codes(self) -> tuple[JudgeAnomalyCode, ...]:
+        return self.judge_anomaly_codes
+
+    @property
+    def anomaly_count(self) -> int:
+        return self.judge_anomaly_count
+
+    @property
+    def rows(self) -> Mapping[str, Any]:
+        return {k: v for k, v in self.items() if k != _GAP_HINTS_KEY}
 
 
 def _judge_parse_result(
     rows: Mapping[str, Any] | None = None,
     *,
+    status: JudgeBatchStatus = JudgeBatchStatus.COMPLETED,
     anomaly_codes: Sequence[JudgeAnomalyCode] = (),
     anomaly_count: int = 0,
+    gap_hints: tuple[tuple[str, str], ...] = (),
 ) -> _JudgeParseResult:
     return _JudgeParseResult(
         rows or {},
+        status=status,
         anomaly_codes=anomaly_codes,
         anomaly_count=anomaly_count,
+        gap_hints=gap_hints,
     )
 
 
@@ -202,9 +219,9 @@ class LLMEvidenceJudge:
                 **kwargs,
             )
         except Exception:
-            return {}
+            return _judge_parse_result(status=JudgeBatchStatus.UNAVAILABLE)
         return _parse_judge_output(
-            response.content,
+            getattr(response, "content", ""),
             candidate_ids=tuple(f"C{index}" for index in range(1, len(candidates) + 1)),
             allowed_topic_ids=frozenset(topic["topic_id"] for topic in topics),
         )
@@ -237,26 +254,26 @@ def _parse_judge_output(
     *,
     candidate_ids: tuple[str, ...],
     allowed_topic_ids: frozenset[str],
-) -> dict[str, Any]:
+) -> _JudgeParseResult:
     text = str(content or "").strip()
     if not text:
-        return _judge_parse_result()
+        return _judge_parse_result(status=JudgeBatchStatus.UNAVAILABLE)
     fenced = _FENCE_PATTERN.fullmatch(text)
     if fenced is not None:
         text = fenced.group("body").strip()
     try:
         payload = json.loads(text, object_pairs_hook=_DuplicateAwareDict)
     except (json.JSONDecodeError, ValueError):
-        return _judge_parse_result()
+        return _judge_parse_result(status=JudgeBatchStatus.UNAVAILABLE)
     if (
         not isinstance(payload, dict)
         or _has_duplicate_keys(payload)
         or set(payload) != {"candidates", "gap_hints"}
     ):
-        return _judge_parse_result()
+        return _judge_parse_result(status=JudgeBatchStatus.UNAVAILABLE)
     candidates = payload.get("candidates")
     if not isinstance(candidates, dict):
-        return _judge_parse_result()
+        return _judge_parse_result(status=JudgeBatchStatus.UNAVAILABLE)
     expected_ids = frozenset(candidate_ids)
     anomaly_codes: list[JudgeAnomalyCode] = []
     anomaly_count = 0
@@ -297,8 +314,10 @@ def _parse_judge_output(
         parsed[_GAP_HINTS_KEY] = hints
     return _JudgeParseResult(
         parsed,
+        status=JudgeBatchStatus.COMPLETED,
         anomaly_codes=anomaly_codes,
         anomaly_count=min(anomaly_count, 8),
+        gap_hints=hints,
     )
 
 
@@ -377,9 +396,8 @@ def _parse_verdict(
         return {}
     if raw.get("candidate_id") != candidate_id:
         return {}
-    relevance = _parse_enum(raw.get("relevance"), CandidateRelevance)
     relation = _parse_enum(raw.get("source_relation"), SourceRelation)
-    if relevance is None or relation is None:
+    if relation is None:
         return {}
 
     publisher_match = raw.get("publisher_entity_match")
@@ -442,7 +460,6 @@ def _parse_verdict(
         return {}
 
     return {
-        "relevance": relevance,
         "relation": relation,
         "publisher_match": publisher_match,
         "ownership_basis": (
@@ -481,10 +498,8 @@ def _domain_of(url: str) -> str | None:
 
 
 def _fallback_verdict(candidate: EvidenceCandidate) -> dict[str, Any]:
-    """Conservative deterministic fallback when judging fails: relevance cannot
-    be confirmed, so the candidate is at most CONTEXTUAL and never primary."""
+    """Conservative deterministic fallback when judging fails: no topics supported."""
     return {
-        "relevance": CandidateRelevance.CONTEXTUAL,
         "relation": SourceRelation.UNKNOWN,
         "supported_topic_ids": (),
         "freshness_by_topic": {},
@@ -527,6 +542,9 @@ class EvidenceAssembler:
         allowed_topic_ids = frozenset(
             topic.topic_id for topic in plan.required_topics
         )
+        allowed_material_topic_ids = frozenset(
+            topic.topic_id for topic in plan.required_topics if topic.material
+        )
         verdicts = {
             key: _parse_verdict(
                 judged.get(key),
@@ -545,8 +563,11 @@ class EvidenceAssembler:
         for key in indexed:
             candidate = indexed[key]
             verdict = verdicts.get(key) or _fallback_verdict(candidate)
-            relevance = verdict.get("relevance")
-            if relevance is not CandidateRelevance.DIRECT:
+            verdict_supported_ids = verdict.get("supported_topic_ids", ())
+            supported_material_ids = tuple(
+                tid for tid in verdict_supported_ids if tid in allowed_material_topic_ids
+            )
+            if not supported_material_ids:
                 continue
             # Use the validated final URL when a fetch redirected; otherwise the
             # requested URL is the best available source URL.
@@ -582,14 +603,11 @@ class EvidenceAssembler:
                 excerpt_origin=candidate.excerpt_origin,
                 extraction_status=candidate.extraction_status,
                 provider_score=candidate.hit.score,
-                relevance_score=_relevance_score(relevance),
-                relevance_gate_passed=True,
                 freshness_state=_freshness_state(plan, candidate),
                 citable=_citable(candidate, plan),
                 safety_flags=candidate.safety_flags,
-                supported_topics=_legacy_topic_labels(
-                    plan,
-                    verdict.get("supported_topic_ids", ()),
+                supported_topic_ids=tuple(
+                    tid for tid in verdict_supported_ids if tid in allowed_topic_ids
                 ),
                 independence_group=None,
                 conflict_key=verdict.get("conflict_key"),
@@ -765,12 +783,6 @@ class EvidenceAssembler:
             judge_anomaly_codes=tuple(judge_anomaly_codes),
             judge_anomaly_count=judge_anomaly_count,
         )
-
-
-def _relevance_score(relevance: CandidateRelevance) -> float:
-    return {CandidateRelevance.DIRECT: 1.0, CandidateRelevance.CONTEXTUAL: 0.5, CandidateRelevance.IRRELEVANT: 0.0}.get(
-        relevance, 0.0
-    )
 
 
 def _freshness_state(plan: SearchPlan, candidate: EvidenceCandidate) -> Freshness:
@@ -1018,7 +1030,7 @@ def _order_by_relevance(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
     return sorted(
         items,
         key=lambda item: (
-            -int(item.relevance_gate_passed),
+            -len(item.supported_topic_ids),
             -_relation_rank(item.source_relation),
             -(item.provider_score or 0.0),
         ),
@@ -1036,34 +1048,10 @@ def _relation_rank(relation: SourceRelation) -> int:
 
 
 def _assign_evidence_ids(items: Sequence[EvidenceItem]) -> list[EvidenceItem]:
-    return [EvidenceItem(
-        evidence_id=f"E{index}",
-        query_id=item.query_id,
-        provider=item.provider,
-        title=item.title,
-        url=item.url,
-        canonical_url=item.canonical_url,
-        domain=item.domain,
-        publisher=item.publisher,
-        source_relation=item.source_relation,
-        source_relation_basis=item.source_relation_basis,
-        published_at=item.published_at,
-        retrieved_at=item.retrieved_at,
-        excerpt=item.excerpt,
-        excerpt_origin=item.excerpt_origin,
-        extraction_status=item.extraction_status,
-        provider_score=item.provider_score,
-        relevance_score=item.relevance_score,
-        relevance_gate_passed=item.relevance_gate_passed,
-        freshness_state=item.freshness_state,
-        citable=item.citable,
-        safety_flags=item.safety_flags,
-        supported_topics=item.supported_topics,
-        independence_group=item.independence_group,
-        conflict_key=item.conflict_key,
-        conflict_value=item.conflict_value,
-        conflict_relation=item.conflict_relation,
-    ) for index, item in enumerate(items, 1)]
+    return [
+        replace(item, evidence_id=f"E{index}")
+        for index, item in enumerate(items, 1)
+    ]
 
 
 def _detect_conflicts(
@@ -1121,7 +1109,7 @@ def _detect_conflicts(
 
 
 def _topic_has_evidence(items: Sequence[EvidenceItem], topic: RequiredTopic) -> bool:
-    return any(topic.label in item.supported_topics for item in items)
+    return any(topic.topic_id in item.supported_topic_ids for item in items)
 
 
 def _conflict_topic_ids(conflicts: Sequence[EvidenceConflict]) -> frozenset[str]:
