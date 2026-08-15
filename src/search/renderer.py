@@ -24,6 +24,7 @@ _DYNAMIC_REFUSAL = "我暂时无法完成在线核验，因此不能确认当前
 _NO_WEB_DYNAMIC_LIMIT = "根据你的要求，本次没有联网核验；涉及当前状态的结论无法确认。"
 _VALIDATION_FAILED = "回答未能通过证据核验，已移除无法确认的内容。"
 _VALIDATION_UNAVAILABLE = "已获得网页材料，但本次未能完成语义支撑核验；以下表述应谨慎看待。"
+_JUDGE_UNAVAILABLE = "已找到网页内容，但暂时无法可靠判断其是否直接支持问题。"
 
 _HIGH_CONSEQUENCE_WARNING = "重要提示：搜索结果可能不完整或不准确，不能替代适当的专业判断。"
 _NO_WEB_HIGH_CONSEQUENCE_WARNING = (
@@ -32,6 +33,7 @@ _NO_WEB_HIGH_CONSEQUENCE_WARNING = (
 
 _DISCLOSURE_TEXT = {
     DisclosureCode.ONLINE_VERIFICATION_FAILED: _DYNAMIC_REFUSAL,
+    DisclosureCode.JUDGE_UNAVAILABLE: _JUDGE_UNAVAILABLE,
     DisclosureCode.PARTIAL_EVIDENCE: _PARTIAL_PREFIX,
     DisclosureCode.SOURCE_CONFLICT: _CONFLICT_PREFIX,
     DisclosureCode.VALIDATION_UNAVAILABLE: _VALIDATION_UNAVAILABLE,

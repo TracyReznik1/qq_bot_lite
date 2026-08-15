@@ -2,16 +2,23 @@
 
 import unittest
 from src.search.models import (
+    EvidenceCandidate,
+    EvidenceState,
+    ExcerptOrigin,
+    JudgeBatchStatus,
     ProviderHit,
     QueryBatchResult,
     QueryOutcome,
     QueryOutcomeStatus,
     QueryPurpose,
+    ReadOutcome,
+    ReadOutcomeStatus,
     RetrievalBatchState,
+    SearchFailureCode,
     SearchQuery,
     SearchRoundKind,
 )
-from src.search.outcomes import aggregate_query_outcomes, select_candidate_hits
+from src.search.outcomes import aggregate_query_outcomes, final_search_failure, select_candidate_hits
 
 
 def _make_query(query_id: str, index: int) -> SearchQuery:
@@ -119,3 +126,177 @@ class CandidateSelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinalSearchFailureTests(unittest.TestCase):
+    def test_frozen_failure_matrix(self):
+        q = _make_query("q1", 1)
+        cases = (
+            (
+                "all_empty",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.EMPTY, (), ()),)),
+                None,
+                None,
+                None,
+                SearchFailureCode.NO_RESULTS,
+            ),
+            (
+                "all_not_configured",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.ERROR, (), (), readiness_failure=SearchFailureCode.PROVIDER_NOT_CONFIGURED),)),
+                None,
+                None,
+                None,
+                SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+            ),
+            (
+                "all_timeout",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.TIMEOUT, (), ()),)),
+                None,
+                None,
+                None,
+                SearchFailureCode.PROVIDER_TIMEOUT,
+            ),
+            (
+                "all_error_or_unavailable",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.ERROR, (), ()),)),
+                None,
+                None,
+                None,
+                SearchFailureCode.PROVIDER_UNAVAILABLE,
+            ),
+            (
+                "partial_success_all_unreadable",
+                aggregate_query_outcomes((
+                    QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),
+                    QueryOutcome(_make_query("q2", 2), QueryOutcomeStatus.EMPTY, (), ()),
+                )),
+                (ReadOutcome(_make_hit("q1", "https://a.com"), ReadOutcomeStatus.UNREADABLE, None, True),),
+                None,
+                None,
+                SearchFailureCode.CONTENT_UNREADABLE,
+            ),
+            (
+                "success_readable_judge_unavailable",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),)),
+                (
+                    ReadOutcome(
+                        _make_hit("q1", "https://a.com"),
+                        ReadOutcomeStatus.READABLE,
+                        EvidenceCandidate(
+                            _make_hit("q1", "https://a.com"),
+                            None,
+                            "text",
+                            ExcerptOrigin.PAGE_EXTRACT,
+                            "extraction_ok",
+                            (),
+                            1,
+                        ),
+                        True,
+                    ),
+                ),
+                JudgeBatchStatus.UNAVAILABLE,
+                None,
+                SearchFailureCode.JUDGE_UNAVAILABLE,
+            ),
+            (
+                "success_readable_insufficient_evidence",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),)),
+                (
+                    ReadOutcome(
+                        _make_hit("q1", "https://a.com"),
+                        ReadOutcomeStatus.READABLE,
+                        EvidenceCandidate(
+                            _make_hit("q1", "https://a.com"),
+                            None,
+                            "text",
+                            ExcerptOrigin.PAGE_EXTRACT,
+                            "extraction_ok",
+                            (),
+                            1,
+                        ),
+                        True,
+                    ),
+                ),
+                JudgeBatchStatus.COMPLETED,
+                EvidenceState.INSUFFICIENT,
+                SearchFailureCode.INSUFFICIENT_EVIDENCE,
+            ),
+            (
+                "success_readable_partial_evidence",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),)),
+                (
+                    ReadOutcome(
+                        _make_hit("q1", "https://a.com"),
+                        ReadOutcomeStatus.READABLE,
+                        EvidenceCandidate(
+                            _make_hit("q1", "https://a.com"),
+                            None,
+                            "text",
+                            ExcerptOrigin.PAGE_EXTRACT,
+                            "extraction_ok",
+                            (),
+                            1,
+                        ),
+                        True,
+                    ),
+                ),
+                JudgeBatchStatus.COMPLETED,
+                EvidenceState.PARTIAL,
+                SearchFailureCode.PARTIAL_EVIDENCE,
+            ),
+            (
+                "success_readable_conflicting_evidence",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),)),
+                (
+                    ReadOutcome(
+                        _make_hit("q1", "https://a.com"),
+                        ReadOutcomeStatus.READABLE,
+                        EvidenceCandidate(
+                            _make_hit("q1", "https://a.com"),
+                            None,
+                            "text",
+                            ExcerptOrigin.PAGE_EXTRACT,
+                            "extraction_ok",
+                            (),
+                            1,
+                        ),
+                        True,
+                    ),
+                ),
+                JudgeBatchStatus.COMPLETED,
+                EvidenceState.CONFLICTING,
+                SearchFailureCode.SOURCE_CONFLICT,
+            ),
+            (
+                "success_readable_sufficient_evidence",
+                aggregate_query_outcomes((QueryOutcome(q, QueryOutcomeStatus.RESOLVED, (_make_hit("q1", "https://a.com"),), ()),)),
+                (
+                    ReadOutcome(
+                        _make_hit("q1", "https://a.com"),
+                        ReadOutcomeStatus.READABLE,
+                        EvidenceCandidate(
+                            _make_hit("q1", "https://a.com"),
+                            None,
+                            "text",
+                            ExcerptOrigin.PAGE_EXTRACT,
+                            "extraction_ok",
+                            (),
+                            1,
+                        ),
+                        True,
+                    ),
+                ),
+                JudgeBatchStatus.COMPLETED,
+                EvidenceState.SUFFICIENT,
+                None,
+            ),
+        )
+        for name, batch, reads, judge_status, evidence_state, expected in cases:
+            with self.subTest(name=name):
+                result = final_search_failure(
+                    batch,
+                    read_outcomes=reads,
+                    judge_status=judge_status,
+                    evidence_state=evidence_state,
+                )
+                self.assertIs(expected, result)

@@ -1168,7 +1168,6 @@ class OrchestratorDeadlineTests(unittest.TestCase):
                 return ProviderReadiness("ddgs", True, True, None)
 
             def search(self, _query, **_kwargs):
-                time.sleep(0.01)
                 from src.search.models import ProviderResult
                 return ProviderResult("ddgs", ProviderStatus.ERROR, (), 1)
 

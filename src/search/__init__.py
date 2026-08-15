@@ -76,7 +76,7 @@ from .orchestrator import (
     get_search_orchestrator,
     reset_search_orchestrator,
 )
-from .outcomes import aggregate_query_outcomes
+from .outcomes import aggregate_query_outcomes, final_search_failure
 from .url_policy import (
     UrlDecision,
     canonicalize_public_http_url,
@@ -156,6 +156,7 @@ __all__ = [
     "ValidatorStatus",
     "WarningCode",
     "aggregate_query_outcomes",
+    "final_search_failure",
     "canonicalize_public_http_url",
     "evaluate_public_http_url",
     "get_search_orchestrator",

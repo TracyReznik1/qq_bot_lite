@@ -221,6 +221,7 @@ class SearchFailureCode(StrEnum):
     PROVIDER_TIMEOUT = "provider_timeout"
     NO_RESULTS = "no_results"
     CONTENT_UNREADABLE = "content_unreadable"
+    JUDGE_UNAVAILABLE = "judge_unavailable"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     PARTIAL_EVIDENCE = "partial_evidence"
     SOURCE_CONFLICT = "source_conflict"
@@ -277,6 +278,7 @@ class AllowedClaimScope(StrEnum):
 
 class DisclosureCode(StrEnum):
     ONLINE_VERIFICATION_FAILED = "online_verification_failed"
+    JUDGE_UNAVAILABLE = "judge_unavailable"
     PARTIAL_EVIDENCE = "partial_evidence"
     SOURCE_CONFLICT = "source_conflict"
     VALIDATION_UNAVAILABLE = "validation_unavailable"

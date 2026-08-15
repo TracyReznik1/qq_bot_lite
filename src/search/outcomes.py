@@ -6,11 +6,16 @@ from collections import deque
 from typing import Callable, Sequence
 
 from src.search.models import (
+    EvidenceState,
+    JudgeBatchStatus,
     ProviderHit,
     QueryBatchResult,
     QueryOutcome,
     QueryOutcomeStatus,
+    ReadOutcome,
+    ReadOutcomeStatus,
     RetrievalBatchState,
+    SearchFailureCode,
 )
 from src.search.url_policy import canonicalize_public_http_url
 
@@ -72,3 +77,43 @@ def round_robin_hits(
 ) -> tuple[ProviderHit, ...]:
     """Alias for select_candidate_hits."""
     return select_candidate_hits(batch, max_urls=max_urls, validator=validator)
+
+
+def final_search_failure(
+    batch: QueryBatchResult | None,
+    *,
+    read_outcomes: Sequence[ReadOutcome] | None = None,
+    judge_status: JudgeBatchStatus | None = None,
+    evidence_state: EvidenceState | None = None,
+) -> SearchFailureCode | None:
+    """Single authoritative mapping from stage outcomes to final SearchFailureCode."""
+    if batch is None or batch.state is RetrievalBatchState.ALL_FAILED or not batch.outcomes:
+        if batch is None or not batch.outcomes:
+            return SearchFailureCode.PROVIDER_NOT_CONFIGURED
+        readiness = next((o.readiness_failure for o in batch.outcomes if o.readiness_failure is not None), None)
+        if readiness is not None:
+            return readiness
+        statuses = [outcome.status for outcome in batch.outcomes]
+        if all(s is QueryOutcomeStatus.EMPTY for s in statuses):
+            return SearchFailureCode.NO_RESULTS
+        if any(s is QueryOutcomeStatus.TIMEOUT for s in statuses):
+            return SearchFailureCode.PROVIDER_TIMEOUT
+        return SearchFailureCode.PROVIDER_UNAVAILABLE
+
+    if read_outcomes is not None and len(read_outcomes) > 0:
+        if all(ro.status is not ReadOutcomeStatus.READABLE for ro in read_outcomes):
+            return SearchFailureCode.CONTENT_UNREADABLE
+
+    if judge_status is JudgeBatchStatus.UNAVAILABLE:
+        return SearchFailureCode.JUDGE_UNAVAILABLE
+
+    if evidence_state is EvidenceState.CONFLICTING:
+        return SearchFailureCode.SOURCE_CONFLICT
+    if evidence_state is EvidenceState.PARTIAL:
+        return SearchFailureCode.PARTIAL_EVIDENCE
+    if evidence_state is EvidenceState.INSUFFICIENT:
+        return SearchFailureCode.INSUFFICIENT_EVIDENCE
+    if evidence_state is EvidenceState.SUFFICIENT:
+        return None
+
+    return None

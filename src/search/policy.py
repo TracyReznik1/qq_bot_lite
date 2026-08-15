@@ -165,6 +165,8 @@ def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCod
         return DisclosureCode.USER_FORBID_WEB
     if failure_code is SearchFailureCode.VALIDATION_FAILED:
         return DisclosureCode.VALIDATION_FAILED
+    if failure_code is SearchFailureCode.JUDGE_UNAVAILABLE:
+        return DisclosureCode.JUDGE_UNAVAILABLE
     return DisclosureCode.ONLINE_VERIFICATION_FAILED
 
 

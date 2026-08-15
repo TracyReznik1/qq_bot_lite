@@ -26,6 +26,7 @@ from src.search.models import (
     FreshnessRequirement,
     PlanningStatus,
     PotentialHarm,
+    PROVIDER_STATUS_FAILURE_CODES,
     ProviderAttempt,
     ProviderHit,
     ProviderResult,
@@ -55,7 +56,7 @@ from src.search.models import (
     TopicFreshnessTraceEntry,
     TriggerCode,
 )
-from src.search.outcomes import aggregate_query_outcomes, select_candidate_hits
+from src.search.outcomes import aggregate_query_outcomes, final_search_failure, select_candidate_hits
 from src.search.planner import SearchPlanner, _query_fingerprint
 from src.search.providers import (
     DDGSSearchProvider,
@@ -248,16 +249,7 @@ class SearchOrchestrator:
             )
 
         if initial_batch.state is RetrievalBatchState.ALL_FAILED:
-            readiness = next((o.readiness_failure for o in initial_batch.outcomes if o.readiness_failure is not None), None)
-            if readiness is not None:
-                failure = readiness
-            elif any(o.status is QueryOutcomeStatus.TIMEOUT for o in initial_batch.outcomes):
-                failure = SearchFailureCode.PROVIDER_TIMEOUT
-            elif all(o.status is QueryOutcomeStatus.EMPTY for o in initial_batch.outcomes):
-                failure = SearchFailureCode.NO_RESULTS
-            else:
-                failure = SearchFailureCode.PROVIDER_UNAVAILABLE
-
+            failure = final_search_failure(initial_batch) or SearchFailureCode.PROVIDER_UNAVAILABLE
             return self._failure_result(
                 decision,
                 plan,
@@ -472,7 +464,12 @@ class SearchOrchestrator:
                         limitations=tuple(dict.fromkeys((*bundle.limitations, "hard_deadline_exceeded"))),
                     )
             else:
-                failure_code = _failure_for_state(bundle.evidence_state)
+                failure_code = final_search_failure(
+                    initial_batch,
+                    read_outcomes=None,
+                    judge_status=getattr(bundle, "judge_status", None),
+                    evidence_state=bundle.evidence_state,
+                )
         else:
             failure_code = None
 
@@ -973,10 +970,12 @@ class SearchOrchestrator:
             if logged_attempt.invocation_started:
                 trace.provider_invocation_started = True
             if logged_attempt.status is not ProviderStatus.SUCCESS:
-                trace.provider_failures = (
-                    *trace.provider_failures,
-                    _failure_for_status(logged_attempt.status),
-                )
+                status_fail = PROVIDER_STATUS_FAILURE_CODES.get(logged_attempt.status, SearchFailureCode.PROVIDER_UNAVAILABLE)
+                if status_fail is not None:
+                    trace.provider_failures = (
+                        *trace.provider_failures,
+                        status_fail,
+                    )
 
     def _assembler_with_rejecting_judge(self) -> EvidenceAssembler:
         class _RejectingJudge:
@@ -1270,19 +1269,6 @@ def _query_for_hit(
     return plan.initial_queries[0]
 
 
-def _failure_for_status(status: ProviderStatus) -> SearchFailureCode:
-    from src.search.models import PROVIDER_STATUS_FAILURE_CODES
-    return PROVIDER_STATUS_FAILURE_CODES.get(status, SearchFailureCode.PROVIDER_UNAVAILABLE)
-
-
-def _failure_for_state(state: EvidenceState) -> SearchFailureCode | None:
-    return {
-        EvidenceState.PARTIAL: SearchFailureCode.PARTIAL_EVIDENCE,
-        EvidenceState.CONFLICTING: SearchFailureCode.SOURCE_CONFLICT,
-        EvidenceState.INSUFFICIENT: SearchFailureCode.INSUFFICIENT_EVIDENCE,
-    }.get(state)
-
-
 def _limitation_for_failure(failure: SearchFailureCode) -> str:
     return {
         SearchFailureCode.PROVIDER_NOT_CONFIGURED: "provider_not_configured",
@@ -1290,6 +1276,7 @@ def _limitation_for_failure(failure: SearchFailureCode) -> str:
         SearchFailureCode.PROVIDER_TIMEOUT: "hard_deadline_exceeded",
         SearchFailureCode.NO_RESULTS: "no_results",
         SearchFailureCode.CONTENT_UNREADABLE: "content_unreadable",
+        SearchFailureCode.JUDGE_UNAVAILABLE: "judge_unavailable",
     }.get(failure, "retrieval_failure")
 
 

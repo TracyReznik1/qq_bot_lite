@@ -273,7 +273,7 @@ class SearchModelContractTests(unittest.TestCase):
             "SupportLabel": {"supported", "partial", "conflict", "unsupported", "unmapped"},
             "SearchFailureCode": {
                 "provider_not_configured", "provider_unavailable", "provider_timeout",
-                "no_results", "content_unreadable", "insufficient_evidence", "partial_evidence",
+                "no_results", "content_unreadable", "judge_unavailable", "insufficient_evidence", "partial_evidence",
                 "source_conflict", "validation_failed", "user_forbid_web",
             },
             "JudgeAnomalyCode": {
@@ -843,7 +843,7 @@ class SearchModelContractTests(unittest.TestCase):
                         else:
                             with self.assertRaises((TypeError, ValueError)):
                                 m.ProviderReadiness("provider", *values)
-        self.assertEqual(44, 4 * len(reasons))
+        self.assertEqual(4 * len(reasons), 4 * (len(m.SearchFailureCode) + 1))
         self.assertEqual(3, accepted)
 
         hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, ())

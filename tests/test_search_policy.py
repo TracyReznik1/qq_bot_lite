@@ -205,6 +205,19 @@ class AnswerStateSkipAndFailureTests(unittest.TestCase):
             answer.disclosure_codes,
         )
 
+    def test_judge_unavailable_failure_uses_judge_unavailable_disclosure(self):
+        answer = decide_answer_state(
+            make_analysis(),
+            _evidence(EvidenceState.INSUFFICIENT),
+            SearchFailureCode.JUDGE_UNAVAILABLE,
+        )
+        self.assertIs(answer.generation_mode, AnswerGenerationMode.FIXED)
+        self.assertIs(answer.certainty, AnswerCertainty.UNVERIFIED)
+        self.assertEqual(
+            (DisclosureCode.JUDGE_UNAVAILABLE,),
+            answer.disclosure_codes,
+        )
+
 
 class BuildRenderStateTests(unittest.TestCase):
     def test_citations_and_sources_derive_from_retained_claims(self):
