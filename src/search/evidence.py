@@ -33,6 +33,7 @@ from src.search.models import (
     SourceRequirement,
     TopicAssessment,
 )
+from src.search.url_policy import canonicalize_public_http_url
 
 _FENCE_PATTERN = re.compile(
     r"\A\s*```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```\s*\Z",
@@ -472,29 +473,6 @@ def _final_url_of(candidate: EvidenceCandidate) -> str:
     return candidate.hit.url
 
 
-def _canonical_url(url: str) -> str:
-    """Normalize a URL for dedup: strip fragments, keep ports and the query
-    string (fragments and default ports are the only dropped pieces)."""
-    try:
-        parsed = urlparse(str(url or ""))
-    except ValueError:
-        return str(url or "").strip()
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    if not scheme or not host:
-        return str(url or "").strip()
-    port = ""
-    try:
-        default_port = 443 if scheme == "https" else 80
-        if parsed.port is not None and parsed.port != default_port:
-            port = f":{parsed.port}"
-    except ValueError:
-        pass
-    path = parsed.path.rstrip("/")
-    query = f"?{parsed.query}" if parsed.query else ""
-    return f"{scheme}://{host}{port}{path}{query}"
-
-
 def _domain_of(url: str) -> str | None:
     try:
         return (urlparse(str(url or "")).hostname or "").lower() or None
@@ -573,7 +551,7 @@ class EvidenceAssembler:
             # Use the validated final URL when a fetch redirected; otherwise the
             # requested URL is the best available source URL.
             final_url = _final_url_of(candidate)
-            canonical = _canonical_url(final_url)
+            canonical = canonicalize_public_http_url(final_url) or final_url
             if canonical in seen_canonical:
                 continue
             seen_canonical.add(canonical)
@@ -963,7 +941,8 @@ def _provenance_of(
     *,
     publisher: str | None,
 ) -> _Provenance:
-    domain = _domain_of(url) or _canonical_url(url)
+    canonical_url = canonicalize_public_http_url(url) or url
+    domain = _domain_of(url) or canonical_url
     registrable = _registrable_domain(domain)
     publisher_key = _normalized_identity(publisher)
     keys: set[str] = set()
@@ -983,7 +962,7 @@ def _provenance_of(
     return _Provenance(
         keys=frozenset(keys),
         normalized_excerpt=_normalized_identity(candidate.excerpt)[:600],
-        stable_key=_canonical_url(url),
+        stable_key=canonical_url,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Sequence
 
 from src.search.models import (
@@ -10,6 +11,8 @@ from src.search.models import (
     ExcerptOrigin,
     FetchedDocument,
     ProviderHit,
+    ReadOutcome,
+    ReadOutcomeStatus,
     SearchQuery,
 )
 import src.services.url_fetch_service as url_fetch
@@ -33,14 +36,15 @@ _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 class SearchExtractor:
     """Extract bounded query-aware excerpts from provider hits."""
 
-    def extract(
+    def read(
         self,
         hit: ProviderHit,
         query: SearchQuery,
         *,
-        allow_network_read: bool,
         timeout_seconds: float,
-    ) -> EvidenceCandidate:
+        allow_network_read: bool = True,
+    ) -> ReadOutcome:
+        started = time.monotonic()
         raw_content = hit.raw_content if hit.raw_content else None
         snippet = hit.snippet if hit.snippet else None
 
@@ -48,7 +52,7 @@ class SearchExtractor:
         if raw_content:
             excerpt = _clean_excerpt(raw_content)
             safety_flags = _detect_safety_flags(raw_content)
-            return EvidenceCandidate(
+            candidate = EvidenceCandidate(
                 hit=hit,
                 document=None,
                 excerpt=excerpt,
@@ -57,12 +61,19 @@ class SearchExtractor:
                 safety_flags=safety_flags,
                 content_reads_consumed=1,
             )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            return ReadOutcome(
+                hit=hit,
+                status=ReadOutcomeStatus.READABLE,
+                candidate=candidate,
+                read_attempted=True,
+                latency_ms=elapsed_ms,
+            )
 
-        # When a network read is allowed, fetch the page so a snippet never
-        # blocks the underlying readable content (deep-tier DDGS requires it).
         document = None
         if allow_network_read and hit.url:
             document = self._fetch_document(hit.url, timeout_seconds=timeout_seconds)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
             if document.fetch_status == "success" and document.excerpt:
                 excerpt = _select_query_relevant_excerpt(document.excerpt, query)
                 excerpt = _clean_excerpt(excerpt)
@@ -71,42 +82,122 @@ class SearchExtractor:
                     if document.content_type in {"application/pdf", "application/x-pdf"}
                     else ExcerptOrigin.PAGE_EXTRACT
                 )
-                status = "document_extract" if origin is ExcerptOrigin.DOCUMENT_EXTRACT else "page_extract"
-                return EvidenceCandidate(
+                status_str = "document_extract" if origin is ExcerptOrigin.DOCUMENT_EXTRACT else "page_extract"
+                candidate = EvidenceCandidate(
                     hit=hit,
                     document=document,
                     excerpt=excerpt,
                     excerpt_origin=origin,
-                    extraction_status=status,
+                    extraction_status=status_str,
                     safety_flags=_detect_safety_flags(excerpt),
                     content_reads_consumed=1,
                 )
+                return ReadOutcome(
+                    hit=hit,
+                    status=ReadOutcomeStatus.READABLE,
+                    candidate=candidate,
+                    read_attempted=True,
+                    latency_ms=elapsed_ms,
+                )
 
-        if snippet:
-            excerpt = _clean_excerpt(snippet)
-            safety_flags = _detect_safety_flags(snippet)
-            return EvidenceCandidate(
-                hit=hit,
-                document=document,
-                excerpt=excerpt,
-                excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
-                extraction_status=(
-                    "search_result_snippet_after_fetch_failure"
-                    if document is not None
-                    else "search_result_snippet"
-                ),
-                safety_flags=safety_flags,
-                content_reads_consumed=1 if document is not None else 0,
+            snippet_candidate = (
+                EvidenceCandidate(
+                    hit=hit,
+                    document=document,
+                    excerpt=_clean_excerpt(snippet),
+                    excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
+                    extraction_status="search_result_snippet_after_fetch_failure",
+                    safety_flags=_detect_safety_flags(snippet),
+                    content_reads_consumed=1,
+                )
+                if snippet
+                else None
             )
 
+            if document.fetch_status == "timeout":
+                return ReadOutcome(
+                    hit=hit,
+                    status=ReadOutcomeStatus.TIMEOUT,
+                    candidate=snippet_candidate,
+                    read_attempted=True,
+                    latency_ms=elapsed_ms,
+                )
+            if document.fetch_status in {"unsafe_url", "blocked_ip", "invalid_scheme", "dns_lookup_failed"}:
+                return ReadOutcome(
+                    hit=hit,
+                    status=ReadOutcomeStatus.UNSAFE_URL,
+                    candidate=None,
+                    read_attempted=True,
+                    latency_ms=elapsed_ms,
+                )
+            if document.fetch_status in {"unsupported_type", "unsupported_scheme"}:
+                return ReadOutcome(
+                    hit=hit,
+                    status=ReadOutcomeStatus.UNSUPPORTED_TYPE,
+                    candidate=snippet_candidate,
+                    read_attempted=True,
+                    latency_ms=elapsed_ms,
+                )
+
+            return ReadOutcome(
+                hit=hit,
+                status=ReadOutcomeStatus.UNREADABLE,
+                candidate=snippet_candidate,
+                read_attempted=True,
+                latency_ms=elapsed_ms,
+            )
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if snippet:
+            candidate = EvidenceCandidate(
+                hit=hit,
+                document=None,
+                excerpt=_clean_excerpt(snippet),
+                excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
+                extraction_status="search_result_snippet",
+                safety_flags=_detect_safety_flags(snippet),
+                content_reads_consumed=0,
+            )
+            return ReadOutcome(
+                hit=hit,
+                status=ReadOutcomeStatus.UNREADABLE,
+                candidate=candidate,
+                read_attempted=False,
+                latency_ms=elapsed_ms,
+            )
+
+        return ReadOutcome(
+            hit=hit,
+            status=ReadOutcomeStatus.UNREADABLE,
+            candidate=None,
+            read_attempted=False,
+            latency_ms=elapsed_ms,
+        )
+
+    def extract(
+        self,
+        hit: ProviderHit,
+        query: SearchQuery,
+        *,
+        allow_network_read: bool = True,
+        timeout_seconds: float = 4.0,
+    ) -> EvidenceCandidate:
+        outcome = self.read(
+            hit,
+            query,
+            timeout_seconds=timeout_seconds,
+            allow_network_read=allow_network_read,
+        )
+        if outcome.candidate is not None:
+            return outcome.candidate
         return EvidenceCandidate(
             hit=hit,
-            document=document,
+            document=None,
             excerpt=None,
             excerpt_origin=None,
             extraction_status="no_content",
             safety_flags=(),
-            content_reads_consumed=1 if document is not None else 0,
+            content_reads_consumed=1 if outcome.read_attempted else 0,
         )
 
     def _fetch_document(self, url: str, *, timeout_seconds: float) -> FetchedDocument:

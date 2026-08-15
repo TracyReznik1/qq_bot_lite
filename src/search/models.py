@@ -1287,7 +1287,10 @@ class QueryBatchResult:
         outcomes = _records(self.outcomes, QueryOutcome, "outcomes")
         _require_enum(self.state, RetrievalBatchState, "state")
         if not outcomes:
-            raise ValueError("QueryBatchResult requires non-empty outcomes")
+            _normalize_fields(self, outcomes=outcomes)
+            if self.state is not RetrievalBatchState.ALL_FAILED:
+                raise ValueError("Empty QueryBatchResult must have ALL_FAILED state")
+            return
         indexes = tuple(outcome.query_index for outcome in outcomes)
         if len(set(indexes)) != len(indexes):
             raise ValueError("QueryBatchResult outcomes must have unique query_index values")
@@ -1307,12 +1310,28 @@ class QueryBatchResult:
             raise ValueError(f"QueryBatchResult state {self.state} does not match outcome resolution {expected_state}")
 
     @property
+    def total_count(self) -> int:
+        return len(self.outcomes)
+
+    @property
+    def total_query_count(self) -> int:
+        return len(self.outcomes)
+
+    @property
     def resolved_count(self) -> int:
         return sum(outcome.resolved for outcome in self.outcomes)
 
     @property
+    def resolved_query_count(self) -> int:
+        return self.resolved_count
+
+    @property
     def unresolved_count(self) -> int:
         return sum(not outcome.resolved for outcome in self.outcomes)
+
+    @property
+    def unresolved_query_count(self) -> int:
+        return self.unresolved_count
 
 
 @dataclass(frozen=True)
@@ -1347,6 +1366,49 @@ class EvidenceCandidate:
             _require_enum(self.excerpt_origin, ExcerptOrigin, "excerpt_origin")
         if type(self.content_reads_consumed) is not int or self.content_reads_consumed not in (0, 1):
             raise ValueError("content_reads_consumed must be 0 or 1")
+
+
+class ReadOutcomeStatus(StrEnum):
+    READABLE = "readable"
+    UNREADABLE = "unreadable"
+    TIMEOUT = "timeout"
+    UNSAFE_URL = "unsafe_url"
+    UNSUPPORTED_TYPE = "unsupported_type"
+
+
+@dataclass(frozen=True)
+class ReadOutcome:
+    hit: ProviderHit
+    status: ReadOutcomeStatus
+    candidate: EvidenceCandidate | None
+    read_attempted: bool
+    latency_ms: int | float = 0
+
+    def __post_init__(self) -> None:
+        _require_record(self.hit, ProviderHit, "hit")
+        _require_enum(self.status, ReadOutcomeStatus, "status")
+        if self.candidate is not None:
+            _require_record(self.candidate, EvidenceCandidate, "candidate")
+        if type(self.read_attempted) is not bool:
+            raise TypeError("read_attempted must be a boolean")
+        if (
+            isinstance(self.latency_ms, bool)
+            or not isinstance(self.latency_ms, (int, float))
+            or not math.isfinite(self.latency_ms)
+            or self.latency_ms < 0
+        ):
+            raise ValueError("latency_ms must be a finite non-negative number")
+
+        if self.status is ReadOutcomeStatus.READABLE:
+            if self.candidate is None or not self.candidate.excerpt:
+                raise ValueError("READABLE read outcome requires a candidate with an excerpt")
+        elif self.status is ReadOutcomeStatus.UNSAFE_URL:
+            if self.candidate is not None:
+                raise ValueError("UNSAFE_URL read outcome cannot carry a candidate")
+
+    @property
+    def readable(self) -> bool:
+        return self.status is ReadOutcomeStatus.READABLE
 
 
 @dataclass(frozen=True)

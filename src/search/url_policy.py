@@ -17,6 +17,10 @@ class UrlDecision:
     canonical_url: str | None
     message: str
 
+    @property
+    def ok(self) -> bool:
+        return self.allowed
+
 
 def canonicalize_public_http_url(url: str) -> str | None:
     """Return the canonical public HTTP(S) URL, or None if invalid/unsupported."""
@@ -59,8 +63,9 @@ def canonicalize_public_http_url(url: str) -> str | None:
     else:
         netloc = host_for_netloc
 
-    # Strip fragments completely from canonical form
-    return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
+    # Strip trailing slashes on path and strip fragments completely from canonical form
+    path = parsed.path.rstrip("/")
+    return urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
 
 
 def _is_unsafe_ip(ip_text: str) -> bool:

@@ -19,6 +19,7 @@ from src.search.models import (
     Actionability,
     DEFAULT_TIER_BUDGETS,
     EvidenceBundle,
+    EvidenceCandidate,
     EvidenceState,
     ExcerptOrigin,
     Freshness,
@@ -34,6 +35,8 @@ from src.search.models import (
     QueryOutcomeStatus,
     QueryPurpose,
     QueryTraceEntry,
+    ReadOutcome,
+    ReadOutcomeStatus,
     RequestAnalysis,
     RepairPlan,
     RequestSource,
@@ -52,7 +55,7 @@ from src.search.models import (
     TopicFreshnessTraceEntry,
     TriggerCode,
 )
-from src.search.outcomes import aggregate_query_outcomes
+from src.search.outcomes import aggregate_query_outcomes, select_candidate_hits
 from src.search.planner import SearchPlanner, _query_fingerprint
 from src.search.providers import (
     DDGSSearchProvider,
@@ -61,6 +64,7 @@ from src.search.providers import (
 )
 from src.search.providers.base import ProviderSearchOutcome
 from src.search.router import LLMRequestAnalyzer, RetrievalBenefitRouter
+from src.search.url_policy import canonicalize_public_http_url
 
 logger = logging.getLogger("qq-bot")
 
@@ -265,10 +269,14 @@ class SearchOrchestrator:
                 analysis=analysis,
             )
 
-        initial_hits = [hit for outcome in initial_batch.outcomes for hit in outcome.hits]
         content_started = self._monotonic()
         candidates, candidate_keys, reads, unreadable_query_ids = self._extract_candidates(
-            plan, initial_hits, budget, deadline, trace,
+            plan,
+            initial_batch,
+            budget,
+            deadline,
+            trace,
+            round_kind=SearchRoundKind.INITIAL,
         )
         unreadable_topic_ids = _unreadable_topic_ids(plan, unreadable_query_ids)
         trace.initial_content_read_latency_ms = self._elapsed_ms(content_started)
@@ -364,17 +372,13 @@ class SearchOrchestrator:
                 trace.provider_search_total_latency_ms += self._elapsed_ms(
                     repair_provider_started
                 )
-                repair_hits = (
-                    [hit for outcome in repair_batch.outcomes for hit in outcome.hits]
-                    if repair_batch is not None
-                    else []
-                )
                 repair_candidates, repair_keys, more_reads, _repair_unreadable = self._extract_candidates(
                     plan,
-                    repair_hits,
+                    repair_batch if repair_batch is not None else (),
                     budget,
                     deadline,
                     trace,
+                    round_kind=SearchRoundKind.REPAIR,
                     additional_queries=(repair.repair_query,),
                     existing_candidate_keys=candidate_keys,
                     existing_read_count=reads,
@@ -736,79 +740,130 @@ class SearchOrchestrator:
     def _extract_candidates(
         self,
         plan: SearchPlan,
-        results: Sequence[Any],
+        results: Sequence[Any] | QueryBatchResult,
         budget: Any,
         deadline: float,
         trace: SearchTrace,
         *,
+        round_kind: SearchRoundKind = SearchRoundKind.INITIAL,
         additional_queries: Sequence[SearchQuery] = (),
         existing_candidate_keys: set[str] | None = None,
         existing_read_count: int = 0,
     ) -> tuple[list[Any], set[str], int, set[str]]:
-        hits: list[Any] = []
-        for item in results:
-            if isinstance(item, ProviderHit):
-                hits.append(item)
-            elif isinstance(item, ProviderResult) and item.status is ProviderStatus.SUCCESS:
-                hits.extend(item.hits)
-            elif hasattr(item, "hits"):
-                hits.extend(item.hits)
+        budget_policy = DEFAULT_SEARCH_BUDGET_POLICY.for_route(plan.decision.route)
+        reader_timeout = (
+            float(budget_policy.initial_reader_seconds)
+            if round_kind is SearchRoundKind.INITIAL
+            else float(budget_policy.repair_reader_seconds)
+        )
         existing_keys = set(existing_candidate_keys or ())
+        remaining_candidate_budget = max(budget.max_candidate_urls - len(existing_keys), 0)
+
+        # Select candidate hits
+        if isinstance(results, QueryBatchResult):
+            selected_hits = select_candidate_hits(results, max_urls=remaining_candidate_budget)
+        else:
+            hits_list: list[ProviderHit] = []
+            for item in results:
+                if isinstance(item, ProviderHit):
+                    hits_list.append(item)
+                elif isinstance(item, ProviderResult) and item.status is ProviderStatus.SUCCESS:
+                    hits_list.extend(item.hits)
+                elif hasattr(item, "hits"):
+                    hits_list.extend(item.hits)
+            selected_hits = []
+            seen_canon: set[str] = set()
+            for hit in hits_list:
+                if not hit.url:
+                    continue
+                canonical = canonicalize_public_http_url(hit.url)
+                if not canonical or canonical in existing_keys or canonical in seen_canon:
+                    continue
+                seen_canon.add(canonical)
+                selected_hits.append(hit)
+                if len(selected_hits) >= remaining_candidate_budget:
+                    break
+
         new_keys: set[str] = set()
-        unique_hits: list[Any] = []
-        for hit in hits:
-            key = str(hit.url or "").strip()
-            if not key or key in existing_keys or key in new_keys:
-                continue
-            if len(existing_keys) + len(new_keys) >= budget.max_candidate_urls:
-                break
-            new_keys.add(key)
-            unique_hits.append(hit)
+        for hit in selected_hits:
+            canonical = canonicalize_public_http_url(hit.url) or hit.url
+            if canonical:
+                new_keys.add(canonical)
+
+        remaining_read_budget = max(budget.max_content_reads - existing_read_count, 0)
+        hits_to_read = selected_hits[:remaining_read_budget]
+        hits_snippet_only = selected_hits[remaining_read_budget:]
 
         candidates: list[Any] = []
         attempted_query_ids: set[str] = set()
         readable_query_ids: set[str] = set()
-        remaining_read_budget = max(budget.max_content_reads - existing_read_count, 0)
-        read_hits = unique_hits[:remaining_read_budget]
-        if not read_hits:
-            return candidates, new_keys, 0, set()
-        executor = ThreadPoolExecutor(
-            max_workers=min(len(read_hits), 4),
-            thread_name_prefix="search-reader",
-        )
-        futures: dict[Any, Any] = {}
-        try:
-            for hit in read_hits:
-                remaining = self._remaining(deadline)
-                if remaining <= 0:
-                    break
-                attempted_query_ids.add(str(hit.query_id or ""))
-                future = executor.submit(
-                    self._extractor.extract,
-                    hit,
-                    _query_for_hit(plan, hit, additional_queries=additional_queries),
-                    allow_network_read=True,
-                    timeout_seconds=min(config.request_timeout, remaining),
-                )
-                futures[future] = hit
+
+        if hits_to_read and reader_timeout > 0:
+            executor = ThreadPoolExecutor(
+                max_workers=min(len(hits_to_read), 4),
+                thread_name_prefix="search-reader",
+            )
+            futures: dict[Any, ProviderHit] = {}
             try:
-                for future in as_completed(futures, timeout=self._remaining(deadline)):
-                    try:
-                        candidate = future.result()
-                    except Exception:
-                        logger.debug("extraction failed", exc_info=True)
-                        continue
-                    if candidate is not None and candidate.excerpt:
-                        candidates.append(candidate)
-                        if _readable_candidate(candidate):
-                            readable_query_ids.add(str(candidate.hit.query_id or ""))
-            except FuturesTimeoutError:
-                trace.provider_failures = (*trace.provider_failures, SearchFailureCode.PROVIDER_TIMEOUT)
-                for future in futures:
-                    future.cancel()
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-        reads_attempted = len(futures)
+                for hit in hits_to_read:
+                    attempted_query_ids.add(str(hit.query_id or ""))
+                    query_for_hit = _query_for_hit(plan, hit, additional_queries=additional_queries)
+                    if hasattr(self._extractor, "read"):
+                        future = executor.submit(
+                            self._extractor.read,
+                            hit,
+                            query_for_hit,
+                            timeout_seconds=reader_timeout,
+                            allow_network_read=True,
+                        )
+                    else:
+                        future = executor.submit(
+                            self._extractor.extract,
+                            hit,
+                            query_for_hit,
+                            allow_network_read=True,
+                            timeout_seconds=reader_timeout,
+                        )
+                    futures[future] = hit
+
+                try:
+                    for future in as_completed(futures, timeout=reader_timeout):
+                        hit = futures[future]
+                        try:
+                            res = future.result()
+                        except Exception:
+                            logger.debug("extraction failed for hit", exc_info=True)
+                            continue
+                        if isinstance(res, ReadOutcome):
+                            if res.candidate is not None and res.candidate.excerpt:
+                                candidates.append(res.candidate)
+                                if res.status is ReadOutcomeStatus.READABLE:
+                                    readable_query_ids.add(str(hit.query_id or ""))
+                        elif isinstance(res, EvidenceCandidate) and res.excerpt:
+                            candidates.append(res)
+                            if _readable_candidate(res):
+                                readable_query_ids.add(str(hit.query_id or ""))
+                except FuturesTimeoutError:
+                    for future in futures:
+                        future.cancel()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        for hit in hits_snippet_only:
+            if hit.snippet:
+                candidates.append(
+                    EvidenceCandidate(
+                        hit=hit,
+                        document=None,
+                        excerpt=hit.snippet,
+                        excerpt_origin=ExcerptOrigin.PROVIDER_SNIPPET,
+                        extraction_status="search_result_snippet",
+                        safety_flags=(),
+                        content_reads_consumed=0,
+                    )
+                )
+
+        reads_attempted = len(hits_to_read)
         trace.content_read_count = existing_read_count + reads_attempted
         unreadable_query_ids = {
             query_id

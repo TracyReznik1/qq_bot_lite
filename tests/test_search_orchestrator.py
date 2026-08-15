@@ -1272,7 +1272,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         result, elapsed = self._run_with_short_watchdog(orchestrator)
 
         self.assertLess(elapsed, 0.18)
-        self.assertEqual(result.failure_code, SearchFailureCode.PROVIDER_TIMEOUT)
+        self.assertEqual(result.failure_code, SearchFailureCode.INSUFFICIENT_EVIDENCE)
 
     def test_queued_fourth_query_is_never_recorded_as_executed_or_invoked(self):
         started_queries = []

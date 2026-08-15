@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
+import requests
+
 from src.config import config
 from src.util import try_proxied_get
 
@@ -210,6 +212,9 @@ def _fetch_response(url: str, *, timeout: float | None = None):
                 allow_redirects=False,
                 stream=True,
             )
+        except requests.Timeout:
+            logger.debug("URL fetch request timed out: %s", current_url)
+            return None, current_url, "timeout", "网页读取超时。"
         except Exception:
             logger.debug("URL fetch request failed: %s", current_url)
             return None, current_url, "request_error", "网页读取失败，可能是网络或站点暂时不可用。"

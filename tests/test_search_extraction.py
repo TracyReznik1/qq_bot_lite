@@ -289,5 +289,73 @@ class SearchExtractorTests(unittest.TestCase):
         self.assertIn("绿色植物", candidate.excerpt)
 
 
+class ReadOutcomeContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = extraction_module()
+        self.extractor = self.module.SearchExtractor()
+
+    def test_read_returns_readable_for_page_extract(self):
+        from src.search.models import ReadOutcomeStatus
+        response = _response(text="<html><head><title>光合作用</title></head><body><p>光合作用依赖光能。</p></body></html>")
+        with (
+            mock.patch.object(self.module.url_fetch, "try_proxied_get", return_value=response),
+            mock.patch.object(self.module.url_fetch.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]),
+        ):
+            outcome = self.extractor.read(
+                hit(raw_content=None, content=None),
+                query(),
+                timeout_seconds=4.0,
+                allow_network_read=True,
+            )
+        self.assertEqual(ReadOutcomeStatus.READABLE, outcome.status)
+        self.assertTrue(outcome.readable)
+        self.assertTrue(outcome.read_attempted)
+        self.assertIsNotNone(outcome.candidate)
+        self.assertIn("光合作用依赖光能", outcome.candidate.excerpt)
+
+    def test_read_returns_readable_for_provider_raw_content(self):
+        from src.search.models import ReadOutcomeStatus
+        outcome = self.extractor.read(
+            hit(raw_content="原生正文内容"),
+            query(),
+            timeout_seconds=4.0,
+            allow_network_read=True,
+        )
+        self.assertEqual(ReadOutcomeStatus.READABLE, outcome.status)
+        self.assertTrue(outcome.read_attempted)
+        self.assertEqual("原生正文内容", outcome.candidate.excerpt)
+
+    def test_read_returns_timeout_with_snippet_fallback(self):
+        from src.search.models import ReadOutcomeStatus
+        import requests
+        with (
+            mock.patch.object(self.module.url_fetch.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]),
+            mock.patch.object(self.module.url_fetch, "try_proxied_get", side_effect=requests.Timeout("timed out")),
+        ):
+            outcome = self.extractor.read(
+                hit(raw_content=None, content="fallback snippet"),
+                query(),
+                timeout_seconds=0.1,
+                allow_network_read=True,
+            )
+        self.assertEqual(ReadOutcomeStatus.TIMEOUT, outcome.status)
+        self.assertFalse(outcome.readable)
+        self.assertTrue(outcome.read_attempted)
+        self.assertIsNotNone(outcome.candidate)
+        self.assertEqual("fallback snippet", outcome.candidate.excerpt)
+
+    def test_read_returns_unsafe_url_without_candidate(self):
+        from src.search.models import ReadOutcomeStatus
+        outcome = self.extractor.read(
+            hit(url="http://192.168.1.1/secret", raw_content=None, content="snippet"),
+            query(),
+            timeout_seconds=4.0,
+            allow_network_read=True,
+        )
+        self.assertEqual(ReadOutcomeStatus.UNSAFE_URL, outcome.status)
+        self.assertFalse(outcome.readable)
+        self.assertIsNone(outcome.candidate)
+
+
 if __name__ == "__main__":
     unittest.main()
