@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -121,18 +122,15 @@ def _parse_timestamp(value: str) -> datetime:
 def repo_text_files(roots: Iterable[Path] | None = None) -> Iterable[Path]:
     """Yield repository text files whose content may embed a blind question."""
     for root in roots or (ROOT,):
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            try:
-                rel = path.relative_to(root)
-            except ValueError:
-                continue
-            if any(part in _EXCLUDE_DIR_PARTS for part in rel.parts):
-                continue
-            if path.suffix.lower() not in _TEXT_SUFFIXES:
-                continue
-            yield path
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _exc: None):
+            dirnames[:] = [
+                name for name in dirnames if name not in _EXCLUDE_DIR_PARTS
+            ]
+            for name in filenames:
+                path = Path(dirpath) / name
+                if path.suffix.lower() not in _TEXT_SUFFIXES:
+                    continue
+                yield path
 
 
 def repo_normalized_texts(
