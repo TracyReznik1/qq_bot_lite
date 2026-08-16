@@ -183,12 +183,14 @@ subset. It separately reports orchestrated/routed, attempted/orchestrated, and
 sufficient/attempted conversion rates, and timeout, no-result, partial,
 conflicting, and insufficient outcomes. Candidate URL, content read, semantic
 query, repair query, retrieval
-round, and hard-timeout violations use the immutable tier budgets:
+round, and total-response watchdog violations use the immutable tier budgets.
+The watchdog column is the derived maximum-request ceiling (the sum of every
+legal stage budget plus the scheduling margin), not an expected latency target:
 
-| tier | candidates | reads | semantic queries | repair queries | rounds | hard timeout |
+| tier | candidates | reads | semantic queries | repair queries | rounds | watchdog |
 |---|---:|---:|---:|---:|---:|---:|
-| light | 5 | 2 | 1 | 0 | 1 | 8 s |
-| standard | 8 | 5 | 4 | 1 | 2 | 20 s |
+| light | 5 | 2 | 1 | 0 | 1 | 34 s |
+| standard | 8 | 5 | 4 | 1 | 2 | 65 s |
 
 Citation/failure invariants are counted separately from model metrics. They
 cover provider/evidence contradictions, Claim-to-Evidence-to-final-URL mapping,

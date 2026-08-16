@@ -495,7 +495,7 @@ class IntegrityMetricTests(unittest.TestCase):
                 content_read_count=6,
                 retrieval_round_count=3,
                 adaptive_repair_round_started=True,
-                retrieval_pipeline_latency_ms=20_001,
+                total_response_latency_ms=65_001,
             ),
             {
                 "route": "light",
@@ -505,7 +505,7 @@ class IntegrityMetricTests(unittest.TestCase):
                 "retrieval_round_count": 1,
                 "semantic_query_count": 2,
                 "repair_query_count": 1,
-                "retrieval_pipeline_latency_ms": 8_001,
+                "total_response_latency_ms": 34_001,
             },
         ]
         violations = tool.budget_violations(traces)
@@ -515,7 +515,7 @@ class IntegrityMetricTests(unittest.TestCase):
         self.assertEqual(violations["content_read_count"], 1)
         self.assertEqual(violations["semantic_query_count"], 1)
         self.assertEqual(violations["repair_query_count"], 1)
-        self.assertEqual(violations["hard_timeout"], 2)
+        self.assertEqual(violations["watchdog"], 2)
 
     def test_round_accounting_initial_vs_repair(self):
         tool = evaluate_tool()

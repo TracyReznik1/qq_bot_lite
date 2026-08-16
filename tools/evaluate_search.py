@@ -102,7 +102,8 @@ EVIDENCE_STATES = {"sufficient", "partial", "conflicting", "insufficient"}
 PROVIDER_STATUSES = {"success", "empty", "timeout", "error", "not_configured", "unavailable"}
 FAILURE_CODES = {
     "provider_not_configured", "provider_unavailable", "provider_timeout",
-    "no_results", "content_unreadable", "insufficient_evidence",
+    "no_results", "content_unreadable", "judge_unavailable",
+    "insufficient_evidence",
     "partial_evidence", "source_conflict", "validation_failed", "user_forbid_web",
 }
 
@@ -149,7 +150,7 @@ TIER_BUDGETS: Mapping[str, Mapping[str, int]] = {
         "semantic_query_count": 1,
         "repair_query_count": 0,
         "retrieval_round_count": 1,
-        "hard_timeout_ms": 8_000,
+        "watchdog_ms": 34_000,
     },
     "standard": {
         "initial_query_count": 3,
@@ -158,7 +159,7 @@ TIER_BUDGETS: Mapping[str, Mapping[str, int]] = {
         "semantic_query_count": 4,
         "repair_query_count": 1,
         "retrieval_round_count": 2,
-        "hard_timeout_ms": 20_000,
+        "watchdog_ms": 65_000,
     },
 }
 
@@ -202,7 +203,8 @@ ANSWER_CLAIM_SCOPES = {
     "conflict_description_only", "no_external_factual_claims",
 }
 ANSWER_DISCLOSURE_CODES = {
-    "online_verification_failed", "partial_evidence", "source_conflict",
+    "online_verification_failed", "judge_unavailable", "partial_evidence",
+    "source_conflict",
     "validation_unavailable", "validation_failed", "user_forbid_web",
 }
 WARNING_CODES = {"high_consequence"}
@@ -1761,7 +1763,7 @@ def budget_violations(traces: Iterable[Any]) -> dict[str, int]:
     names = (
         "initial_query_count", "candidate_url_count", "content_read_count",
         "semantic_query_count", "repair_query_count", "retrieval_round_count",
-        "hard_timeout",
+        "watchdog",
     )
     violations = {name: 0 for name in names}
     for trace in traces:
@@ -1780,9 +1782,9 @@ def budget_violations(traces: Iterable[Any]) -> dict[str, int]:
         for name, value in observed.items():
             if value > budget[name]:
                 violations[name] += 1
-        latency = _field(trace, "retrieval_pipeline_latency_ms")
-        if _is_nonnegative_number(latency) and latency > budget["hard_timeout_ms"]:
-            violations["hard_timeout"] += 1
+        latency = _field(trace, "total_response_latency_ms")
+        if _is_nonnegative_number(latency) and latency > budget["watchdog_ms"]:
+            violations["watchdog"] += 1
     return violations
 
 
@@ -2443,6 +2445,8 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
     repair_started = trace.get("adaptive_repair_round_started") is True
     if repair_started != (trace.get("repair_used") is True):
         errors.append(f"{prefix} repair_used disagrees with adaptive repair round")
+    if repair_started and route != "standard":
+        errors.append(f"{prefix} adaptive repair round requires the standard route")
     if repair_started and _repair_query_count(trace) != 1:
         errors.append(f"{prefix} adaptive repair round requires exactly one repair query")
     if _repair_query_count(trace) > 0 and trace.get("retrieval_stop_reason") != "post_repair_stop":
