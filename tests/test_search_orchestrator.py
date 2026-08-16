@@ -1382,7 +1382,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertGreater(
             sum(1 for item in result.evidence.evidence_items if item.citable), 0
         )
-        self.assertIn("hard_deadline_exceeded", result.evidence.limitations)
+        self.assertIn("watchdog_timeout", result.evidence.limitations)
         self._assert_bundle_trace_mirror(result)
 
 

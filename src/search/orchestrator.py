@@ -493,10 +493,10 @@ class SearchOrchestrator:
         if bundle.evidence_state is not EvidenceState.SUFFICIENT:
             if SearchFailureCode.PROVIDER_TIMEOUT in trace.provider_failures:
                 failure_code = SearchFailureCode.PROVIDER_TIMEOUT
-                if "hard_deadline_exceeded" not in bundle.limitations:
+                if "watchdog_timeout" not in bundle.limitations:
                     bundle = replace(
                         bundle,
-                        limitations=tuple(dict.fromkeys((*bundle.limitations, "hard_deadline_exceeded"))),
+                        limitations=tuple(dict.fromkeys((*bundle.limitations, "watchdog_timeout"))),
                     )
             else:
                 failure_code = final_search_failure(
@@ -1152,17 +1152,11 @@ class SearchOrchestrator:
             analysis=analysis,
             failure=SearchFailureCode.PROVIDER_TIMEOUT,
             bundle=bundle,
-            limitation="hard_deadline_exceeded",
+            limitation="watchdog_timeout",
             gap=gap,
             repair=repair,
             initial_canonical_urls=initial_canonical_urls,
         )
-
-    def _remaining(self, deadline: float) -> float:
-        return max(deadline - self._monotonic(), 0.0)
-
-    def _expired(self, deadline: float) -> bool:
-        return self._remaining(deadline) <= 0
 
     def _assembler(self) -> EvidenceAssembler:
         return EvidenceAssembler(self._judge)
@@ -1282,7 +1276,7 @@ def _limitation_for_failure(failure: SearchFailureCode) -> str:
     return {
         SearchFailureCode.PROVIDER_NOT_CONFIGURED: "provider_not_configured",
         SearchFailureCode.PROVIDER_UNAVAILABLE: "provider_unavailable",
-        SearchFailureCode.PROVIDER_TIMEOUT: "hard_deadline_exceeded",
+        SearchFailureCode.PROVIDER_TIMEOUT: "watchdog_timeout",
         SearchFailureCode.NO_RESULTS: "no_results",
         SearchFailureCode.CONTENT_UNREADABLE: "content_unreadable",
         SearchFailureCode.JUDGE_UNAVAILABLE: "judge_unavailable",

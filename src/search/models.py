@@ -2002,7 +2002,7 @@ class SearchPipelineResult:
             EvidenceState.CONFLICTING,
         }:
             allowed.add(SearchFailureCode.VALIDATION_FAILED)
-        if any(lim in getattr(self.evidence, "limitations", ()) for lim in ("hard_deadline_exceeded", "provider_timeout", "watchdog_timeout")):
+        if any(lim in getattr(self.evidence, "limitations", ()) for lim in ("provider_timeout", "watchdog_timeout")):
             allowed.add(SearchFailureCode.PROVIDER_TIMEOUT)
         if evidence_state is EvidenceState.INSUFFICIENT:
             allowed |= {SearchFailureCode.PROVIDER_UNAVAILABLE, SearchFailureCode.PROVIDER_TIMEOUT, SearchFailureCode.NO_RESULTS, SearchFailureCode.CONTENT_UNREADABLE}

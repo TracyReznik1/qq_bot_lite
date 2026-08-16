@@ -72,7 +72,7 @@ AttemptFinishedObserver = Callable[[ProviderAttempt], None]
 
 
 class ProviderRegistry:
-    """Ordered registry of search providers supporting direct named search and legacy fallback."""
+    """Ordered registry of search providers supporting one named-provider attempt."""
 
     def __init__(self, providers: Iterable[SearchProvider] | None = None) -> None:
         self._providers: list[SearchProvider] = list(providers or ())
@@ -85,22 +85,6 @@ class ProviderRegistry:
 
     def configured(self) -> bool:
         return any(provider.readiness().configured for provider in self._providers)
-
-    def search(
-        self,
-        query: SearchQuery,
-        *,
-        tier: SearchTier,
-        max_results: int,
-        timeout_seconds: float,
-    ) -> ProviderResult:
-        """Preserve the original public ProviderResult contract."""
-        return self.search_with_attempts(
-            query,
-            tier=tier,
-            max_results=max_results,
-            timeout_seconds=timeout_seconds,
-        ).result
 
     def search_provider_with_attempts(
         self,
@@ -159,110 +143,6 @@ class ProviderRegistry:
         )
         attempts = (attempt,) if attempt is not None else ()
         return ProviderSearchOutcome(result, attempts)
-
-    def search_with_attempts(
-        self,
-        query: SearchQuery,
-        *,
-        tier: SearchTier,
-        max_results: int,
-        timeout_seconds: float,
-        on_attempt_started: AttemptStartedObserver | None = None,
-        on_attempt_finished: AttemptFinishedObserver | None = None,
-    ) -> ProviderSearchOutcome:
-        """Search with immutable, request-local attempt truth for orchestration."""
-        attempts: list[ProviderAttempt] = []
-        scheduled_result: ProviderResult | None = None
-        scheduled_attempt: ProviderAttempt | None = None
-        duration = max(float(timeout_seconds), 0.0)
-        deadline = time.monotonic() + duration
-        if duration <= 0:
-            return ProviderSearchOutcome(
-                ProviderResult(
-                    provider=self._readiness_provider_name(),
-                    status=ProviderStatus.TIMEOUT,
-                    hits=(),
-                    latency_ms=0,
-                ),
-                (),
-            )
-
-        primary = self._primary_provider()
-        fallback = self._fallback_provider()
-        if (
-            primary is not None
-            and primary.readiness().available
-            and self._remaining(deadline) > 0
-        ):
-            result, attempt = self._call_until_deadline(
-                primary,
-                query,
-                tier=tier,
-                max_results=max_results,
-                deadline=deadline,
-                on_attempt_started=on_attempt_started,
-                on_attempt_finished=on_attempt_finished,
-            )
-            scheduled_result = result
-            scheduled_attempt = attempt
-            if attempt is not None:
-                attempts.append(attempt)
-            if result.status is ProviderStatus.SUCCESS and result.hits:
-                return self._outcome(result, attempts)
-
-        remaining = self._remaining(deadline)
-        if fallback is not None and fallback.readiness().available and remaining > 0:
-            result, attempt = self._call_until_deadline(
-                fallback,
-                query,
-                tier=tier,
-                max_results=max_results,
-                deadline=deadline,
-                on_attempt_started=on_attempt_started,
-                on_attempt_finished=on_attempt_finished,
-            )
-            scheduled_result = result
-            scheduled_attempt = attempt
-            if attempt is not None:
-                attempts.append(attempt)
-            if result.status is ProviderStatus.SUCCESS and result.hits:
-                return self._outcome(result, attempts)
-
-        if scheduled_result is not None and scheduled_attempt is None:
-            return ProviderSearchOutcome(
-                ProviderResult(
-                    provider=scheduled_result.provider,
-                    status=scheduled_result.status,
-                    hits=scheduled_result.hits,
-                    latency_ms=(
-                        sum(attempt.latency_ms for attempt in attempts)
-                        + scheduled_result.latency_ms
-                    ),
-                ),
-                tuple(attempts),
-            )
-        if not attempts:
-            # No adapter was actually invoked: this is a readiness failure, not
-            # an attempted invocation.
-            return ProviderSearchOutcome(
-                ProviderResult(
-                    provider=self._readiness_provider_name(),
-                    status=ProviderStatus.NOT_CONFIGURED if not self.configured() else ProviderStatus.UNAVAILABLE,
-                    hits=(),
-                    latency_ms=0,
-                ),
-                (),
-            )
-        last_status = attempts[-1].status
-        return ProviderSearchOutcome(
-            ProviderResult(
-                provider=attempts[-1].provider,
-                status=last_status,
-                hits=(),
-                latency_ms=sum(attempt.latency_ms for attempt in attempts),
-            ),
-            tuple(attempts),
-        )
 
     def _call_until_deadline(
         self,
@@ -382,31 +262,8 @@ class ProviderRegistry:
             invocation_started=True,
         )
 
-    @staticmethod
-    def _outcome(result: ProviderResult, attempts: list[ProviderAttempt]) -> ProviderSearchOutcome:
-        return ProviderSearchOutcome(
-            ProviderResult(
-                provider=result.provider,
-                status=result.status,
-                hits=result.hits,
-                latency_ms=sum(attempt.latency_ms for attempt in attempts),
-            ),
-            tuple(attempts),
-        )
-
-    def _primary_provider(self) -> SearchProvider | None:
-        return self._provider_named("ddgs")
-
-    def _fallback_provider(self) -> SearchProvider | None:
-        return self._provider_named("tavily")
-
     def _provider_named(self, name: str) -> SearchProvider | None:
         return next(
             (provider for provider in self._providers if provider.name == name),
             None,
         )
-
-    def _readiness_provider_name(self) -> str:
-        if self._providers:
-            return self._providers[0].name
-        return "registry"
