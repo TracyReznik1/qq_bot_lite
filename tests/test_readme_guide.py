@@ -196,11 +196,16 @@ class ReadmeGuideTests(unittest.TestCase):
             self.readme,
         )
 
-    def test_readme_documents_ddgs_primary_tavily_fallback(self):
-        self.assertIn("DDGS 是主搜索提供者", self.readme)
-        self.assertIn("Tavily", self.readme)
+    def test_readme_documents_tavily_primary_ddgs_fallback(self):
+        self.assertIn("Tavily 是主搜索提供者", self.readme)
+        self.assertIn("DDGS", self.readme)
         self.assertIn("回退", self.readme)
-        self.assertNotIn("Tavily 作为主搜索提供者", self.readme)
+        self.assertNotIn("DDGS 是主搜索提供者", self.readme)
+        self.assertIn("DDGS 的阶段超时统一为 30 秒", self.readme)
+        self.assertIn(
+            "`light` 约 58 秒、`standard` 约 112 秒",
+            self.readme,
+        )
         self.assertIn(
             "返回明确的在线检索失败披露（不同路径会说明在线检索未完成或无法完成在线核验）",
             self.readme,
