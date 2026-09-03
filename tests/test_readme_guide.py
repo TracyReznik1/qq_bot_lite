@@ -203,6 +203,14 @@ class ReadmeGuideTests(unittest.TestCase):
         self.assertNotIn("DDGS 是主搜索提供者", self.readme)
         self.assertIn("DDGS 的阶段超时统一为 30 秒", self.readme)
         self.assertIn(
+            "不会向 QQ 用户展示引用编号、来源标题或 URL",
+            self.readme,
+        )
+        self.assertIn(
+            "证据映射仅保留在后台校验与 Trace 中",
+            self.readme,
+        )
+        self.assertIn(
             "`light` 约 58 秒、`standard` 约 112 秒",
             self.readme,
         )
