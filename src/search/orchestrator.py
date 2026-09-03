@@ -574,23 +574,23 @@ class SearchOrchestrator:
         max_results = max(int(config.search_max_results or 1), 1)
 
         if round_kind is SearchRoundKind.INITIAL:
-            ddgs_timeout = float(budget_policy.initial_ddgs_seconds)
             tavily_timeout = float(budget_policy.initial_tavily_seconds)
+            ddgs_timeout = float(budget_policy.initial_ddgs_seconds)
         else:
-            ddgs_timeout = float(budget_policy.repair_ddgs_seconds)
             tavily_timeout = float(budget_policy.repair_tavily_seconds)
+            ddgs_timeout = float(budget_policy.repair_ddgs_seconds)
 
-        # Batch 1: DDGS for all queries concurrently
-        ddgs_trackers: dict[str, _QueryAttemptTracker] = {
+        # Batch 1: Tavily for all queries concurrently
+        tavily_trackers: dict[str, _QueryAttemptTracker] = {
             query.query_id: _QueryAttemptTracker(query) for query in queries
         }
-        ddgs_outcomes = self._dispatch_provider_batch(
-            "ddgs",
+        tavily_outcomes = self._dispatch_provider_batch(
+            "tavily",
             queries,
             route,
             max_results,
-            ddgs_timeout,
-            ddgs_trackers,
+            tavily_timeout,
+            tavily_trackers,
         )
 
         unresolved_queries: list[SearchQuery] = []
@@ -598,11 +598,19 @@ class SearchOrchestrator:
 
         now = self._monotonic()
         for query in queries:
-            outcome = ddgs_outcomes.get(query.query_id)
-            tracker = ddgs_trackers[query.query_id]
+            outcome = tavily_outcomes.get(query.query_id)
+            tracker = tavily_trackers[query.query_id]
             attempts = outcome.attempts if outcome is not None else tracker.snapshot(now)
             status = outcome.result.status if outcome is not None else ProviderStatus.TIMEOUT
-            hits = outcome.result.hits if outcome is not None and outcome.result.status is ProviderStatus.SUCCESS else ()
+            hits = (
+                tuple(
+                    hit
+                    for hit in outcome.result.hits
+                    if canonicalize_public_http_url(hit.url)
+                )
+                if outcome is not None and status is ProviderStatus.SUCCESS
+                else ()
+            )
 
             readiness_failure = None
             if status is ProviderStatus.SUCCESS and hits:
@@ -620,78 +628,93 @@ class SearchOrchestrator:
             else:
                 query_status = QueryOutcomeStatus.ERROR
 
-            interim_outcomes[query.query_id] = (query_status, hits, attempts, readiness_failure)
+            interim_outcomes[query.query_id] = (
+                query_status,
+                hits,
+                attempts,
+                readiness_failure,
+            )
             if query_status is not QueryOutcomeStatus.RESOLVED:
                 unresolved_queries.append(query)
 
-        # Batch 2: Tavily ONLY for unresolved queries concurrently
-        tavily_trackers: dict[str, _QueryAttemptTracker] = {
+        # Batch 2: DDGS ONLY for unresolved queries concurrently
+        ddgs_trackers: dict[str, _QueryAttemptTracker] = {
             query.query_id: _QueryAttemptTracker(query) for query in unresolved_queries
         }
-        tavily_outcomes: dict[str, ProviderSearchOutcome] = {}
-        if unresolved_queries and tavily_timeout > 0:
-            tavily_outcomes = self._dispatch_provider_batch(
-                "tavily",
+        ddgs_outcomes: dict[str, ProviderSearchOutcome] = {}
+        if unresolved_queries and ddgs_timeout > 0:
+            ddgs_outcomes = self._dispatch_provider_batch(
+                "ddgs",
                 unresolved_queries,
                 route,
                 max_results,
-                tavily_timeout,
-                tavily_trackers,
+                ddgs_timeout,
+                ddgs_trackers,
             )
 
         now = self._monotonic()
         final_query_outcomes: list[QueryOutcome] = []
         for query in queries:
-            ddgs_status, ddgs_hits, ddgs_attempts, ddgs_readiness = interim_outcomes[query.query_id]
-            if ddgs_status is QueryOutcomeStatus.RESOLVED:
-                self._record_query_attempts(trace, query, ddgs_attempts)
+            (
+                tavily_status,
+                tavily_hits,
+                tavily_attempts,
+                tavily_readiness,
+            ) = interim_outcomes[query.query_id]
+            if tavily_status is QueryOutcomeStatus.RESOLVED:
+                self._record_query_attempts(trace, query, tavily_attempts)
                 final_query_outcomes.append(
                     QueryOutcome(
                         query=query,
                         status=QueryOutcomeStatus.RESOLVED,
-                        hits=ddgs_hits,
-                        attempts=ddgs_attempts,
-                        readiness_failure=ddgs_readiness,
+                        hits=tavily_hits,
+                        attempts=tavily_attempts,
+                        readiness_failure=tavily_readiness,
                     )
                 )
             else:
-                tavily_outcome = tavily_outcomes.get(query.query_id)
-                tavily_tracker = tavily_trackers.get(query.query_id)
-                tavily_attempts = (
-                    tavily_outcome.attempts
-                    if tavily_outcome is not None
-                    else tavily_tracker.snapshot(now)
-                    if tavily_tracker is not None
+                ddgs_outcome = ddgs_outcomes.get(query.query_id)
+                ddgs_tracker = ddgs_trackers.get(query.query_id)
+                ddgs_attempts = (
+                    ddgs_outcome.attempts
+                    if ddgs_outcome is not None
+                    else ddgs_tracker.snapshot(now)
+                    if ddgs_tracker is not None
                     else ()
                 )
-                tavily_status = (
-                    tavily_outcome.result.status
-                    if tavily_outcome is not None
+                ddgs_status = (
+                    ddgs_outcome.result.status
+                    if ddgs_outcome is not None
                     else ProviderStatus.TIMEOUT
                 )
-                tavily_hits = (
-                    tavily_outcome.result.hits
-                    if tavily_outcome is not None and tavily_outcome.result.status is ProviderStatus.SUCCESS
+                ddgs_hits = (
+                    tuple(
+                        hit
+                        for hit in ddgs_outcome.result.hits
+                        if canonicalize_public_http_url(hit.url)
+                    )
+                    if ddgs_outcome is not None
+                    and ddgs_status is ProviderStatus.SUCCESS
                     else ()
                 )
-                combined_attempts = (*ddgs_attempts, *tavily_attempts)
+                combined_attempts = (*tavily_attempts, *ddgs_attempts)
                 self._record_query_attempts(trace, query, combined_attempts)
 
                 readiness_failure = None
-                if tavily_status is ProviderStatus.SUCCESS and tavily_hits:
+                if ddgs_status is ProviderStatus.SUCCESS and ddgs_hits:
                     final_status = QueryOutcomeStatus.RESOLVED
-                    final_hits = tavily_hits
-                elif tavily_status is ProviderStatus.EMPTY:
+                    final_hits = ddgs_hits
+                elif ddgs_status is ProviderStatus.EMPTY:
                     final_status = QueryOutcomeStatus.EMPTY
                     final_hits = ()
-                elif tavily_status is ProviderStatus.TIMEOUT:
+                elif ddgs_status is ProviderStatus.TIMEOUT:
                     final_status = QueryOutcomeStatus.TIMEOUT
                     final_hits = ()
-                elif tavily_status is ProviderStatus.NOT_CONFIGURED:
+                elif ddgs_status is ProviderStatus.NOT_CONFIGURED:
                     final_status = QueryOutcomeStatus.UNAVAILABLE
                     final_hits = ()
                     readiness_failure = SearchFailureCode.PROVIDER_NOT_CONFIGURED
-                elif tavily_status is ProviderStatus.UNAVAILABLE:
+                elif ddgs_status is ProviderStatus.UNAVAILABLE:
                     final_status = QueryOutcomeStatus.UNAVAILABLE
                     final_hits = ()
                     readiness_failure = SearchFailureCode.PROVIDER_UNAVAILABLE
@@ -1378,12 +1401,7 @@ def _build_production_orchestrator() -> SearchOrchestrator:
     router = RetrievalBenefitRouter()
     planner = SearchPlanner(llm)
     judge = LLMEvidenceJudge(llm)
-    providers: list[Any] = [
-        DDGSSearchProvider(
-            proxy_url=config.proxy_url,
-            timeout_seconds=config.request_timeout,
-        )
-    ]
+    providers: list[Any] = []
     if config.tavily_api_key:
         providers.append(
             TavilySearchProvider(
@@ -1391,6 +1409,12 @@ def _build_production_orchestrator() -> SearchOrchestrator:
                 proxy_url=config.proxy_url,
             )
         )
+    providers.append(
+        DDGSSearchProvider(
+            proxy_url=config.proxy_url,
+            timeout_seconds=config.request_timeout,
+        )
+    )
     return SearchOrchestrator(
         request_analyzer=request_analyzer,
         router=router,

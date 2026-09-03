@@ -787,7 +787,10 @@ class OrchestratorFailureTests(unittest.TestCase):
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(_FakeProvider(hits=()),),
+            providers=(
+                _FakeProvider(hits=()),
+                _FakeProvider(name="ddgs", hits=()),
+            ),
             extractor=_FakeExtractor(),
         )
 
@@ -798,11 +801,12 @@ class OrchestratorFailureTests(unittest.TestCase):
 
     def test_unavailable_failure_seals_bundle_and_trace_from_same_state(self):
         class UnavailableProvider:
-            name = "tavily"
+            def __init__(self, name):
+                self.name = name
 
             def readiness(self):
                 return ProviderReadiness(
-                    "tavily", True, False, SearchFailureCode.PROVIDER_UNAVAILABLE
+                    self.name, True, False, SearchFailureCode.PROVIDER_UNAVAILABLE
                 )
 
             def search(self, *_args, **_kwargs):
@@ -813,7 +817,7 @@ class OrchestratorFailureTests(unittest.TestCase):
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(UnavailableProvider(),),
+            providers=(UnavailableProvider("tavily"), UnavailableProvider("ddgs")),
             extractor=_FakeExtractor(),
         )
 
@@ -824,22 +828,23 @@ class OrchestratorFailureTests(unittest.TestCase):
 
     def test_provider_failure_never_changes_route_to_skip(self):
         class FailingProvider:
-            name = "tavily"
+            def __init__(self, name):
+                self.name = name
 
             def readiness(self):
-                return ProviderReadiness("tavily", True, True, None)
+                return ProviderReadiness(self.name, True, True, None)
 
             def search(self, query, *, tier, max_results, timeout_seconds):
                 del query, tier, max_results, timeout_seconds
                 from src.search.models import ProviderResult
-                return ProviderResult("tavily", ProviderStatus.ERROR, (), 1)
+                return ProviderResult(self.name, ProviderStatus.ERROR, (), 1)
 
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("light")),
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(FailingProvider(),),
+            providers=(FailingProvider("tavily"), FailingProvider("ddgs")),
             extractor=_FakeExtractor(),
             clock=FakeClock(),
         )
@@ -999,7 +1004,10 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(SlowProvider(hits=[_hit(raw_content="正文")]),),
+            providers=(
+                SlowProvider(hits=[_hit(raw_content="正文")]),
+                SlowProvider(name="ddgs", hits=[_hit(raw_content="正文")]),
+            ),
             extractor=_FakeExtractor(),
         )
 
@@ -1048,7 +1056,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(provider,),
+            providers=(provider, _FakeProvider(name="ddgs", hits=())),
             extractor=_FakeExtractor(),
         )
 
@@ -1129,7 +1137,7 @@ class OrchestratorDeadlineTests(unittest.TestCase):
             router=_make_router(router_payload("light")),
             planner=_make_planner(),
             judge=_FakeJudge(),
-            providers=(provider,),
+            providers=(provider, _FakeProvider(name="ddgs", hits=())),
             extractor=_FakeExtractor(),
         )
         actual_remaining = orchestrator._registry._remaining
@@ -1163,29 +1171,29 @@ class OrchestratorDeadlineTests(unittest.TestCase):
 
     def test_fallback_timeout_keeps_completed_primary_and_real_fallback_truth(self):
         class ErrorPrimary:
-            name = "ddgs"
-
-            def readiness(self):
-                return ProviderReadiness("ddgs", True, True, None)
-
-            def search(self, _query, **_kwargs):
-                from src.search.models import ProviderResult
-                return ProviderResult("ddgs", ProviderStatus.ERROR, (), 1)
-
-        class SlowFallback:
             name = "tavily"
 
             def readiness(self):
                 return ProviderReadiness("tavily", True, True, None)
 
+            def search(self, _query, **_kwargs):
+                from src.search.models import ProviderResult
+                return ProviderResult("tavily", ProviderStatus.ERROR, (), 1)
+
+        class SlowFallback:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
             def search(self, search_query, **_kwargs):
                 time.sleep(0.25)
                 from src.search.models import ProviderHit, ProviderResult
                 provider_hit = ProviderHit(
-                    "tavily", search_query.query_id, "late", "https://late.example/item",
+                    "ddgs", search_query.query_id, "late", "https://late.example/item",
                     "late", None, None, None, (),
                 )
-                return ProviderResult("tavily", ProviderStatus.SUCCESS, (provider_hit,), 1)
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (provider_hit,), 1)
 
         orchestrator = self.module.SearchOrchestrator(
             request_analyzer=_make_request_analyzer(router_payload("light")),
@@ -1203,8 +1211,8 @@ class OrchestratorDeadlineTests(unittest.TestCase):
         self.assertEqual(
             [(attempt.provider, attempt.status) for attempt in result.trace.provider_attempts],
             [
-                ("ddgs", ProviderStatus.ERROR),
-                ("tavily", ProviderStatus.TIMEOUT),
+                ("tavily", ProviderStatus.ERROR),
+                ("ddgs", ProviderStatus.TIMEOUT),
             ],
         )
         self._assert_bundle_trace_mirror(result)
@@ -1808,7 +1816,7 @@ class OrchestratorProductionGraphTests(unittest.TestCase):
         self.assertEqual([provider.name for provider in orchestrator._providers], ["ddgs"])
         tavily_constructor.assert_not_called()
 
-    def test_production_provider_graph_is_ddgs_then_tavily(self):
+    def test_production_provider_graph_is_tavily_then_ddgs(self):
         module = orchestrator_module()
         fake_config = SimpleNamespace(
             tavily_api_key="test-key",
@@ -1831,7 +1839,7 @@ class OrchestratorProductionGraphTests(unittest.TestCase):
 
         self.assertEqual(
             [provider.name for provider in orchestrator._providers],
-            ["ddgs", "tavily"],
+            ["tavily", "ddgs"],
         )
 
 
@@ -1853,18 +1861,19 @@ class RepairBudgetAndStopTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _per_query_provider():
+    def _per_query_provider(name="tavily"):
         from src.search.models import ProviderHit, ProviderResult
 
         class PerQueryProvider:
-            name = "tavily"
+            def __init__(self, provider_name):
+                self.name = provider_name
 
             def readiness(self):
-                return ProviderReadiness("tavily", True, True, None)
+                return ProviderReadiness(self.name, True, True, None)
 
             def search(self, search_query, **_kwargs):
                 hit = ProviderHit(
-                    "tavily",
+                    self.name,
                     search_query.query_id,
                     search_query.query_id,
                     f"https://example.com/{search_query.query_id}",
@@ -1874,25 +1883,25 @@ class RepairBudgetAndStopTests(unittest.TestCase):
                     "正文",
                     (),
                 )
-                return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+                return ProviderResult(self.name, ProviderStatus.SUCCESS, (hit,), 1)
 
-        return PerQueryProvider()
+        return PerQueryProvider(name)
 
     def test_full_capacity_repair_uses_request_wide_query_indexes(self):
         m = importlib.import_module("src.search.models")
         from src.search.models import ProviderResult
 
-        class DdgsEmptyProvider:
-            name = "ddgs"
+        class TavilyEmptyProvider:
+            name = "tavily"
 
             def readiness(self):
-                return ProviderReadiness("ddgs", True, True, None)
+                return ProviderReadiness("tavily", True, True, None)
 
             def search(self, _query, **_kwargs):
-                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+                return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
 
         orchestrator = self._orchestrator(
-            providers=(DdgsEmptyProvider(), self._per_query_provider()),
+            providers=(TavilyEmptyProvider(), self._per_query_provider("ddgs")),
             judge=_FakeJudge(supported_topic_ids=()),
         )
         result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))
@@ -1915,17 +1924,17 @@ class RepairBudgetAndStopTests(unittest.TestCase):
     def test_provider_fallback_does_not_increment_semantic_query_count(self):
         from src.search.models import ProviderResult
 
-        class DdgsEmptyProvider:
-            name = "ddgs"
+        class TavilyEmptyProvider:
+            name = "tavily"
 
             def readiness(self):
-                return ProviderReadiness("ddgs", True, True, None)
+                return ProviderReadiness("tavily", True, True, None)
 
             def search(self, _query, **_kwargs):
-                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+                return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
 
         orchestrator = self._orchestrator(
-            providers=(DdgsEmptyProvider(), self._per_query_provider()),
+            providers=(TavilyEmptyProvider(), self._per_query_provider("ddgs")),
             judge=_FakeJudge(),
         )
         result = orchestrator.run(request("Rust 和 Go 的并发模型有什么区别"))

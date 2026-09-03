@@ -1,4 +1,4 @@
-"""Unit tests for independent DDGS-first and Tavily fallback query batches."""
+"""Unit tests for independent Tavily-first and DDGS fallback query batches."""
 
 import unittest
 from datetime import date
@@ -12,9 +12,14 @@ from src.search.models import (
     ProviderReadiness,
     ProviderResult,
     ProviderStatus,
+    QueryPurpose,
     RequestSource,
     RetrievalRequest,
+    SearchFailureCode,
+    SearchQuery,
+    SearchRoundKind,
     SearchTier,
+    SearchTrace,
 )
 from src.search.orchestrator import SearchOrchestrator
 from tests.search_fakes import FakeClock
@@ -138,85 +143,268 @@ class ProviderBatchOrchestrationTests(unittest.TestCase):
             extractor=_FakeExtractor(),
         )
 
-    def test_ddgs_resolves_all_queries_tavily_not_invoked(self):
-        ddgs_calls = []
+    def test_tavily_resolves_all_queries_ddgs_not_invoked(self):
         tavily_calls = []
-
-        class MockDDGS:
-            name = "ddgs"
-            def readiness(self):
-                return ProviderReadiness("ddgs", True, True, None)
-            def search(self, query, **kwargs):
-                ddgs_calls.append(query.query_id)
-                hit = _hit(url=f"https://example.com/{query.query_id}", query_id=query.query_id, provider="ddgs")
-                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
+        ddgs_calls = []
 
         class MockTavily:
             name = "tavily"
+
             def readiness(self):
                 return ProviderReadiness("tavily", True, True, None)
+
             def search(self, query, **kwargs):
                 tavily_calls.append(query.query_id)
-                return ProviderResult("tavily", ProviderStatus.SUCCESS, (), 1)
-
-        orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
-        result = orchestrator.run(_request())
-        self.assertTrue(len(ddgs_calls) > 0)
-        self.assertEqual(len(tavily_calls), 0)
-        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
-
-    def test_ddgs_fails_one_query_only_unresolved_query_falls_back_to_tavily(self):
-        ddgs_calls = []
-        tavily_calls = []
-
-        class MockDDGS:
-            name = "ddgs"
-            def readiness(self):
-                return ProviderReadiness("ddgs", True, True, None)
-            def search(self, query, **kwargs):
-                ddgs_calls.append(query.query_id)
-                if query.query_id == "initial-1":
-                    hit = _hit(url=f"https://example.com/{query.query_id}", query_id=query.query_id, provider="ddgs")
-                    return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
-                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
-
-        class MockTavily:
-            name = "tavily"
-            def readiness(self):
-                return ProviderReadiness("tavily", True, True, None)
-            def search(self, query, **kwargs):
-                tavily_calls.append(query.query_id)
-                hit = _hit(url=f"https://tavily.example.com/{query.query_id}", query_id=query.query_id, provider="tavily")
+                hit = _hit(
+                    url=f"https://tavily.example.com/{query.query_id}",
+                    query_id=query.query_id,
+                    provider="tavily",
+                )
                 return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
 
-        orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
-        result = orchestrator.run(_request())
-        self.assertIn("initial-1", ddgs_calls)
-        self.assertNotIn("initial-1", tavily_calls)
-        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
-
-    def test_sibling_query_failure_isolated(self):
         class MockDDGS:
             name = "ddgs"
+
             def readiness(self):
                 return ProviderReadiness("ddgs", True, True, None)
+
             def search(self, query, **kwargs):
-                if query.query_id == "initial-1":
-                    hit = _hit(url="https://example.com/q1", query_id=query.query_id, provider="ddgs")
-                    return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
-                return ProviderResult("ddgs", ProviderStatus.TIMEOUT, (), 1)
+                ddgs_calls.append(query.query_id)
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (), 1)
+
+        orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
+        result = orchestrator.run(_request())
+
+        self.assertTrue(tavily_calls)
+        self.assertEqual([], ddgs_calls)
+        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertEqual("tavily", result.trace.provider_attempts[0].provider)
+
+    def test_tavily_fails_one_query_only_unresolved_query_falls_back_to_ddgs(self):
+        tavily_calls = []
+        ddgs_calls = []
 
         class MockTavily:
             name = "tavily"
+
             def readiness(self):
                 return ProviderReadiness("tavily", True, True, None)
+
             def search(self, query, **kwargs):
-                return ProviderResult("tavily", ProviderStatus.TIMEOUT, (), 1)
+                tavily_calls.append(query.query_id)
+                if query.query_id == "initial-1":
+                    hit = _hit(
+                        url=f"https://tavily.example.com/{query.query_id}",
+                        query_id=query.query_id,
+                        provider="tavily",
+                    )
+                    return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+                return ProviderResult("tavily", ProviderStatus.EMPTY, (), 1)
+
+        class MockDDGS:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, query, **kwargs):
+                ddgs_calls.append(query.query_id)
+                hit = _hit(
+                    url=f"https://example.com/{query.query_id}",
+                    query_id=query.query_id,
+                    provider="ddgs",
+                )
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
 
         orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
         result = orchestrator.run(_request())
-        # Sibling failure of query 2/3 does not discard query 1 hits
-        candidate_urls = [item.canonical_url for item in result.evidence.evidence_items]
+
+        self.assertIn("initial-1", tavily_calls)
+        self.assertNotIn("initial-1", ddgs_calls)
+        self.assertEqual(set(tavily_calls) - {"initial-1"}, set(ddgs_calls))
+        self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
+
+    def test_each_unresolved_tavily_status_falls_back_to_ddgs(self):
+        statuses = (
+            ProviderStatus.EMPTY,
+            ProviderStatus.TIMEOUT,
+            ProviderStatus.ERROR,
+            ProviderStatus.UNAVAILABLE,
+            ProviderStatus.NOT_CONFIGURED,
+        )
+        for tavily_status in statuses:
+            with self.subTest(status=tavily_status):
+                ddgs_calls = []
+
+                class MockTavily:
+                    name = "tavily"
+
+                    def readiness(self):
+                        configured = tavily_status is not ProviderStatus.NOT_CONFIGURED
+                        available = tavily_status not in {
+                            ProviderStatus.NOT_CONFIGURED,
+                            ProviderStatus.UNAVAILABLE,
+                        }
+                        reason = (
+                            None
+                            if available
+                            else SearchFailureCode.PROVIDER_UNAVAILABLE
+                            if configured
+                            else SearchFailureCode.PROVIDER_NOT_CONFIGURED
+                        )
+                        return ProviderReadiness(
+                            "tavily", configured, available, reason
+                        )
+
+                    def search(self, query, **kwargs):
+                        return ProviderResult("tavily", tavily_status, (), 1)
+
+                class MockDDGS:
+                    name = "ddgs"
+
+                    def readiness(self):
+                        return ProviderReadiness("ddgs", True, True, None)
+
+                    def search(self, query, **kwargs):
+                        ddgs_calls.append(query.query_id)
+                        hit = _hit(
+                            url=f"https://example.com/{query.query_id}",
+                            query_id=query.query_id,
+                            provider="ddgs",
+                        )
+                        return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
+
+                self._make_orchestrator((MockTavily(), MockDDGS())).run(_request())
+                self.assertTrue(ddgs_calls)
+
+    def test_tavily_invalid_urls_fall_back_to_ddgs(self):
+        ddgs_calls = []
+
+        class MockTavily:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, query, **kwargs):
+                invalid = _hit(
+                    url="ftp://example.com/private",
+                    query_id=query.query_id,
+                    provider="tavily",
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (invalid,), 1)
+
+        class MockDDGS:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, query, **kwargs):
+                ddgs_calls.append(query.query_id)
+                hit = _hit(
+                    url=f"https://example.com/{query.query_id}",
+                    query_id=query.query_id,
+                    provider="ddgs",
+                )
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
+
+        orchestrator = self._make_orchestrator((MockTavily(), MockDDGS()))
+        orchestrator.run(_request())
+        self.assertTrue(ddgs_calls)
+
+    def test_repair_round_uses_tavily_before_ddgs(self):
+        for tavily_status, expected_providers in (
+            (ProviderStatus.SUCCESS, ["tavily"]),
+            (ProviderStatus.EMPTY, ["tavily", "ddgs"]),
+        ):
+            with self.subTest(status=tavily_status):
+                calls = []
+
+                class MockTavily:
+                    name = "tavily"
+
+                    def readiness(self):
+                        return ProviderReadiness("tavily", True, True, None)
+
+                    def search(self, query, **kwargs):
+                        calls.append(("tavily", query.query_id))
+                        hits = (
+                            (_hit(
+                                url="https://tavily.example.com/repair",
+                                query_id=query.query_id,
+                                provider="tavily",
+                            ),)
+                            if tavily_status is ProviderStatus.SUCCESS
+                            else ()
+                        )
+                        return ProviderResult("tavily", tavily_status, hits, 1)
+
+                class MockDDGS:
+                    name = "ddgs"
+
+                    def readiness(self):
+                        return ProviderReadiness("ddgs", True, True, None)
+
+                    def search(self, query, **kwargs):
+                        calls.append(("ddgs", query.query_id))
+                        return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+
+                orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
+                query = SearchQuery(
+                    query_id="repair-1",
+                    query_index=1,
+                    round_kind=SearchRoundKind.REPAIR,
+                    purpose=QueryPurpose.REPAIR,
+                    text="补充",
+                    target_topic_ids=("topic-1",),
+                )
+                trace = SearchTrace(
+                    "req-repair", RequestSource.CHAT, SearchTier.STANDARD
+                )
+                orchestrator._run_provider_round(
+                    (query,),
+                    SearchTier.STANDARD,
+                    SearchRoundKind.REPAIR,
+                    trace,
+                )
+
+                self.assertEqual(
+                    expected_providers,
+                    [provider for provider, _query_id in calls],
+                )
+
+    def test_sibling_query_failure_isolated(self):
+        class MockTavily:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, query, **kwargs):
+                if query.query_id == "initial-1":
+                    hit = _hit(
+                        url="https://example.com/q1",
+                        query_id=query.query_id,
+                        provider="tavily",
+                    )
+                    return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+                return ProviderResult("tavily", ProviderStatus.TIMEOUT, (), 1)
+
+        class MockDDGS:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, query, **kwargs):
+                return ProviderResult("ddgs", ProviderStatus.TIMEOUT, (), 1)
+
+        orchestrator = self._make_orchestrator((MockDDGS(), MockTavily()))
+        result = orchestrator.run(_request())
+        candidate_urls = [
+            item.canonical_url for item in result.evidence.evidence_items
+        ]
         self.assertIn("https://example.com/q1", candidate_urls)
 
 
