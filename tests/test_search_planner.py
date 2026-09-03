@@ -24,6 +24,7 @@ from src.search.models import (
     RiskLevel,
     SearchTier,
     SearchRoundKind,
+    SearchTimeScope,
     SearchTrace,
     SkipReason,
     SourceRequirement,
@@ -56,6 +57,7 @@ def request(question: str) -> RetrievalRequest:
 
 def retrieval_context(
     source_requirement: SourceRequirement = SourceRequirement.ANY_RELEVANT,
+    **kwargs,
 ) -> RetrievalContext:
     return RetrievalContext(
         must_search=True,
@@ -64,6 +66,7 @@ def retrieval_context(
         external_fact_required=True,
         complexity_codes=(),
         source_requirement=source_requirement,
+        **kwargs,
     )
 
 
@@ -243,26 +246,64 @@ class PlannerDirectQueryContractTests(unittest.TestCase):
         self.assertEqual(1, len(plan.initial_queries))
         self.assertIs(plan.initial_queries[0].purpose, QueryPurpose.DIRECT)
 
-    def test_current_bounds_do_not_add_queries_and_bound_the_direct_query(self):
+    def test_current_freshness_does_not_invent_today_publication_bounds(self):
         model = StaticPlannerModel(strict_payload(
-            topics=(model_topic("Python 并发 API"),),
-            supplements=(
-                {"purpose": "primary", "text": "Python 并发 API 官方文档", "target_topic_ids": ["topic-1"], "date_from": None, "date_to": None},
-            ),
+            topics=(model_topic("晋级队伍"),),
+            supplements=(),
         ))
-        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
-        stable = planner.plan(
-            request("比较 Python 并发 API"), standard_decision(),
-            retrieval_context(), freshness_context(),
-        )
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 9, 3))
+
         current = planner.plan(
-            request("比较 Python 并发 API"), standard_decision(),
-            retrieval_context(), freshness_context(FreshnessRequirement.CURRENT),
+            request("截至今天有哪些队伍晋级"),
+            light_decision(),
+            retrieval_context(search_keywords="截至 2026-09-03 晋级队伍"),
+            freshness_context(FreshnessRequirement.CURRENT),
         )
 
-        self.assertEqual(len(stable.initial_queries), len(current.initial_queries))
-        self.assertEqual(date(2026, 7, 29), current.initial_queries[0].date_from)
-        self.assertEqual(date(2026, 7, 29), current.initial_queries[0].date_to)
+        self.assertEqual("截至 2026-09-03 晋级队伍", current.initial_queries[0].text)
+        self.assertIsNone(current.initial_queries[0].date_from)
+        self.assertIsNone(current.initial_queries[0].date_to)
+
+    def test_explicit_publication_bounds_apply_to_direct_query(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel(), today_provider=lambda: date(2026, 9, 3))
+        plan = planner.plan(
+            request("今天发布了哪些新闻"),
+            light_decision(),
+            retrieval_context(
+                search_keywords="2026-09-03 发布 新闻",
+                time_scope=SearchTimeScope.TODAY,
+                publication_date_from=date(2026, 9, 3),
+                publication_date_to=date(2026, 9, 4),
+            ),
+            freshness_context(FreshnessRequirement.CURRENT),
+        )
+        self.assertEqual(date(2026, 9, 3), plan.initial_queries[0].date_from)
+        self.assertEqual(date(2026, 9, 4), plan.initial_queries[0].date_to)
+
+    def test_event_year_does_not_become_publication_window(self):
+        model = StaticPlannerModel(strict_payload(
+            topics=(model_topic("CN 晋级队伍"),),
+            supplements=(),
+        ))
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 9, 3))
+
+        plan = planner.plan(
+            request("今年参加上海冠军赛的队伍"),
+            light_decision(),
+            retrieval_context(
+                search_keywords="2026 无畏契约 上海冠军赛 CN 晋级队伍",
+                time_scope=SearchTimeScope.YEAR,
+                time_scope_text="2026年",
+            ),
+            freshness_context(),
+        )
+
+        self.assertEqual(
+            "2026 无畏契约 上海冠军赛 CN 晋级队伍",
+            plan.initial_queries[0].text,
+        )
+        self.assertIsNone(plan.initial_queries[0].date_from)
+        self.assertIsNone(plan.initial_queries[0].date_to)
 
     def test_version_context_overrides_model_topics_and_drops_unversioned_supplements(self):
         model = StaticPlannerModel(strict_payload(
@@ -791,8 +832,9 @@ class PlannerDegradationTests(unittest.TestCase):
         planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
         plan = plan_with_context(planner, request("北京今天有什么新闻"), d)
 
-        self.assertNotIn("北京错误单边主查询", {query.text for query in plan.initial_queries})
-        self.assertNotIn("北京错误倒序独立查询", {query.text for query in plan.initial_queries})
+        self.assertIn("北京错误单边主查询", {query.text for query in plan.initial_queries})
+        self.assertIn("北京错误倒序独立查询", {query.text for query in plan.initial_queries})
+        self.assertIs(plan.planning_status, PlanningStatus.NORMAL)
         self.assertTrue(all(
             (query.date_from is None and query.date_to is None)
             or (
@@ -802,6 +844,25 @@ class PlannerDegradationTests(unittest.TestCase):
             )
             for query in plan.initial_queries
         ))
+
+    def test_equal_model_publication_bounds_are_stripped_without_degrading(self):
+        model = StaticPlannerModel(strict_payload(
+            topics=(model_topic("北京新闻"),),
+            supplements=(supplemental_query(
+                "primary",
+                "北京今日发布新闻",
+                date_from="2026-07-29",
+                date_to="2026-07-29",
+            ),),
+        ))
+        planner = self.module.SearchPlanner(model, today_provider=lambda: date(2026, 7, 29))
+
+        plan = plan_with_context(planner, request("北京今天发布了哪些新闻"), standard_decision())
+
+        query = next(item for item in plan.initial_queries if item.text == "北京今日发布新闻")
+        self.assertIsNone(query.date_from)
+        self.assertIsNone(query.date_to)
+        self.assertIs(plan.planning_status, PlanningStatus.NORMAL)
 
 
 class PlannerQueryCapTests(unittest.TestCase):
@@ -922,6 +983,17 @@ class RepairUnificationTests(unittest.TestCase):
         )
         self.assertFalse(duplicate.triggered)
         self.assertIsNone(duplicate.repair_query)
+
+    def test_prepare_direct_cleans_conversational_prefixes(self):
+        planner = self.module.SearchPlanner(StaticPlannerModel())
+        req = request("请帮我查一下 Python 3.13 是哪天发布的？")
+        p = planner.plan(
+            req,
+            decision(SearchTier.LIGHT),
+            retrieval_context(),
+            freshness_context(),
+        )
+        self.assertEqual("Python 3.13 是哪天发布的", p.initial_queries[0].text)
 
 
 if __name__ == "__main__":

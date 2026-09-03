@@ -633,6 +633,25 @@ class NoSearchAccessTests(unittest.TestCase):
                     )
                 self.assertEqual(0, llm.calls)
 
+    def test_discoverer_accepts_realistic_long_excerpt(self):
+        module = validation_module()
+        long_excerpt = "Python 3.13 包含了许多重要的新特性和性能改进。" * 40  # > 1000 chars
+        long_item = replace(item(), excerpt=long_excerpt)
+        b = bundle((long_item,), state=EvidenceState.SUFFICIENT)
+        d = GroundedDraft(
+            (models().AnswerBlock("B1", "factual", "Python 3.13 发布了", ("C1",)),),
+            (models().Claim("C1", "B1", "Python 3.13 发布了", True, ("E1",)),),
+            (), (), False,
+        )
+
+        class EchoLLM:
+            def chat(self, *_args, **_kwargs):
+                return ChatResponse(content='{"spans":[]}')
+
+        # Should not raise ClaimDiscoveryUnavailable
+        spans = module.LLMClaimDiscoverer(EchoLLM()).discover(d, b)
+        self.assertEqual((), spans)
+
     def test_production_discoverer_rejects_output_overflow_and_invalid_claim_coverage(self):
         module = validation_module()
         d = GroundedDraft(

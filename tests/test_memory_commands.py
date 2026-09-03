@@ -124,7 +124,7 @@ class MemoryCommandsTests(unittest.TestCase):
         self.assertFalse(ctx.memory_context.is_group)
 
         admin_ctx = CommandContext(
-            uid=config.admin_qq_ids[0] if config.admin_qq_ids else "99999",
+            uid=next(iter(config.admin_qq_ids)) if config.admin_qq_ids else "99999",
             session_key="private:99999",
             raw_message="/help",
         )

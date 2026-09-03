@@ -29,6 +29,7 @@ from src.search.models import (
     PotentialHarm,
     PROVIDER_STATUS_FAILURE_CODES,
     ProviderAttempt,
+    ProviderErrorCode,
     ProviderHit,
     ProviderResult,
     ProviderStatus,
@@ -52,6 +53,7 @@ from src.search.models import (
     SearchQuery,
     SearchRoundKind,
     SearchTier,
+    SearchTerminalCategory,
     SearchTrace,
     SkipReason,
     TopicFreshnessTraceEntry,
@@ -508,6 +510,10 @@ class SearchOrchestrator:
         else:
             failure_code = None
 
+        trace.terminal_search_category = _terminal_search_category(
+            failure_code,
+            existing=trace.terminal_search_category,
+        )
         return SearchPipelineResult(
             decision=decision,
             plan=plan,
@@ -595,6 +601,12 @@ class SearchOrchestrator:
 
         unresolved_queries: list[SearchQuery] = []
         interim_outcomes: dict[str, tuple[QueryOutcomeStatus, tuple[Any, ...], tuple[ProviderAttempt, ...], SearchFailureCode | None]] = {}
+
+        for outcome in tavily_outcomes.values():
+            if outcome.result.date_filter_normalized:
+                trace.date_filter_normalized_count += 1
+            if outcome.result.parameter_retry_attempted:
+                trace.tavily_parameter_retry_count += 1
 
         now = self._monotonic()
         for query in queries:
@@ -731,6 +743,13 @@ class SearchOrchestrator:
                         readiness_failure=readiness_failure,
                     )
                 )
+                tavily_outcome = tavily_outcomes.get(query.query_id)
+                if (
+                    final_status is not QueryOutcomeStatus.RESOLVED
+                    and tavily_outcome is not None
+                    and tavily_outcome.result.error_code is ProviderErrorCode.INVALID_PARAMETERS
+                ):
+                    trace.terminal_search_category = SearchTerminalCategory.PROVIDER_PARAMETERS
 
         return aggregate_query_outcomes(final_query_outcomes)
 
@@ -1066,6 +1085,14 @@ class SearchOrchestrator:
         trace.citable_evidence_count = sum(
             1 for item in bundle.evidence_items if item.citable
         )
+        trace.snippet_degradation_used = any(
+            item.citable
+            and item.extraction_status in {
+                "search_result_snippet",
+                "search_result_snippet_after_fetch_failure",
+            }
+            for item in bundle.evidence_items
+        )
         trace.retrieval_pipeline_latency_ms = self._elapsed_ms(started)
         return bundle
 
@@ -1109,6 +1136,10 @@ class SearchOrchestrator:
             trace.provider_failures = (*trace.provider_failures, failure)
         trace.provider_failures = tuple(dict.fromkeys(trace.provider_failures))
         trace.degradation_reason = failure
+        trace.terminal_search_category = _terminal_search_category(
+            failure,
+            existing=trace.terminal_search_category,
+        )
 
         if failure is SearchFailureCode.PROVIDER_NOT_CONFIGURED and bundle is None:
             trace.evidence_state = None
@@ -1191,6 +1222,28 @@ class SearchOrchestrator:
 
     def _elapsed_ms(self, started: float) -> int:
         return int((self._monotonic() - started) * 1000)
+
+
+def _terminal_search_category(
+    failure: SearchFailureCode | None,
+    *,
+    existing: SearchTerminalCategory | None = None,
+) -> SearchTerminalCategory | None:
+    if failure is None:
+        return None
+    if existing is SearchTerminalCategory.PROVIDER_PARAMETERS:
+        return existing
+    if failure in {
+        SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+        SearchFailureCode.PROVIDER_UNAVAILABLE,
+        SearchFailureCode.PROVIDER_TIMEOUT,
+    }:
+        return SearchTerminalCategory.PROVIDER_CONNECTIVITY
+    if failure is SearchFailureCode.NO_RESULTS:
+        return SearchTerminalCategory.EMPTY_RESULTS
+    if failure is SearchFailureCode.CONTENT_UNREADABLE:
+        return SearchTerminalCategory.CONTENT_UNREADABLE
+    return SearchTerminalCategory.INSUFFICIENT_EVIDENCE
 
 
 def _call_with_supported_kwargs(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

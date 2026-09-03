@@ -68,11 +68,16 @@ def canonicalize_public_http_url(url: str) -> str | None:
     return urlunparse((scheme, netloc, path, parsed.params, parsed.query, ""))
 
 
-def _is_unsafe_ip(ip_text: str) -> bool:
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_unsafe_ip(ip_text: str, *, is_resolved_hostname: bool = False) -> bool:
     try:
         ip = ipaddress.ip_address(ip_text)
     except ValueError:
         return True
+    if is_resolved_hostname and ip in _FAKE_IP_NET:
+        return False
     return (
         not ip.is_global
         or ip.is_loopback
@@ -121,7 +126,7 @@ def evaluate_public_http_url(url: str, *, timeout: float | None = None) -> UrlDe
 
     try:
         ip = ipaddress.ip_address(hostname)
-        if _is_unsafe_ip(str(ip)):
+        if _is_unsafe_ip(str(ip), is_resolved_hostname=False):
             return UrlDecision(False, "unsafe_url", None, "出于安全原因，不能读取本机或局域网地址。")
         return UrlDecision(True, "allowed", canonical, "")
     except ValueError:
@@ -137,7 +142,7 @@ def evaluate_public_http_url(url: str, *, timeout: float | None = None) -> UrlDe
 
     for info in addr_infos:
         ip_str = info[4][0]
-        if _is_unsafe_ip(ip_str):
+        if _is_unsafe_ip(ip_str, is_resolved_hostname=True):
             return UrlDecision(False, "unsafe_url", None, "出于安全原因，不能读取本机或局域网地址。")
 
     return UrlDecision(True, "allowed", canonical, "")

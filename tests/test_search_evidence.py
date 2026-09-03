@@ -1327,6 +1327,7 @@ class TopicFreshnessSufficiencyTests(unittest.TestCase):
         eligibility = getattr(importlib.import_module("src.search.models"), "FreshnessEligibility")
         cases = (
             ("Python 3.13 release", "supports 3.13", eligibility.SATISFIED),
+            ("Python 3.13.0 release", "supports 3.13.0", eligibility.SATISFIED),
             ("Python 3.12 release", "supports 3.12", eligibility.STALE),
             ("Python 13.13 release", "supports 13.13", eligibility.STALE),
             ("Python 3.130 release", "supports 3.130", eligibility.STALE),
@@ -1886,7 +1887,7 @@ class EvidenceStateTests(unittest.TestCase):
         self.assertNotEqual(bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIs(bundle.topic_assessments[0].freshness, FreshnessEligibility.UNKNOWN)
 
-    def test_failed_fetch_snippet_is_not_citable_even_when_current_is_satisfied(self):
+    def test_relevant_failed_fetch_snippet_is_low_confidence_citable(self):
         failed_document = FetchedDocument(
             "https://tavily.example/status",
             "https://tavily.example/status",
@@ -1897,7 +1898,11 @@ class EvidenceStateTests(unittest.TestCase):
             (),
         )
         weak = replace(
-            candidate(provider="tavily", content="当前状态片段", url="https://tavily.example/status"),
+            candidate(
+                provider="tavily",
+                content="2026上海全球冠军赛CN四支队伍为JDG、TYL、EDG和XLG，四队均已确认晋级。",
+                url="https://tavily.example/status",
+            ),
             document=failed_document,
             extraction_status="search_result_snippet_after_fetch_failure",
             content_reads_consumed=1,
@@ -1911,10 +1916,39 @@ class EvidenceStateTests(unittest.TestCase):
             }
         )
         bundle = self.module.EvidenceAssembler(judge).assemble(
-            current_topic_plan("动态"), (weak,)
+            current_topic_plan("CN参赛队伍"), (weak,)
         )
-        self.assertIsNot(bundle.evidence_state, EvidenceState.SUFFICIENT)
-        self.assertFalse(bundle.evidence_items[0].citable)
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
+        self.assertTrue(bundle.evidence_items[0].citable)
+        self.assertEqual(
+            "search_result_snippet_after_fetch_failure",
+            bundle.evidence_items[0].extraction_status,
+        )
+
+    def test_missing_structured_date_can_use_judged_snippet_freshness(self):
+        weak = candidate(
+            content="2026-08-22 四支晋级队伍已经确定，赛事官方随后公布完整参赛名单。",
+            published=None,
+        )
+        plan = topic_plan(
+            topic(
+                "topic-1",
+                "晋级队伍",
+                FreshnessRequirement.WINDOW,
+                date_from=date(2026, 8, 1),
+                date_to=date(2026, 8, 31),
+            )
+        )
+        judge = StaticEvidenceJudge({
+            "C1": topic_judge_ok(
+                "C1",
+                freshness_by_topic={"topic-1": "satisfied"},
+            )
+        })
+
+        bundle = self.module.EvidenceAssembler(judge).assemble(plan, (weak,))
+
+        self.assertIs(bundle.evidence_state, EvidenceState.SUFFICIENT)
         self.assertIs(bundle.topic_assessments[0].freshness, FreshnessEligibility.SATISFIED)
 
     def test_risk_does_not_change_failed_fetch_snippet_admission(self):

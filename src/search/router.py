@@ -32,6 +32,7 @@ from src.search.models import (
     RiskContext,
     RiskLevel,
     SearchTier,
+    SearchTimeScope,
     SkipReason,
     SourceRequirement,
     TriggerCode,
@@ -1079,6 +1080,11 @@ class _RequestClassification:
     high_consequence: bool = False
     warning_required: bool = False
     fail_closed: bool = False
+    search_keywords: str | None = None
+    time_scope: SearchTimeScope = SearchTimeScope.NONE
+    time_scope_text: str | None = None
+    publication_date_from: date | None = None
+    publication_date_to: date | None = None
 
 
 # ── strict JSON parsing for the routing advisor ─────────────────────────
@@ -1094,7 +1100,7 @@ _REQUEST_ANALYSIS_ENUM_FIELDS: Mapping[str, type[Any]] = {
     "freshness_requirement": FreshnessRequirement,
 }
 
-_REQUEST_ANALYSIS_FIELDS = frozenset(
+_REQUEST_ANALYSIS_REQUIRED_FIELDS = frozenset(
     {
         "factuality",
         "external_fact_required",
@@ -1110,6 +1116,14 @@ _REQUEST_ANALYSIS_FIELDS = frozenset(
         "fail_closed",
     }
 )
+_REQUEST_ANALYSIS_FIELDS = _REQUEST_ANALYSIS_REQUIRED_FIELDS
+_REQUEST_ANALYSIS_ALLOWED_FIELDS = _REQUEST_ANALYSIS_REQUIRED_FIELDS | {
+    "search_keywords",
+    "time_scope",
+    "time_scope_text",
+    "publication_date_from",
+    "publication_date_to",
+}
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1139,7 +1153,8 @@ def _parse_optional_date(value: Any, field_name: str) -> date | None:
 
 
 def _normalized_advisor_output(payload: dict[str, Any]) -> dict[str, Any]:
-    if set(payload) != _REQUEST_ANALYSIS_FIELDS:
+    keys = set(payload)
+    if not _REQUEST_ANALYSIS_REQUIRED_FIELDS.issubset(keys) or not keys.issubset(_REQUEST_ANALYSIS_ALLOWED_FIELDS):
         raise ValueError("request analysis must contain exactly the closed fields")
 
     normalized = dict(payload)
@@ -1173,6 +1188,29 @@ def _normalized_advisor_output(payload: dict[str, Any]) -> dict[str, Any]:
     version_constraint = normalized["version_constraint"]
     if version_constraint is not None and type(version_constraint) is not str:
         raise ValueError("version_constraint must be a string or null")
+    search_keywords = normalized.get("search_keywords")
+    if search_keywords is not None and type(search_keywords) is not str:
+        raise ValueError("search_keywords must be a string or null")
+    time_scope = _parse_enum(normalized.get("time_scope", "none"), SearchTimeScope)
+    if time_scope is None:
+        raise ValueError("time_scope must be a closed enum value")
+    normalized["time_scope"] = time_scope
+    time_scope_text = normalized.get("time_scope_text")
+    if time_scope_text is not None and type(time_scope_text) is not str:
+        raise ValueError("time_scope_text must be a string or null")
+    normalized["time_scope_text"] = time_scope_text
+    for field_name in ("publication_date_from", "publication_date_to"):
+        normalized[field_name] = _parse_optional_date(
+            normalized.get(field_name),
+            field_name,
+        )
+    if (
+        normalized["publication_date_from"] is not None
+        and normalized["publication_date_to"] is not None
+        and normalized["publication_date_from"] > normalized["publication_date_to"]
+    ):
+        normalized["publication_date_from"] = None
+        normalized["publication_date_to"] = None
     return normalized
 
 
@@ -1202,14 +1240,19 @@ def parse_advisor_json(content: Any) -> dict[str, Any]:
 # ── one-shot request analysis ───────────────────────────────────────────
 
 ROUTING_SYSTEM_PROMPT = """\
-Classify the request into retrieval complexity, freshness needs, and answer
-risk. You do not choose a search tier or a skip route. Treat the question text
-as the only input.
+Classify the request into retrieval complexity, freshness needs, search keywords,
+time semantics, and answer risk. You do not choose a search tier or a skip route.
+Treat the question text as the only input.
 
 Return JSON only with exactly these fields:
 {
   "factuality": "non_factual|factual|mixed|ambiguous",
   "external_fact_required": true or false,
+  "search_keywords": null or "concise entity/event/version keywords in the same language as the question",
+  "time_scope": "none|today|recent|year|explicit_range",
+  "time_scope_text": null or "the normalized time expression retained in search_keywords",
+  "publication_date_from": null or "YYYY-MM-DD",
+  "publication_date_to": null or "YYYY-MM-DD",
   "complexity_codes": ["multi_fact|multi_entity|comparison|recommendation|multi_source_required|cross_verification_required|ambiguous_entity"],
   "source_requirement": "any_relevant|independent_corroboration",
   "freshness_requirement": "not_required|current|as_of|window|version",
@@ -1222,7 +1265,14 @@ Return JSON only with exactly these fields:
   "fail_closed": false
 }
 
-Never invent a source requirement that the user did not explicitly request.
+Rules:
+- Publication dates describe when a web page was published, not when an event happened or when a fact is valid.
+- For “今年参加上海冠军赛的队伍”, use time_scope="year", preserve the year/event in search_keywords, and set both publication dates to null.
+- For “今天发布了哪些新闻”, use time_scope="today"; publication-date intent is allowed because the user asks what was published today.
+- For “截至今天有哪些队伍晋级”, preserve the cutoff in search_keywords and set both publication dates to null because useful sources need not be published today.
+- Never alter or "correct" a named entity merely because it is unfamiliar.
+- freshness_requirement: use "not_required" for general facts, history, or fixed events; use "current" for facts requiring current verification; use "version" for specific software versions.
+- Never invent a source requirement that the user did not explicitly request.
 """
 
 
@@ -1363,7 +1413,10 @@ class RetrievalBenefitRouter:
 
 
 def _validated_request_classification(raw: Any) -> _RequestClassification:
-    if not isinstance(raw, dict) or set(raw) != _REQUEST_ANALYSIS_FIELDS:
+    if not isinstance(raw, dict):
+        return _RequestClassification()
+    keys = set(raw)
+    if not _REQUEST_ANALYSIS_REQUIRED_FIELDS.issubset(keys) or not keys.issubset(_REQUEST_ANALYSIS_ALLOWED_FIELDS):
         return _RequestClassification()
     try:
         freshness = FreshnessContext(
@@ -1391,6 +1444,11 @@ def _validated_request_classification(raw: Any) -> _RequestClassification:
             high_consequence=risk.high_consequence,
             warning_required=risk.warning_required,
             fail_closed=risk.fail_closed,
+            search_keywords=raw.get("search_keywords"),
+            time_scope=raw.get("time_scope", SearchTimeScope.NONE),
+            time_scope_text=raw.get("time_scope_text"),
+            publication_date_from=raw.get("publication_date_from"),
+            publication_date_to=raw.get("publication_date_to"),
         )
     except (KeyError, TypeError, ValueError):
         return _RequestClassification()
@@ -1671,6 +1729,11 @@ def _build_request_analysis(
             external_fact_required=external_fact_required,
             complexity_codes=codes,
             source_requirement=source_requirement,
+            search_keywords=classification.search_keywords,
+            time_scope=classification.time_scope,
+            time_scope_text=classification.time_scope_text,
+            publication_date_from=classification.publication_date_from,
+            publication_date_to=classification.publication_date_to,
         ),
         freshness=_freshness_context(question, classification),
         risk=_risk_context(question, classification),

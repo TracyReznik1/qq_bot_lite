@@ -540,7 +540,10 @@ class SearchModelContractTests(unittest.TestCase):
     def test_review_contracts_have_exact_public_fields_and_exports(self):
         m = models()
         expected_fields = {
-            "ProviderResult": ("provider", "status", "hits", "latency_ms"),
+            "ProviderResult": (
+                "provider", "status", "hits", "latency_ms", "error_code",
+                "date_filter_normalized", "parameter_retry_attempted",
+            ),
             "FetchedDocument": (
                 "requested_url", "final_url", "content_type", "title", "excerpt",
                 "fetch_status", "untrusted_content_flags",
@@ -853,6 +856,64 @@ class SearchModelContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.ProviderResult("p", status, hits, 1)
 
+    def test_provider_result_accepts_closed_parameter_recovery_metadata(self):
+        m = models()
+        hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, ())
+        recovered = m.ProviderResult(
+            "tavily",
+            m.ProviderStatus.SUCCESS,
+            (hit,),
+            3,
+            error_code=m.ProviderErrorCode.INVALID_PARAMETERS,
+            date_filter_normalized=True,
+            parameter_retry_attempted=True,
+        )
+        self.assertIs(recovered.error_code, m.ProviderErrorCode.INVALID_PARAMETERS)
+        self.assertTrue(recovered.date_filter_normalized)
+        self.assertTrue(recovered.parameter_retry_attempted)
+
+        ordinary = m.ProviderResult("tavily", m.ProviderStatus.SUCCESS, (hit,), 1)
+        self.assertIsNone(ordinary.error_code)
+        self.assertFalse(ordinary.date_filter_normalized)
+        self.assertFalse(ordinary.parameter_retry_attempted)
+
+        with self.assertRaises(TypeError):
+            m.ProviderResult("tavily", m.ProviderStatus.ERROR, (), 1, error_code="invalid_parameters")
+        with self.assertRaises(TypeError):
+            m.ProviderResult("tavily", m.ProviderStatus.ERROR, (), 1, date_filter_normalized=1)
+        with self.assertRaises(ValueError):
+            m.ProviderResult(
+                "tavily",
+                m.ProviderStatus.SUCCESS,
+                (hit,),
+                1,
+                error_code=m.ProviderErrorCode.INVALID_PARAMETERS,
+            )
+
+    def test_search_trace_accepts_closed_recovery_and_terminal_metadata(self):
+        m = models()
+        trace = m.SearchTrace(
+            "req-1",
+            m.RequestSource.CHAT,
+            m.SearchTier.LIGHT,
+            date_filter_normalized_count=2,
+            tavily_parameter_retry_count=1,
+            snippet_degradation_used=True,
+            terminal_search_category=m.SearchTerminalCategory.PROVIDER_PARAMETERS,
+        )
+        logged = trace.to_log_dict()
+        self.assertEqual(2, logged["date_filter_normalized_count"])
+        self.assertEqual(1, logged["tavily_parameter_retry_count"])
+        self.assertTrue(logged["snippet_degradation_used"])
+        self.assertEqual("provider_parameters", logged["terminal_search_category"])
+
+        with self.assertRaises(ValueError):
+            m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT, date_filter_normalized_count=-1)
+        with self.assertRaises(TypeError):
+            m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT, snippet_degradation_used=1)
+        with self.assertRaises(TypeError):
+            m.SearchTrace("req-1", m.RequestSource.CHAT, m.SearchTier.LIGHT, terminal_search_category="provider_parameters")
+
     def test_collection_element_type_closure_for_shared_contract_patterns(self):
         m = models()
         hit = m.ProviderHit("p", "q", "title", "https://example.com", None, None, None, None, [])
@@ -960,6 +1021,32 @@ class RequestAnalysisContextContractTests(unittest.TestCase):
             self._retrieval(m, source_requirement="any_relevant")
         with self.assertRaises((TypeError, ValueError)):
             self._retrieval(m, must_search="yes")
+
+    def test_retrieval_context_closes_search_time_fields(self):
+        m = models()
+        context = m.RetrievalContext(
+            True,
+            None,
+            m.Factuality.FACTUAL,
+            True,
+            (),
+            m.SourceRequirement.ANY_RELEVANT,
+            search_keywords="  2026 上海冠军赛  ",
+            time_scope=m.SearchTimeScope.YEAR,
+            time_scope_text="  2026年  ",
+            publication_date_from=date(2026, 1, 1),
+            publication_date_to=date(2026, 12, 31),
+        )
+        self.assertEqual("2026 上海冠军赛", context.search_keywords)
+        self.assertEqual("2026年", context.time_scope_text)
+        with self.assertRaises(TypeError):
+            replace(context, time_scope="year")
+        with self.assertRaises(ValueError):
+            replace(
+                context,
+                publication_date_from=date(2026, 12, 31),
+                publication_date_to=date(2026, 1, 1),
+            )
 
     def test_freshness_contract_closes_date_and_version_constraints(self):
         m = models()

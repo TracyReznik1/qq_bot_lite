@@ -75,6 +75,17 @@ class SearchUrlPolicyTests(unittest.TestCase):
         self.assertEqual("empty_url", evaluate_public_http_url("").status)
         self.assertEqual("unsupported_scheme", evaluate_public_http_url("ftp://example.com").status)
 
+    def test_evaluate_allows_public_domain_resolving_to_fake_ip_proxy_range(self):
+        with mock.patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.33", 443))]):
+            decision = evaluate_public_http_url("https://www.python.org/downloads/")
+            self.assertTrue(decision.allowed)
+            self.assertEqual("allowed", decision.status)
+
+    def test_evaluate_rejects_direct_fake_ip_literal(self):
+        decision = evaluate_public_http_url("http://198.18.0.1/admin")
+        self.assertFalse(decision.allowed)
+        self.assertEqual("unsafe_url", decision.status)
+
 
 if __name__ == "__main__":
     unittest.main()

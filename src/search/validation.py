@@ -67,7 +67,7 @@ _MAX_DISCOVERY_CLAIMS = 80
 _MAX_DISCOVERY_CLAIM_TEXT = 800
 _MAX_DISCOVERY_CLAIM_EVIDENCE = 10
 _MAX_DISCOVERY_EVIDENCE = 20
-_MAX_DISCOVERY_EXCERPT = 500
+_MAX_DISCOVERY_EXCERPT = 6000
 _MAX_DISCOVERY_SPANS = 80
 
 
@@ -122,7 +122,7 @@ class LLMClaimDiscoverer:
             "evidence": [
                 {
                     "evidence_id": item.evidence_id,
-                    "excerpt": item.excerpt or "",
+                    "excerpt": (item.excerpt or "")[:1500],
                     "citable": item.citable,
                 }
                 for item in evidence.evidence_items
@@ -191,14 +191,28 @@ def _require_discovery_input_within_bounds(
         raise ClaimDiscoveryUnavailable("claim discovery input exceeds closed bounds")
 
 
+def _extract_json_body(text: str) -> str:
+    raw = str(text or "").strip()
+    if "[/非可信上下文]" in raw:
+        raw = raw.split("[/非可信上下文]", 1)[1].strip()
+    fenced = _FENCE_PATTERN.fullmatch(raw)
+    if fenced is not None:
+        return fenced.group("body").strip()
+    fence_search = re.search(r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```", raw, re.IGNORECASE | re.DOTALL)
+    if fence_search is not None:
+        return fence_search.group("body").strip()
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        return raw[first_brace:last_brace + 1].strip()
+    return raw
+
+
 def _parse_discovery_output(
     content: Any,
     draft: GroundedDraft,
 ) -> tuple[DiscoveredClaimSpan, ...]:
-    text = str(content or "").strip()
-    fenced = _FENCE_PATTERN.fullmatch(text)
-    if fenced is not None:
-        text = fenced.group("body").strip()
+    text = _extract_json_body(content)
     try:
         payload = json.loads(
             text,
@@ -260,10 +274,7 @@ def _raise_invalid_constant(value: str) -> Any:
 
 
 def parse_grounded_draft(text: str) -> GroundedDraft:
-    raw = str(text or "").strip()
-    fenced = _FENCE_PATTERN.fullmatch(raw)
-    if fenced is not None:
-        raw = fenced.group("body").strip()
+    raw = _extract_json_body(text)
     try:
         payload = json.loads(
             raw,
@@ -597,7 +608,7 @@ def _evidence_to_dict(bundle: EvidenceBundle) -> dict[str, Any]:
                 "evidence_id": item.evidence_id,
                 "title": item.title,
                 "url": item.url,
-                "excerpt": (item.excerpt or "")[:500],
+                "excerpt": (item.excerpt or "")[:1500],
                 "source_relation": item.source_relation.value,
             }
             for item in bundle.evidence_items

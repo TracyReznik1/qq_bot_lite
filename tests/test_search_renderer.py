@@ -133,14 +133,22 @@ class PureRendererTests(unittest.TestCase):
             rendered.shown_source_urls,
         )
 
-    def test_failure_renders_disclosure_without_sources(self):
-        state = _state(
-            disclosures=(DisclosureCode.ONLINE_VERIFICATION_FAILED,),
-            outcome=RenderOutcome.FAILURE,
+    def test_distinct_failures_render_source_free_disclosures(self):
+        cases = (
+            (DisclosureCode.SEARCH_UNAVAILABLE, "在线搜索服务暂时不可用"),
+            (DisclosureCode.NO_SUPPORTING_EVIDENCE, "暂未找到足以确认结论的信息"),
+            (DisclosureCode.PREMISE_MISMATCH, "名称或前提不一致"),
         )
-        rendered = render_search_reply(state, qq_limit=1700)
-        self.assertIn("无法完成在线核验", rendered.text)
-        self.assertEqual((), rendered.shown_source_urls)
+        for code, expected in cases:
+            with self.subTest(code=code):
+                state = _state(
+                    disclosures=(code,),
+                    outcome=RenderOutcome.FAILURE,
+                )
+                rendered = render_search_reply(state, qq_limit=1700)
+                self.assertIn(expected, rendered.text)
+                self.assertNotRegex(rendered.text, r"\[\d+\]|https?://|来源[：:]")
+                self.assertEqual((), rendered.shown_source_urls)
 
     def test_warning_rendered_exactly_once(self):
         block = AnswerBlock("B1", "factual", "剂量是99毫克", ("C1",))

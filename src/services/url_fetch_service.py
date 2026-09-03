@@ -398,8 +398,13 @@ def _read_limited_document(response) -> tuple[bool, str, str, bytes]:
     if not raw_bytes:
         return True, "", "", b""
 
-    encoding = getattr(response, "encoding", None) or getattr(response, "apparent_encoding", None) or "utf-8"
-    raw_text = raw_bytes.decode(encoding, errors="replace")
+    encoding = getattr(response, "encoding", None)
+    if not encoding or encoding.lower() in ("iso-8859-1", "latin-1", "ascii"):
+        encoding = getattr(response, "apparent_encoding", None) or "utf-8"
+    try:
+        raw_text = raw_bytes.decode(encoding, errors="replace")
+    except Exception:
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
     return True, "", raw_text, raw_bytes
 
 

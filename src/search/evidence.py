@@ -402,6 +402,8 @@ def _parse_verdict(
 
     publisher_match = raw.get("publisher_entity_match")
     ownership_basis = raw.get("ownership_basis")
+    if ownership_basis == "":
+        ownership_basis = None
     if type(publisher_match) is not bool:
         return {}
     if ownership_basis is not None and (
@@ -416,6 +418,8 @@ def _parse_verdict(
         return {}
 
     publisher = raw.get("publisher")
+    if publisher == "":
+        publisher = None
     if publisher is not None and (
         not isinstance(publisher, str) or not publisher.strip()
     ):
@@ -791,11 +795,37 @@ def _freshness_state(plan: SearchPlan, candidate: EvidenceCandidate) -> Freshnes
     return Freshness.NONE
 
 
+_MIN_USEFUL_SNIPPET_CHARS = 24
+_PROVIDER_SNIPPET_STATUSES = frozenset({
+    "search_result_snippet",
+    "search_result_snippet_after_fetch_failure",
+})
+
+
+def _usable_provider_snippet(candidate: EvidenceCandidate) -> bool:
+    excerpt = " ".join(str(candidate.excerpt or "").split())
+    return (
+        len(excerpt) >= _MIN_USEFUL_SNIPPET_CHARS
+        and canonicalize_public_http_url(_final_url_of(candidate)) is not None
+        and not candidate.safety_flags
+        and candidate.extraction_status in _PROVIDER_SNIPPET_STATUSES
+    )
+
+
 def _citable(candidate: EvidenceCandidate, plan: SearchPlan) -> bool:
-    """Keep failed-fetch snippets out of topic support independent of policy."""
     del plan
-    return bool(candidate.excerpt) and (
-        candidate.extraction_status != "search_result_snippet_after_fetch_failure"
+    if candidate.extraction_status == "search_result_snippet_after_fetch_failure":
+        return _usable_provider_snippet(candidate)
+    return bool(candidate.excerpt)
+
+
+def _usable_provider_snippet_item(item: EvidenceItem) -> bool:
+    excerpt = " ".join(str(item.excerpt or "").split())
+    return (
+        len(excerpt) >= _MIN_USEFUL_SNIPPET_CHARS
+        and item.canonical_url is not None
+        and not item.safety_flags
+        and item.extraction_status in _PROVIDER_SNIPPET_STATUSES
     )
 
 
@@ -866,6 +896,14 @@ def _freshness_for_topic(
     published = item.published_at.date() if item.published_at is not None else None
     if topic.date_from is not None or topic.date_to is not None:
         if published is None:
+            if (
+                item.citable
+                and _usable_provider_snippet_item(item)
+                and judged_status is FreshnessEligibility.SATISFIED
+            ):
+                return FreshnessEligibility.SATISFIED
+            if judged_status is FreshnessEligibility.STALE:
+                return FreshnessEligibility.STALE
             return FreshnessEligibility.UNKNOWN
         if topic.date_from is not None and published < topic.date_from:
             return FreshnessEligibility.STALE
@@ -890,7 +928,7 @@ def _freshness_for_topic(
 
 def _has_exact_version_literal(corpus: str, required: str) -> bool:
     token = re.escape(required)
-    return re.search(rf"(?<![0-9.]){token}(?![0-9.])", corpus) is not None
+    return re.search(rf"(?<![0-9.]){token}(?:\.[0-9]+)?(?![0-9.])", corpus) is not None
 
 
 def _contains_explicit_version_token(corpus: str) -> bool:

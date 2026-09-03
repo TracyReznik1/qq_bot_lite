@@ -203,9 +203,13 @@ ANSWER_CLAIM_SCOPES = {
     "conflict_description_only", "no_external_factual_claims",
 }
 ANSWER_DISCLOSURE_CODES = {
-    "online_verification_failed", "judge_unavailable", "partial_evidence",
-    "source_conflict",
+    "online_verification_failed", "search_unavailable", "no_supporting_evidence",
+    "premise_mismatch", "judge_unavailable", "partial_evidence", "source_conflict",
     "validation_unavailable", "validation_failed", "user_forbid_web",
+}
+SEARCH_TERMINAL_CATEGORIES = {
+    "provider_connectivity", "provider_parameters", "empty_results",
+    "content_unreadable", "insufficient_evidence",
 }
 WARNING_CODES = {"high_consequence"}
 VALIDATOR_STATUSES = {"passed", "filtered", "unavailable", "malformed"}
@@ -246,6 +250,8 @@ TRACE_FIELDS = {
     "initial_query_redaction_codes", "adaptive_repair_redaction_codes",
     "retrieval_round_count", "executed_queries", "provider_configured",
     "provider_attempts", "provider_invocation_started", "provider_failures",
+    "date_filter_normalized_count", "tavily_parameter_retry_count",
+    "snippet_degradation_used", "terminal_search_category",
     "candidate_url_count", "citable_evidence_count", "evidence_state",
     "repair_used", "claim_count", "supported_claim_count", "citation_count",
     "knowledge_fallback_used", "degradation_reason", "content_read_count",
@@ -2241,6 +2247,7 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         "adaptive_repair_round_started", "provider_configured",
         "provider_invocation_started", "knowledge_fallback_used", "repair_used",
         "provider_attempted", "sufficient_evidence", "must_search", "finalized",
+        "snippet_degradation_used",
     ):
         if type(trace.get(name)) is not bool:
             errors.append(f"{prefix} {name} must be boolean")
@@ -2250,9 +2257,16 @@ def _validate_trace(trace: Mapping[str, Any], index: int) -> list[str]:
         "citable_evidence_count", "claim_count", "supported_claim_count", "citation_count",
         "validator_retained_claim_count", "validator_removed_block_count",
         "render_citation_count", "render_source_count", "judge_anomaly_count",
+        "date_filter_normalized_count", "tavily_parameter_retry_count",
     ):
         if not _is_int(trace.get(name)):
             errors.append(f"{prefix} {name} must be a non-negative integer")
+    terminal_category = trace.get("terminal_search_category")
+    if terminal_category is not None and not _closed(
+        terminal_category,
+        SEARCH_TERMINAL_CATEGORIES,
+    ):
+        errors.append(f"{prefix} invalid terminal_search_category")
     for name in ("initial_query_redaction_codes", "adaptive_repair_redaction_codes"):
         values = trace.get(name)
         if not _is_string_list(values) or any(not _closed(value, REDACTION_CODES) for value in values or ()):

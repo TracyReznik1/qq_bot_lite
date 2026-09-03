@@ -53,10 +53,10 @@ def build_system_prompt(context: MemoryContext | str, *, evidence_payload: str =
     grounded_section = (
         "\n"
         "[Grounded Answer]\n"
-        "当外部证据存在时，按以下 JSON 结构返回回答：\n"
+        "当外部证据存在时，必须且只能返回严格的 JSON 对象（禁止输出任何前缀闲聊、寒暄或自然语言文本，只输出合法的 JSON）：\n"
         "{\n"
-        '  "answer_blocks": [{"block_id": "B1", "kind": "factual|inference|non_factual", "text": "一句原子事实", "claim_ids": ["C1"]}],\n'
-        '  "claims": [{"claim_id": "C1", "block_id": "B1", "text": "同一句事实", "material": true, "evidence_ids": ["E1"]}],\n'
+        '  "answer_blocks": [{"block_id": "B1", "kind": "factual", "text": "基于证据陈述的事实句子", "claim_ids": ["C1"]}],\n'
+        '  "claims": [{"claim_id": "C1", "block_id": "B1", "text": "基于证据陈述的事实句子", "material": true, "evidence_ids": ["E1"]}],\n'
         '  "limitations": [],\n'
         '  "conflict_summary": [],\n'
         '  "used_knowledge_fallback": false\n'

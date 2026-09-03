@@ -13,6 +13,7 @@ from src.search.models import (
     EvidenceState,
     FreshnessRequirement,
     RenderOutcome,
+    RepairReasonCode,
     SearchFailureCode,
     SkipReason,
     ValidatorStatus,
@@ -192,16 +193,44 @@ class AnswerStateSkipAndFailureTests(unittest.TestCase):
             AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
         )
 
-    def test_insufficient_failure_uses_online_verification_disclosure(self):
+    def test_provider_outage_has_network_specific_disclosure(self):
         answer = decide_answer_state(
             make_analysis(),
             _evidence(EvidenceState.INSUFFICIENT),
-            SearchFailureCode.NO_RESULTS,
+            SearchFailureCode.PROVIDER_UNAVAILABLE,
+        )
+        self.assertEqual(
+            (DisclosureCode.SEARCH_UNAVAILABLE,),
+            answer.disclosure_codes,
+        )
+
+    def test_insufficient_evidence_does_not_claim_network_failure(self):
+        answer = decide_answer_state(
+            make_analysis(),
+            _evidence(EvidenceState.INSUFFICIENT),
+            SearchFailureCode.INSUFFICIENT_EVIDENCE,
         )
         self.assertIs(answer.generation_mode, AnswerGenerationMode.FIXED)
         self.assertIs(answer.certainty, AnswerCertainty.UNVERIFIED)
         self.assertEqual(
-            (DisclosureCode.ONLINE_VERIFICATION_FAILED,),
+            (DisclosureCode.NO_SUPPORTING_EVIDENCE,),
+            answer.disclosure_codes,
+        )
+
+    def test_evidence_backed_premise_mismatch_has_distinct_disclosure(self):
+        evidence = SimpleNamespace(
+            evidence_state=EvidenceState.INSUFFICIENT,
+            gap_analysis=SimpleNamespace(
+                repair_reason_codes=(RepairReasonCode.PREMISE_MISMATCH,),
+            ),
+        )
+        answer = decide_answer_state(
+            make_analysis(),
+            evidence,
+            SearchFailureCode.INSUFFICIENT_EVIDENCE,
+        )
+        self.assertEqual(
+            (DisclosureCode.PREMISE_MISMATCH,),
             answer.disclosure_codes,
         )
 

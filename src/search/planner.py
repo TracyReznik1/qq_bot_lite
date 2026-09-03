@@ -358,6 +358,10 @@ Return JSON only:
 }
 
 Rules:
+- date_from/date_to filter when web pages were published, not when an event happened or when a fact is valid
+- keep event years and fact cutoffs in query text; leave publication dates null unless the user explicitly asks what was published in a period
+- “今年参加上海冠军赛的队伍” and “截至今天有哪些队伍晋级” require null publication dates
+- “今天发布了哪些新闻” may carry publication-time intent
 - never generate more than the supplied supplemental-query limit
 - use at most three topics; labels must be non-blank
 - supplemental target ids refer only to the ordered topic ids topic-1 through topic-3
@@ -385,6 +389,18 @@ _PLANNER_SUPPLEMENTAL_QUERY_KEYS = frozenset({
     "date_to",
 })
 
+_CONVERSATIONAL_PREFIX_PATTERN = re.compile(
+    r"^(?:请(?:帮我|问)?(?:查|搜|看|检索|查询)?(?:一下|下)?|帮我(?:查|搜|看|检索|查询)?(?:一下|下)?|我想知道|我想了解|我想查一下|我想搜一下|麻烦(?:帮我)?(?:查|搜|看|检索)?(?:一下|下)?|能(?:不能|否)?(?:帮我)?(?:查|搜|看|检索)?(?:一下|下)?|告诉我|你知道|请问|查一下|搜一下)\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_conversational_prefix(text: str) -> str:
+    cleaned = _CONVERSATIONAL_PREFIX_PATTERN.sub("", text).strip()
+    if cleaned:
+        return re.sub(r"[？?]+$", "", cleaned).strip() or text
+    return text
+
 
 class SearchPlanner:
     """Plan bounded initial queries and the single optional repair query."""
@@ -410,11 +426,25 @@ class SearchPlanner:
             raise TypeError("freshness_context must be a FreshnessContext")
         budget = DEFAULT_TIER_BUDGETS[decision.route]
         original = str(request.question or "")
-        direct_text, redaction_codes, direct_degraded = self._prepare_direct(original)
+        direct_candidate = retrieval_context.search_keywords or original
+        direct_text, redaction_codes, direct_degraded = self._prepare_direct(direct_candidate)
+        if not direct_text:
+            direct_text, redaction_codes, direct_degraded = self._prepare_direct(original)
         effective_freshness = _effective_freshness_context(
             freshness_context,
             self._today(),
         )
+        if (
+            retrieval_context.publication_date_from is not None
+            or retrieval_context.publication_date_to is not None
+        ):
+            effective_freshness = FreshnessContext(
+                requirement=effective_freshness.requirement,
+                as_of=effective_freshness.as_of,
+                date_from=retrieval_context.publication_date_from,
+                date_to=retrieval_context.publication_date_to,
+                version_constraint=effective_freshness.version_constraint,
+            )
 
         if decision.route is SearchTier.LIGHT:
             required_topics = _fallback_required_topics(
@@ -630,7 +660,8 @@ class SearchPlanner:
     def _prepare_direct(self, original: str) -> tuple[str, tuple[str, ...], bool]:
         normalized = redact_query_text(original)
         personal = _clean_personal_identifiers(normalized.text, original)
-        text = _cap_query_text(personal.text)
+        cleaned = _clean_conversational_prefix(personal.text)
+        text = _cap_query_text(cleaned)
         codes = tuple(dict.fromkeys((*normalized.redaction_codes, *personal.redaction_codes)))
         degraded = normalized.degraded or personal.degraded
         return text, codes, degraded
@@ -832,16 +863,16 @@ def _parse_model_topic(raw: Any, index: int) -> RequiredTopic | None:
         raw.get("source_requirement"),
         SourceRequirement,
     )
-    date_from, valid_start = _parse_model_date(raw.get("date_from"))
-    date_to, valid_end = _parse_model_date(raw.get("date_to"))
+    date_from, date_to = _normalized_model_bounds(
+        raw.get("date_from"),
+        raw.get("date_to"),
+    )
     version_constraint = raw.get("version_constraint")
     if (
         not isinstance(label, str)
         or type(material) is not bool
         or freshness_requirement is None
         or source_requirement is None
-        or not valid_start
-        or not valid_end
         or (version_constraint is not None and type(version_constraint) is not str)
     ):
         return None
@@ -906,15 +937,15 @@ def _parse_model_supplemental_query(
         return None, True
     purpose = _parse_enum(raw.get("purpose"), QueryPurpose)
     text = raw.get("text")
-    date_from, valid_start = _parse_model_date(raw.get("date_from"))
-    date_to, valid_end = _parse_model_date(raw.get("date_to"))
+    date_from, date_to = _normalized_model_bounds(
+        raw.get("date_from"),
+        raw.get("date_to"),
+    )
     if (
         purpose is None
         or purpose in {QueryPurpose.DIRECT, QueryPurpose.REPAIR}
         or not isinstance(text, str)
         or not text.strip()
-        or not valid_start
-        or not valid_end
     ):
         return None, True
     target_topic_ids = tuple(
@@ -938,6 +969,26 @@ def _parse_model_date(value: Any) -> tuple[date | None, bool]:
     return parsed, parsed is not None
 
 
+def _normalized_model_bounds(
+    raw_from: Any,
+    raw_to: Any,
+) -> tuple[date | None, date | None]:
+    date_from, valid_start = _parse_model_date(raw_from)
+    date_to, valid_end = _parse_model_date(raw_to)
+    if (
+        not valid_start
+        or not valid_end
+        or (date_from is None) != (date_to is None)
+        or (
+            date_from is not None
+            and date_to is not None
+            and date_from >= date_to
+        )
+    ):
+        return None, None
+    return date_from, date_to
+
+
 def _effective_freshness_context(
     context: FreshnessContext,
     today: date,
@@ -956,13 +1007,7 @@ def _effective_freshness_context(
             version_constraint=context.version_constraint,
         )
     if context.requirement is FreshnessRequirement.CURRENT:
-        return FreshnessContext(
-            requirement=context.requirement,
-            as_of=None,
-            date_from=today,
-            date_to=today,
-            version_constraint=context.version_constraint,
-        )
+        return context
     return context
 
 
@@ -987,10 +1032,11 @@ def _fallback_required_topics(
     *,
     single_implicit_topic: bool = False,
 ) -> tuple[RequiredTopic, ...]:
+    target_text = _clean_conversational_prefix(retrieval_context.search_keywords or original)
     if single_implicit_topic:
-        labels = (_short_original(original)[:160] or "用户问题",)
+        labels = (_short_original(target_text)[:160] or "用户问题",)
     else:
-        labels = _derive_required_topics(original)[:3] or ("用户问题",)
+        labels = _derive_required_topics(target_text)[:3] or ("用户问题",)
     return tuple(
         RequiredTopic(
             topic_id=f"topic-{index}",

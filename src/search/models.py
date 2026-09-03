@@ -105,6 +105,14 @@ class FreshnessRequirement(StrEnum):
     VERSION = "version"
 
 
+class SearchTimeScope(StrEnum):
+    NONE = "none"
+    TODAY = "today"
+    RECENT = "recent"
+    YEAR = "year"
+    EXPLICIT_RANGE = "explicit_range"
+
+
 class FreshnessEligibility(StrEnum):
     NOT_REQUIRED = "not_required"
     SATISFIED = "satisfied"
@@ -172,6 +180,20 @@ class ProviderStatus(StrEnum):
     ERROR = "error"
     NOT_CONFIGURED = "not_configured"
     UNAVAILABLE = "unavailable"
+
+
+class ProviderErrorCode(StrEnum):
+    INVALID_PARAMETERS = "invalid_parameters"
+    CONNECTION = "connection"
+    UNKNOWN = "unknown"
+
+
+class SearchTerminalCategory(StrEnum):
+    PROVIDER_CONNECTIVITY = "provider_connectivity"
+    PROVIDER_PARAMETERS = "provider_parameters"
+    EMPTY_RESULTS = "empty_results"
+    CONTENT_UNREADABLE = "content_unreadable"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
 class QueryOutcomeStatus(StrEnum):
@@ -278,6 +300,9 @@ class AllowedClaimScope(StrEnum):
 
 class DisclosureCode(StrEnum):
     ONLINE_VERIFICATION_FAILED = "online_verification_failed"
+    SEARCH_UNAVAILABLE = "search_unavailable"
+    NO_SUPPORTING_EVIDENCE = "no_supporting_evidence"
+    PREMISE_MISMATCH = "premise_mismatch"
     JUDGE_UNAVAILABLE = "judge_unavailable"
     PARTIAL_EVIDENCE = "partial_evidence"
     SOURCE_CONFLICT = "source_conflict"
@@ -506,6 +531,11 @@ class RetrievalContext:
     external_fact_required: bool
     complexity_codes: tuple[RetrievalComplexityCode, ...]
     source_requirement: SourceRequirement
+    search_keywords: str | None = None
+    time_scope: SearchTimeScope = SearchTimeScope.NONE
+    time_scope_text: str | None = None
+    publication_date_from: date | None = None
+    publication_date_to: date | None = None
 
     def __post_init__(self) -> None:
         if type(self.must_search) is not bool:
@@ -516,13 +546,35 @@ class RetrievalContext:
             _require_enum(self.skip_reason, SkipReason, "skip_reason")
         _require_enum(self.factuality, Factuality, "factuality")
         _require_enum(self.source_requirement, SourceRequirement, "source_requirement")
+        _require_enum(self.time_scope, SearchTimeScope, "time_scope")
+        if self.search_keywords is not None and type(self.search_keywords) is not str:
+            raise TypeError("search_keywords must be a string or None")
+        if self.time_scope_text is not None and type(self.time_scope_text) is not str:
+            raise TypeError("time_scope_text must be a string or None")
+        for field_name in ("publication_date_from", "publication_date_to"):
+            value = getattr(self, field_name)
+            if value is not None and type(value) is not date:
+                raise TypeError(f"{field_name} must be a date or None")
+        if (
+            self.publication_date_from is not None
+            and self.publication_date_to is not None
+            and self.publication_date_from > self.publication_date_to
+        ):
+            raise ValueError("publication_date_from cannot exceed publication_date_to")
+        keywords = self.search_keywords.strip() if self.search_keywords is not None else None
+        time_scope_text = self.time_scope_text.strip() if self.time_scope_text is not None else None
         complexity_codes = _tuple(self.complexity_codes)
         _require_enum_values(
             complexity_codes,
             RetrievalComplexityCode,
             "complexity_codes",
         )
-        _normalize_fields(self, complexity_codes=complexity_codes)
+        _normalize_fields(
+            self,
+            complexity_codes=complexity_codes,
+            search_keywords=keywords or None,
+            time_scope_text=time_scope_text or None,
+        )
 
 
 @dataclass(frozen=True)
@@ -1261,16 +1313,28 @@ class ProviderResult:
     status: ProviderStatus
     hits: tuple[ProviderHit, ...]
     latency_ms: int | float
+    error_code: ProviderErrorCode | None = None
+    date_filter_normalized: bool = False
+    parameter_retry_attempted: bool = False
 
     def __post_init__(self) -> None:
         _normalize_fields(self, hits=_records(self.hits, ProviderHit, "hits"))
         _require_safe_metadata(self.provider, "provider")
         _require_enum(self.status, ProviderStatus, "status")
+        if self.error_code is not None:
+            _require_enum(self.error_code, ProviderErrorCode, "error_code")
+        if type(self.date_filter_normalized) is not bool or type(self.parameter_retry_attempted) is not bool:
+            raise TypeError("provider recovery metadata must be booleans")
         _require_number(self.latency_ms, "latency_ms")
         if self.status is ProviderStatus.SUCCESS and not self.hits:
             raise ValueError("successful provider result requires hits")
         if self.status is not ProviderStatus.SUCCESS and self.hits:
             raise ValueError("non-success provider result cannot contain hits")
+        if self.status is ProviderStatus.SUCCESS and self.error_code is not None and not (
+            self.error_code is ProviderErrorCode.INVALID_PARAMETERS
+            and self.parameter_retry_attempted
+        ):
+            raise ValueError("successful recovery requires an attempted invalid-parameter retry")
 
 
 @dataclass(frozen=True)
@@ -1659,6 +1723,10 @@ class SearchTrace:
     provider_attempts: tuple[ProviderAttempt, ...] = ()
     provider_invocation_started: bool = False
     provider_failures: tuple[SearchFailureCode, ...] = ()
+    date_filter_normalized_count: int = 0
+    tavily_parameter_retry_count: int = 0
+    snippet_degradation_used: bool = False
+    terminal_search_category: SearchTerminalCategory | None = None
     candidate_url_count: int = 0
     citable_evidence_count: int = 0
     evidence_state: EvidenceState | None = None
@@ -1766,6 +1834,7 @@ class SearchTrace:
             self.judge_anomaly_count,
         )
         for enum_value, enum_type, field_name in (
+            (self.terminal_search_category, SearchTerminalCategory, "terminal_search_category"),
             (self.answer_generation_mode, AnswerGenerationMode, "answer_generation_mode"),
             (self.answer_certainty, AnswerCertainty, "answer_certainty"),
             (self.answer_claim_scope, AllowedClaimScope, "answer_claim_scope"),
@@ -1784,7 +1853,11 @@ class SearchTrace:
             WarningCode,
             "answer_warning_codes",
         )
+        if type(self.snippet_degradation_used) is not bool:
+            raise TypeError("snippet_degradation_used must be a boolean")
         for field_name in (
+            "date_filter_normalized_count",
+            "tavily_parameter_retry_count",
             "validator_retained_claim_count",
             "validator_removed_block_count",
             "render_citation_count",
@@ -1893,6 +1966,10 @@ class SearchTrace:
             "provider_attempts": [_attempt_metadata(attempt) for attempt in self.provider_attempts],
             "provider_invocation_started": self.provider_invocation_started,
             "provider_failures": self.provider_failures,
+            "date_filter_normalized_count": self.date_filter_normalized_count,
+            "tavily_parameter_retry_count": self.tavily_parameter_retry_count,
+            "snippet_degradation_used": self.snippet_degradation_used,
+            "terminal_search_category": self.terminal_search_category,
             "candidate_url_count": self.candidate_url_count,
             "citable_evidence_count": self.citable_evidence_count,
             "evidence_state": self.evidence_state,

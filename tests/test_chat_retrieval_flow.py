@@ -530,7 +530,7 @@ class FailureFlowTests(unittest.TestCase):
     def test_stable_failure_uses_fixed_disclosure_and_no_memory(self):
         result = search_result(SearchTier.LIGHT, failure=models().SearchFailureCode.NO_RESULTS)
         reply, llm_chat = self._run(result)
-        self.assertIn("无法完成在线核验", reply)
+        self.assertIn("暂未找到足以确认结论的信息", reply)
         self.assertEqual(0, llm_chat.call_count)
 
     def test_dynamic_low_risk_failure_does_not_use_memory_or_risk_warning(self):
@@ -543,7 +543,7 @@ class FailureFlowTests(unittest.TestCase):
             text="昨天天曼契约EDGVSTEC谁赢了",
         )
         self.assertEqual(0, llm_chat.call_count)
-        self.assertIn("无法完成在线核验", reply)
+        self.assertIn("在线搜索服务暂时不可用", reply)
         self.assertNotIn("不能替代适当的专业判断", reply)
         self.assertNotIn("EDG赢了", reply)
         self.assertNotIn("TEC赢了", reply)

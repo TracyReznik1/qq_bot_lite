@@ -22,6 +22,7 @@ from src.search.models import (
     FreshnessRequirement,
     RenderOutcome,
     RenderState,
+    RepairReasonCode,
     RequestAnalysis,
     SearchFailureCode,
     SkipReason,
@@ -115,12 +116,17 @@ def decide_answer_state(
             warnings,
             validator_requirement,
         )
+    disclosure = (
+        DisclosureCode.PREMISE_MISMATCH
+        if _has_evidence_backed_premise_mismatch(evidence)
+        else _failure_disclosure(failure_code)
+    )
     return AnswerState(
         state,
         AnswerGenerationMode.FIXED,
         AnswerCertainty.UNVERIFIED,
         AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
-        (_failure_disclosure(failure_code),),
+        (disclosure,),
         warnings,
         validator_requirement,
     )
@@ -159,6 +165,17 @@ def _conflict_topic_ids(evidence: EvidenceBundle) -> frozenset[str]:
     )
 
 
+def _has_evidence_backed_premise_mismatch(
+    evidence: EvidenceBundle | None,
+) -> bool:
+    if evidence is None:
+        return False
+    gap = getattr(evidence, "gap_analysis", None)
+    return RepairReasonCode.PREMISE_MISMATCH in tuple(
+        getattr(gap, "repair_reason_codes", ())
+    )
+
+
 def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCode:
     """Map a search failure to its deterministic disclosure code."""
     if failure_code is SearchFailureCode.USER_FORBID_WEB:
@@ -167,7 +184,13 @@ def _failure_disclosure(failure_code: SearchFailureCode | None) -> DisclosureCod
         return DisclosureCode.VALIDATION_FAILED
     if failure_code is SearchFailureCode.JUDGE_UNAVAILABLE:
         return DisclosureCode.JUDGE_UNAVAILABLE
-    return DisclosureCode.ONLINE_VERIFICATION_FAILED
+    if failure_code in {
+        SearchFailureCode.PROVIDER_NOT_CONFIGURED,
+        SearchFailureCode.PROVIDER_UNAVAILABLE,
+        SearchFailureCode.PROVIDER_TIMEOUT,
+    }:
+        return DisclosureCode.SEARCH_UNAVAILABLE
+    return DisclosureCode.NO_SUPPORTING_EVIDENCE
 
 
 def build_render_state(

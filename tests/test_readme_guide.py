@@ -214,12 +214,17 @@ class ReadmeGuideTests(unittest.TestCase):
             "`light` 约 58 秒、`standard` 约 112 秒",
             self.readme,
         )
-        self.assertIn(
-            "返回明确的在线检索失败披露（不同路径会说明在线检索未完成或无法完成在线核验）",
-            self.readme,
-        )
-        self.assertIn("在线检索未完成", self.readme)
-        self.assertIn("无法完成在线核验", self.readme)
+        self.assertIn("在线搜索服务暂时不可用", self.readme)
+        self.assertIn("暂未找到足以确认结论的信息", self.readme)
+        self.assertIn("名称或前提不一致", self.readme)
+
+    def test_readme_describes_resilient_search_recovery(self):
+        self.assertIn("事件时间", self.readme)
+        self.assertIn("网页发布时间", self.readme)
+        self.assertIn("移除日期过滤后重试一次 Tavily", self.readme)
+        self.assertIn("搜索摘要", self.readme)
+        self.assertIn("低置信度", self.readme)
+        self.assertIn("不会额外调用 LLM 复核", self.readme)
 
     def test_operator_docs_remove_old_model_variables(self):
         env_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")

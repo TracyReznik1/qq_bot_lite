@@ -20,6 +20,9 @@ from src.search.models import (
 _PARTIAL_PREFIX = "以下只回答已获得证据支持的部分；其余部分暂无法确认。"
 _CONFLICT_PREFIX = "来源之间存在未解决差异，下面分别列出，不合并为单一结论。"
 _DYNAMIC_REFUSAL = "我暂时无法完成在线核验，因此不能确认当前结论。"
+_SEARCH_UNAVAILABLE = "在线搜索服务暂时不可用，请稍后再试。"
+_NO_SUPPORTING_EVIDENCE = "我完成了搜索，但暂未找到足以确认结论的信息。"
+_PREMISE_MISMATCH = "检索到的信息与问题中的名称或前提不一致，请确认表述后再试。"
 _NO_WEB_DYNAMIC_LIMIT = "根据你的要求，本次没有联网核验；涉及当前状态的结论无法确认。"
 _VALIDATION_FAILED = "回答未能通过证据核验，已移除无法确认的内容。"
 _VALIDATION_UNAVAILABLE = "已获得网页材料，但本次未能完成语义支撑核验；以下表述应谨慎看待。"
@@ -32,6 +35,9 @@ _NO_WEB_HIGH_CONSEQUENCE_WARNING = (
 
 _DISCLOSURE_TEXT = {
     DisclosureCode.ONLINE_VERIFICATION_FAILED: _DYNAMIC_REFUSAL,
+    DisclosureCode.SEARCH_UNAVAILABLE: _SEARCH_UNAVAILABLE,
+    DisclosureCode.NO_SUPPORTING_EVIDENCE: _NO_SUPPORTING_EVIDENCE,
+    DisclosureCode.PREMISE_MISMATCH: _PREMISE_MISMATCH,
     DisclosureCode.JUDGE_UNAVAILABLE: _JUDGE_UNAVAILABLE,
     DisclosureCode.PARTIAL_EVIDENCE: _PARTIAL_PREFIX,
     DisclosureCode.SOURCE_CONFLICT: _CONFLICT_PREFIX,

@@ -11,7 +11,10 @@ from datetime import date, datetime, timezone
 from typing import Any
 from unittest import mock
 
+from tavily.errors import BadRequestError
+
 from src.search.models import (
+    ProviderErrorCode,
     ProviderHit,
     ProviderReadiness,
     ProviderResult,
@@ -208,11 +211,11 @@ class TavilyAdapterTests(unittest.TestCase):
         self.assertEqual(client.calls[0][1]["search_depth"], "advanced")
         self.assertTrue(client.calls[0][1]["include_raw_content"])
 
-    def test_maps_date_domains_and_topic(self):
+    def test_equal_date_bounds_are_omitted_before_tavily_call(self):
         client = FakeTavilyClient()
         adapter = self._adapter(client)
         from_today = date(2026, 7, 29)
-        adapter.search(
+        result = adapter.search(
             query(
                 purpose=QueryPurpose.TIME_BOUNDED,
                 date_from=from_today,
@@ -225,10 +228,89 @@ class TavilyAdapterTests(unittest.TestCase):
             timeout_seconds=20.0,
         )
         kwargs = client.calls[0][1]
-        self.assertEqual(kwargs["start_date"], "2026-07-29")
-        self.assertEqual(kwargs["end_date"], "2026-07-29")
+        self.assertNotIn("start_date", kwargs)
+        self.assertNotIn("end_date", kwargs)
         self.assertEqual(kwargs["include_domains"], ("example.com",))
         self.assertEqual(kwargs["exclude_domains"], ("badexample.net",))
+        self.assertTrue(result.date_filter_normalized)
+        self.assertFalse(result.parameter_retry_attempted)
+
+    def test_bad_request_with_dates_retries_once_without_dates(self):
+        client = FakeTavilyClient()
+        client.search = mock.Mock(side_effect=[
+            BadRequestError("start_date and end_date invalid"),
+            {"results": [_tavily_hit()]},
+        ])
+        adapter = self._adapter(client)
+
+        result = adapter.search(
+            query(date_from=date(2026, 1, 1), date_to=date(2026, 9, 3)),
+            tier=SearchTier.LIGHT,
+            max_results=4,
+            timeout_seconds=8.0,
+        )
+
+        self.assertEqual(2, client.search.call_count)
+        self.assertIn("start_date", client.search.call_args_list[0].kwargs)
+        self.assertNotIn("start_date", client.search.call_args_list[1].kwargs)
+        self.assertIs(result.status, ProviderStatus.SUCCESS)
+        self.assertIs(result.error_code, ProviderErrorCode.INVALID_PARAMETERS)
+        self.assertTrue(result.parameter_retry_attempted)
+
+    def test_second_bad_request_returns_closed_parameter_error(self):
+        client = FakeTavilyClient()
+        client.search = mock.Mock(side_effect=[
+            BadRequestError("bad dates"),
+            BadRequestError("still bad"),
+        ])
+        adapter = self._adapter(client)
+
+        result = adapter.search(
+            query(date_from=date(2026, 1, 1), date_to=date(2026, 9, 3)),
+            tier=SearchTier.LIGHT,
+            max_results=4,
+            timeout_seconds=8.0,
+        )
+
+        self.assertEqual(2, client.search.call_count)
+        self.assertIs(result.status, ProviderStatus.ERROR)
+        self.assertIs(result.error_code, ProviderErrorCode.INVALID_PARAMETERS)
+        self.assertTrue(result.date_filter_normalized)
+        self.assertTrue(result.parameter_retry_attempted)
+
+    def test_parameter_retry_receives_only_remaining_timeout(self):
+        client = FakeTavilyClient()
+        client.search = mock.Mock(side_effect=[
+            BadRequestError("bad dates"),
+            {"results": [_tavily_hit()]},
+        ])
+        adapter = self._adapter(client)
+
+        with mock.patch.object(self.module.tavily.time, "monotonic", side_effect=[10.0, 12.5, 12.5]):
+            result = adapter.search(
+                query(date_from=date(2026, 1, 1), date_to=date(2026, 9, 3)),
+                tier=SearchTier.LIGHT,
+                max_results=4,
+                timeout_seconds=8.0,
+            )
+
+        self.assertIs(result.status, ProviderStatus.SUCCESS)
+        self.assertAlmostEqual(5.5, client.search.call_args_list[1].kwargs["timeout"])
+
+    def test_non_parameter_error_does_not_retry(self):
+        client = FakeTavilyClient()
+        client.search = mock.Mock(side_effect=RuntimeError("connection failed"))
+        adapter = self._adapter(client)
+
+        result = adapter.search(
+            query(date_from=date(2026, 1, 1), date_to=date(2026, 9, 3)),
+            tier=SearchTier.LIGHT,
+            max_results=4,
+            timeout_seconds=8.0,
+        )
+
+        self.assertEqual(1, client.search.call_count)
+        self.assertIs(result.status, ProviderStatus.ERROR)
 
     def test_news_topic_for_time_bounded_purpose(self):
         client = FakeTavilyClient()

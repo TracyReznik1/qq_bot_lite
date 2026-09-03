@@ -8,6 +8,7 @@ from src.search.models import (
     EvidenceCandidate,
     EvidenceState,
     ExcerptOrigin,
+    ProviderErrorCode,
     ProviderHit,
     ProviderReadiness,
     ProviderResult,
@@ -133,14 +134,14 @@ def _make_planner():
 
 
 class ProviderBatchOrchestrationTests(unittest.TestCase):
-    def _make_orchestrator(self, providers):
+    def _make_orchestrator(self, providers, *, extractor=None):
         return SearchOrchestrator(
             request_analyzer=_make_request_analyzer(),
             router=_make_router(),
             planner=_make_planner(),
             judge=_FakeJudge(),
             providers=providers,
-            extractor=_FakeExtractor(),
+            extractor=extractor if extractor is not None else _FakeExtractor(),
         )
 
     def test_tavily_resolves_all_queries_ddgs_not_invoked(self):
@@ -179,6 +180,134 @@ class ProviderBatchOrchestrationTests(unittest.TestCase):
         self.assertEqual([], ddgs_calls)
         self.assertIs(result.evidence.evidence_state, EvidenceState.SUFFICIENT)
         self.assertEqual("tavily", result.trace.provider_attempts[0].provider)
+
+    def test_recovered_tavily_parameter_error_does_not_fall_back(self):
+        tavily_calls = []
+        ddgs_calls = []
+
+        class MockTavily:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, query, **kwargs):
+                tavily_calls.append(query.query_id)
+                hit = _hit(
+                    url=f"https://tavily.example.com/{query.query_id}",
+                    query_id=query.query_id,
+                    provider="tavily",
+                )
+                return ProviderResult(
+                    "tavily",
+                    ProviderStatus.SUCCESS,
+                    (hit,),
+                    2,
+                    error_code=ProviderErrorCode.INVALID_PARAMETERS,
+                    date_filter_normalized=True,
+                    parameter_retry_attempted=True,
+                )
+
+        class MockDDGS:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, query, **kwargs):
+                ddgs_calls.append(query.query_id)
+                return ProviderResult("ddgs", ProviderStatus.EMPTY, (), 1)
+
+        result = self._make_orchestrator((MockDDGS(), MockTavily())).run(_request())
+
+        self.assertTrue(tavily_calls)
+        self.assertEqual([], ddgs_calls)
+        self.assertEqual(result.trace.semantic_query_count, result.trace.tavily_parameter_retry_count)
+        self.assertEqual(result.trace.semantic_query_count, result.trace.date_filter_normalized_count)
+        self.assertIsNone(result.trace.terminal_search_category)
+
+    def test_terminal_tavily_parameter_error_falls_back_to_ddgs(self):
+        tavily_calls = []
+        ddgs_calls = []
+
+        class MockTavily:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, query, **kwargs):
+                tavily_calls.append(query.query_id)
+                return ProviderResult(
+                    "tavily",
+                    ProviderStatus.ERROR,
+                    (),
+                    2,
+                    error_code=ProviderErrorCode.INVALID_PARAMETERS,
+                    parameter_retry_attempted=True,
+                )
+
+        class MockDDGS:
+            name = "ddgs"
+
+            def readiness(self):
+                return ProviderReadiness("ddgs", True, True, None)
+
+            def search(self, query, **kwargs):
+                ddgs_calls.append(query.query_id)
+                hit = _hit(
+                    url=f"https://ddgs.example.com/{query.query_id}",
+                    query_id=query.query_id,
+                    provider="ddgs",
+                )
+                return ProviderResult("ddgs", ProviderStatus.SUCCESS, (hit,), 1)
+
+        result = self._make_orchestrator((MockDDGS(), MockTavily())).run(_request())
+
+        self.assertEqual(set(tavily_calls), set(ddgs_calls))
+        self.assertEqual(result.trace.semantic_query_count, result.trace.tavily_parameter_retry_count)
+        self.assertEqual(result.trace.semantic_query_count, len(set(tavily_calls)))
+
+    def test_qualified_provider_snippet_sets_degradation_trace_flag(self):
+        class MockTavily:
+            name = "tavily"
+
+            def readiness(self):
+                return ProviderReadiness("tavily", True, True, None)
+
+            def search(self, query, **kwargs):
+                hit = _hit(
+                    url=f"https://tavily.example.com/{query.query_id}",
+                    snippet="2026上海全球冠军赛CN四支队伍为JDG、TYL、EDG和XLG，完整名单已经确认。",
+                    query_id=query.query_id,
+                    provider="tavily",
+                )
+                return ProviderResult("tavily", ProviderStatus.SUCCESS, (hit,), 1)
+
+        class FailedFetchExtractor(_FakeExtractor):
+            def extract(self, hit, query, *, allow_network_read=True, timeout_seconds=None):
+                item = super().extract(
+                    hit,
+                    query,
+                    allow_network_read=allow_network_read,
+                    timeout_seconds=timeout_seconds,
+                )
+                return EvidenceCandidate(
+                    hit=item.hit,
+                    document=None,
+                    excerpt=item.excerpt,
+                    excerpt_origin=item.excerpt_origin,
+                    extraction_status="search_result_snippet_after_fetch_failure",
+                    safety_flags=(),
+                    content_reads_consumed=1,
+                )
+
+        result = self._make_orchestrator(
+            (MockTavily(),),
+            extractor=FailedFetchExtractor(),
+        ).run(_request())
+
+        self.assertTrue(result.trace.snippet_degradation_used)
 
     def test_tavily_fails_one_query_only_unresolved_query_falls_back_to_ddgs(self):
         tavily_calls = []

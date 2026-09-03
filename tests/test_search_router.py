@@ -25,6 +25,7 @@ from src.search.models import (
     RiskContext,
     RiskLevel,
     SearchTier,
+    SearchTimeScope,
     SkipReason,
     SourceRequirement,
     TriggerCode,
@@ -834,6 +835,37 @@ class LLMRequestAnalyzerTests(unittest.TestCase):
     def test_parses_fenced_json(self):
         result = self._parse(f"```json\n{json.dumps(NEUTRAL)}\n```")
         self.assertEqual(result["complexity_codes"], ())
+
+    def test_parses_optional_search_time_contract(self):
+        result = self._parse(json.dumps({
+            **NEUTRAL,
+            "search_keywords": "2026 无畏契约 上海冠军赛 CN 晋级队伍",
+            "time_scope": "year",
+            "time_scope_text": "2026年",
+            "publication_date_from": None,
+            "publication_date_to": None,
+        }, ensure_ascii=False))
+
+        self.assertEqual(
+            "2026 无畏契约 上海冠军赛 CN 晋级队伍",
+            result["search_keywords"],
+        )
+        self.assertIs(result["time_scope"], SearchTimeScope.YEAR)
+        self.assertEqual("2026年", result["time_scope_text"])
+        self.assertIsNone(result["publication_date_from"])
+        self.assertIsNone(result["publication_date_to"])
+
+    def test_legacy_advisor_payload_defaults_search_time_contract(self):
+        result = self._parse(json.dumps(NEUTRAL))
+
+        self.assertIs(result["time_scope"], SearchTimeScope.NONE)
+        self.assertIsNone(result["time_scope_text"])
+        self.assertIsNone(result["publication_date_from"])
+        self.assertIsNone(result["publication_date_to"])
+
+    def test_unknown_search_time_scope_is_empty(self):
+        payload = {**NEUTRAL, "time_scope": "sometimes"}
+        self.assertEqual({}, self._parse(json.dumps(payload)))
 
     def test_dates_require_basic_iso_hyphenated_format(self):
         for field_name in ("as_of", "date_from", "date_to"):

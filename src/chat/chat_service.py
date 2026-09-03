@@ -393,7 +393,15 @@ class _Verifier:
         ]
         try:
             response = llm.chat(messages, temperature=0.0)
-            parsed = json.loads(response.content)
+            raw = str(getattr(response, "content", "") or "").strip()
+            fence_match = re.search(r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```", raw, re.IGNORECASE | re.DOTALL)
+            if fence_match is not None:
+                raw = fence_match.group("body").strip()
+            first_brace = raw.find("{")
+            last_brace = raw.rfind("}")
+            if first_brace != -1 and last_brace > first_brace:
+                raw = raw[first_brace:last_brace + 1].strip()
+            parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise SemanticVerificationUnavailable("verifier returned non-object")
             return parsed

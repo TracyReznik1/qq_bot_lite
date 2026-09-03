@@ -230,6 +230,9 @@ class ProviderRegistry:
                 status=result.status,
                 hits=tuple(result.hits),
                 latency_ms=max(elapsed_ms, 0),
+                error_code=result.error_code,
+                date_filter_normalized=result.date_filter_normalized,
+                parameter_retry_attempted=result.parameter_retry_attempted,
             )
 
         attempt = self._attempt(provider, query, result, readiness)
