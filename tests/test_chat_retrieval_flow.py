@@ -397,7 +397,9 @@ class SearchFlowTests(unittest.TestCase):
                     force_search=force_search,
                 )
                 self.assertIn("版本是3.2", reply)
-                self.assertIn("来源：", reply)
+                self.assertNotIn("来源：", reply)
+                self.assertNotRegex(reply, r"\[\d+\]")
+                self.assertNotIn("https://", reply)
                 for forbidden in ("检索完成", "搜索成功", "搜索状态：success"):
                     self.assertNotIn(forbidden, reply)
                 self.assertNotIn("不能替代适当的专业判断", reply)
@@ -446,7 +448,9 @@ class SearchFlowTests(unittest.TestCase):
                 self.assertIn("冒号说明仍保留", reply)
                 self.assertIn("中文正文保留", reply)
                 self.assertIn("ASCII 正文保留", reply)
-                self.assertIn("来源：", reply)
+                self.assertNotIn("来源：", reply)
+                self.assertNotRegex(reply, r"\[\d+\]")
+                self.assertNotIn("https://", reply)
                 for forbidden in (
                     "检索完成",
                     "搜索成功",
@@ -690,10 +694,13 @@ class FailureFlowTests(unittest.TestCase):
 
         self.assertIn("回答未能通过证据核验", reply)
         self.assertIn("来源之间存在未解决差异", reply)
-        self.assertIn("Source A：3.2", reply)
-        self.assertIn("Source B：3.3", reply)
-        self.assertIn("https://a.example.com", reply)
-        self.assertIn("https://b.example.com", reply)
+        self.assertIn("3.2", reply)
+        self.assertIn("3.3", reply)
+        self.assertNotIn("Source A", reply)
+        self.assertNotIn("Source B", reply)
+        self.assertNotIn("https://a.example.com", reply)
+        self.assertNotIn("https://b.example.com", reply)
+        self.assertNotRegex(reply, r"\[\d+\]")
 
 
 class NoToolsTests(unittest.TestCase):
@@ -792,7 +799,9 @@ class TraceLifecycleTests(unittest.TestCase):
         finally:
             chat_service._search_orchestrator = old
 
-        self.assertIn("版本是3.2[1]", reply)
+        self.assertIn("版本是3.2", reply)
+        self.assertNotIn("[1]", reply)
+        self.assertNotIn("来源：", reply)
         trace = result.trace
         self.assertGreater(trace.answer_generation_latency_ms, 0)
         self.assertGreater(trace.structural_validation_latency_ms, 0)
@@ -947,10 +956,11 @@ class PartialConflictFlowTests(unittest.TestCase):
         reply = self._run_grounded(result)
         self.assertIn("版本是3.2", reply)
         self.assertIn("以下只回答已获得证据支持的部分", reply)
-        self.assertIn("https://a.example.com", reply)
+        self.assertNotIn("https://a.example.com", reply)
+        self.assertNotRegex(reply, r"\[\d+\]")
         self.assertNotIn("不能替代适当的专业判断", reply)
 
-    def test_conflict_bundle_shows_sources(self):
+    def test_conflict_bundle_hides_sources(self):
         m = models()
         p = plan(SearchTier.STANDARD, required=("版本",))
         conflict_bundle = m.EvidenceBundle(
@@ -986,8 +996,11 @@ class PartialConflictFlowTests(unittest.TestCase):
         result = search_result(SearchTier.STANDARD, conflict_bundle, failure=m.SearchFailureCode.SOURCE_CONFLICT)
         reply = self._run_grounded(result)
         self.assertIn("来源之间存在未解决差异", reply)
-        self.assertIn("https://a.example.com", reply)
-        self.assertIn("https://b.example.com", reply)
+        self.assertIn("3.2", reply)
+        self.assertIn("3.3", reply)
+        self.assertNotIn("https://a.example.com", reply)
+        self.assertNotIn("https://b.example.com", reply)
+        self.assertNotRegex(reply, r"\[\d+\]")
         self.assertNotIn("不能替代适当的专业判断", reply)
 
 

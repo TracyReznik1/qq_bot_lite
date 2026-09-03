@@ -8,7 +8,6 @@ from typing import Mapping, Sequence
 
 from src.search.models import (
     AnswerBlock,
-    Claim,
     DisclosureCode,
     EvidenceConflict,
     EvidenceItem,
@@ -166,87 +165,43 @@ def _source_title_line_within_budget(
 
 def render_search_reply(state: RenderState, *, qq_limit: int) -> RenderedReply:
     """Render a deterministic view state into a QQ reply."""
-    body = _render_blocks(state.visible_blocks, state.visible_claims, state.citation_map)
-    conflicts = _render_conflicts(
-        state.conflict_groups,
-        state.citation_map,
-        state.used_sources,
-    )
+    body = _render_blocks(state.visible_blocks)
+    conflicts = _render_conflicts(state.conflict_groups)
     warnings = _render_warning_codes(state.warning_codes, state.disclosure_codes)
     disclosures = _render_disclosure_codes(state.disclosure_codes, state.warning_codes)
-    sources, used_ids, shown_urls = _render_sources(
+    used_ids, shown_urls = _source_metadata(
         state.used_sources,
         state.citation_map,
-        qq_limit,
     )
     return _finish_render(
         body,
         conflicts,
         disclosures,
         warnings,
-        sources,
         used_ids,
         shown_urls,
         qq_limit,
     )
 
 
-def _render_blocks(
-    blocks: Sequence[AnswerBlock],
-    claims: Sequence[Claim],
-    citation_map: Mapping[str, int],
-) -> str:
-    claims_by_block: dict[str, list[Claim]] = {}
-    for claim in claims:
-        claims_by_block.setdefault(claim.block_id, []).append(claim)
-
-    parts: list[str] = []
-    for block in blocks:
-        numbers: list[int] = []
-        for claim in claims_by_block.get(block.block_id, ()):
-            for evidence_id in claim.evidence_ids:
-                number = citation_map.get(evidence_id)
-                if number is not None and number not in numbers:
-                    numbers.append(number)
-        text = block.text
-        if numbers:
-            text = f"{text}{''.join(f'[{number}]' for number in sorted(numbers))}"
-        parts.append(text)
-    return "\n".join(parts).strip()
+def _render_blocks(blocks: Sequence[AnswerBlock]) -> str:
+    return "\n".join(block.text for block in blocks).strip()
 
 
 def _render_conflicts(
     conflicts: Sequence[EvidenceConflict],
-    citation_map: Mapping[str, int],
-    used_sources: Sequence[EvidenceItem],
 ) -> list[str]:
-    evidence_by_id = {item.evidence_id: item for item in used_sources}
     sections: list[str] = []
     for conflict in conflicts:
-        member_lines: list[str] = []
-        for member in conflict.members:
-            item = evidence_by_id.get(member.evidence_id)
-            number = citation_map.get(member.evidence_id)
-            if item is None or number is None:
-                continue
-            title = _bounded_title(
-                item.title or item.publisher or member.evidence_id,
-                60,
+        values = list(
+            dict.fromkeys(
+                member.value for member in conflict.members if member.value
             )
-            published_at = member.published_at or item.published_at
-            details: list[str] = []
-            if published_at is not None:
-                if hasattr(published_at, "date"):
-                    details.append(f"日期：{published_at.date().isoformat()}")
-                elif hasattr(published_at, "isoformat"):
-                    details.append(f"日期：{published_at.isoformat()}")
-            if member.relation == "claims_supersession":
-                details.append("该来源声称为后续更新")
-            detail_text = f"（{'；'.join(details)}）" if details else ""
-            member_lines.append(f"- {title}：{member.value}{detail_text}[{number}]")
-        if member_lines:
+        )
+        if values:
             sections.append(
-                f"冲突点（{conflict.conflict_key}）：\n" + "\n".join(member_lines)
+                f"冲突点（{conflict.conflict_key}）：\n"
+                + "\n".join(f"- {value}" for value in values)
             )
     return sections
 
@@ -278,25 +233,18 @@ def _render_warning_codes(
     return [_HIGH_CONSEQUENCE_WARNING]
 
 
-def _render_sources(
+def _source_metadata(
     sources: Sequence[EvidenceItem],
     citation_map: Mapping[str, int],
-    qq_limit: int,
-) -> tuple[list[str], list[str], list[str]]:
-    lines: list[str] = []
+) -> tuple[list[str], list[str]]:
     used_ids: list[str] = []
     shown_urls: list[str] = []
     for item in sources:
-        number = citation_map.get(item.evidence_id)
-        if number is None or not item.url:
+        if citation_map.get(item.evidence_id) is None or not item.url:
             continue
-        url = item.url
-        title = _bounded_source_title(item.title or url, url, number, qq_limit)
-        lines.append(f"[{number}] {_bounded_title(title)}")
-        lines.append(url)
         used_ids.append(item.evidence_id)
-        shown_urls.append(url)
-    return lines, used_ids, shown_urls
+        shown_urls.append(item.url)
+    return used_ids, shown_urls
 
 
 def _finish_render(
@@ -304,7 +252,6 @@ def _finish_render(
     conflicts: list[str],
     disclosures: list[str],
     warnings: list[str],
-    sources: list[str],
     used_ids: list[str],
     shown_urls: list[str],
     qq_limit: int,
@@ -317,9 +264,6 @@ def _finish_render(
         sections.append("\n\n".join(conflicts))
     body_text = "\n\n".join(sections)
     text = _compose_disclosures(body_text, prefix)
-    if sources:
-        source_block = "\n".join(sources)
-        text = f"{text}\n\n来源：\n{source_block}" if text else f"来源：\n{source_block}"
     chunks = split_qq_reply(text, qq_limit)
     return RenderedReply(
         text=text,
@@ -368,14 +312,6 @@ def _compose_disclosures(body: str, disclosures: Sequence[str]) -> str:
     if prefix and cleaned:
         return f"{prefix}\n\n{cleaned}"
     return prefix or cleaned
-
-
-def _bounded_source_title(title: str, url: str, number: int, limit: int) -> str:
-    if len(url) > limit:
-        return _bounded_title(title)
-    fixed_length = len(f"[{number}] \n{url}")
-    available = max(limit - fixed_length, 1)
-    return _bounded_title(title, min(80, available))
 
 
 def _bounded_title(title: str, limit: int = 80) -> str:
