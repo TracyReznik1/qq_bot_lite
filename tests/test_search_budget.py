@@ -18,7 +18,7 @@ class SearchBudgetPolicyTests(unittest.TestCase):
             {
                 "analysis_route_seconds": 3,
                 "planner_seconds": 0,
-                "initial_ddgs_seconds": 6,
+                "initial_ddgs_seconds": 30,
                 "initial_tavily_seconds": 6,
                 "initial_reader_seconds": 4,
                 "initial_judge_seconds": 4,
@@ -35,7 +35,7 @@ class SearchBudgetPolicyTests(unittest.TestCase):
             },
             vars(budget),
         )
-        self.assertEqual(34, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.LIGHT))
+        self.assertEqual(58, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.LIGHT))
 
     def test_standard_stages_and_watchdog_are_derived(self):
         budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.STANDARD)
@@ -44,13 +44,13 @@ class SearchBudgetPolicyTests(unittest.TestCase):
             {
                 "analysis_route_seconds": 3,
                 "planner_seconds": 4,
-                "initial_ddgs_seconds": 8,
+                "initial_ddgs_seconds": 30,
                 "initial_tavily_seconds": 8,
                 "initial_reader_seconds": 6,
                 "initial_judge_seconds": 5,
                 "gap_seconds": 1,
                 "repair_planner_seconds": 2,
-                "repair_ddgs_seconds": 5,
+                "repair_ddgs_seconds": 30,
                 "repair_tavily_seconds": 5,
                 "repair_reader_seconds": 3,
                 "repair_judge_seconds": 4,
@@ -61,7 +61,15 @@ class SearchBudgetPolicyTests(unittest.TestCase):
             },
             vars(budget),
         )
-        self.assertEqual(65, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.STANDARD))
+        self.assertEqual(112, DEFAULT_SEARCH_BUDGET_POLICY.maximum_request_seconds(SearchTier.STANDARD))
+
+    def test_every_active_ddgs_stage_has_thirty_second_budget(self):
+        light = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT)
+        standard = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.STANDARD)
+
+        self.assertEqual(30, light.initial_ddgs_seconds)
+        self.assertEqual(30, standard.initial_ddgs_seconds)
+        self.assertEqual(30, standard.repair_ddgs_seconds)
 
     def test_watchdog_changes_when_a_stage_changes_without_a_second_constant(self):
         original = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT)
