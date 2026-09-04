@@ -21,12 +21,16 @@ from .providers import (
     ProviderStatus,
     SearchProvider,
 )
+from .ranking import EvidenceRanker, RankingResult
+from .reader import OnDemandReader
 from .retrieval import ProviderRunner
 from .tavily import TavilySearchProvider
 
 __all__ = (
     "DDGSSearchProvider",
+    "EvidenceRanker",
     "IMAGE_ONLY_FALLBACK_QUERY",
+    "OnDemandReader",
     "OutputKind",
     "ProviderErrorCode",
     "ProviderHit",
@@ -35,6 +39,7 @@ __all__ = (
     "ProviderRunner",
     "ProviderStatus",
     "QueryPlanner",
+    "RankingResult",
     "RequestSource",
     "SearchFailure",
     "SearchMode",
