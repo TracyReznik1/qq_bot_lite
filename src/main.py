@@ -12,6 +12,8 @@ from src.commands import CommandContext, handle_command
 from src.commands.renderer import PersonaCommandRenderer
 from src.config import BASE_DIR, config
 from src.persona import PersonaConfigurationError, get_persona
+from src.search.simple.models import SearchMode
+
 from src.messaging import (
     MessageQueue,
     enqueue_message,
@@ -148,8 +150,9 @@ def strip_bot_mention(raw_msg: str, self_id: str) -> tuple[bool, str]:
 
 
 def split_reply(text: str) -> list[str]:
-    from src.search.renderer import split_qq_reply
+    from src.search.simple.rendering import split_qq_reply
     return split_qq_reply(text, max(config.max_reply_chars, 200))
+
 
 
 def send_reply(target_id: Any, text: str, is_group: bool) -> None:
@@ -258,6 +261,12 @@ def _process_message(data: dict[str, Any]) -> None:
             is_group=is_group,
             group_id=str(data.get("group_id")) if is_group else None,
         )
+
+        image_data_urls = load_chat_images(
+            parsed_message.image_urls,
+            image_file_ids=parsed_message.image_file_ids,
+            image_url_resolver=onebot.get_image_url,
+        )
         if route.handler == "command":
             result = handle_command(
                 route,
@@ -267,6 +276,7 @@ def _process_message(data: dict[str, Any]) -> None:
                     raw_message=route_text,
                     memory_context=mem_ctx,
                     message_id=str(data.get("message_id") or ""),
+                    image_data_urls=tuple(image_data_urls),
                 ),
                 renderer=command_renderer,
             )
@@ -318,22 +328,18 @@ def _process_message(data: dict[str, Any]) -> None:
                 mem_event.sequence,
                 type(error).__name__,
             )
-        image_data_urls: list[str] = []
 
         try:
             logger.info("Generating chat reply session_key=%s is_group=%s", session_key, is_group)
-            image_data_urls = load_chat_images(
-                parsed_message.image_urls,
-                image_file_ids=parsed_message.image_file_ids,
-                image_url_resolver=onebot.get_image_url,
-            )
             reply = generate_reply(
                 session_key,
                 parsed_message.text,
                 image_data_urls=image_data_urls,
+                mode=SearchMode.LIGHT,
             )
             logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
             send_reply(target_id, reply, is_group)
+
         finally:
             if job_id is not None:
                 try:
@@ -344,6 +350,7 @@ def _process_message(data: dict[str, Any]) -> None:
                         job_id,
                         type(error).__name__,
                     )
+
     except ImageInputError as error:
         send_reply(target_id, str(error), is_group)
     except ImageRecognitionUnavailable as error:
@@ -461,10 +468,9 @@ def health() -> dict[str, Any]:
 
 
 def _search_readiness() -> list[Any]:
-    from src.search import get_search_orchestrator
-    orchestrator = get_search_orchestrator()
-    providers = getattr(orchestrator, "_providers", ()) or ()
-    return [provider.readiness() for provider in providers]
+    from src.search.simple.factory import get_search_readiness
+    return list(get_search_readiness())
+
 
 
 def run() -> None:

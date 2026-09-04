@@ -31,7 +31,12 @@ def build_untrusted_context(
     include_memories: bool = True,
 ) -> str:
     ctx = _ensure_context(context)
-    retrieved = MemoryRetriever().retrieve(ctx, query=query) if include_memories else []
+    retrieved = []
+    if include_memories:
+        try:
+            retrieved = MemoryRetriever().retrieve(ctx, query=query)
+        except Exception:
+            retrieved = []
     formatted_memories = format_memory_context(retrieved) if include_memories else "（本回答不使用已检索记忆）"
     ext_context = evidence_payload.strip() or "暂无"
 

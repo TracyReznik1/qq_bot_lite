@@ -27,9 +27,12 @@ class CommandContext:
     memory_context: MemoryContext | None = None
     message_id: str = ""
     is_admin: bool = False
+    image_data_urls: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "image_data_urls", tuple(self.image_data_urls or ()))
         if self.memory_context is None:
+
             is_group = self.session_key.startswith("group:")
             group_id = None
             if is_group:
@@ -858,8 +861,15 @@ def _forget_command(query: str, context: CommandContext, store: MemoryStore) -> 
 
 def _search_command(query: str, context: CommandContext, _store: MemoryStore) -> CommandResult:
     from .search import search_reply
-    reply = search_reply(query, context.session_key, context.raw_message)
+    reply = search_reply(query, context)
     outcome = CommandOutcome(code="search", facts=(), fallback_reply=reply, already_rendered=True)
+    return CommandResult(handled=True, reply=reply, outcome=outcome)
+
+
+def _skip_command(query: str, context: CommandContext, _store: MemoryStore) -> CommandResult:
+    from .skip import skip_reply
+    reply = skip_reply(query, context)
+    outcome = CommandOutcome(code="skip", facts=(), fallback_reply=reply, already_rendered=True)
     return CommandResult(handled=True, reply=reply, outcome=outcome)
 
 
@@ -868,6 +878,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "h": _help_command,
     "search": _search_command,
     "s": _search_command,
+    "skip": _skip_command,
     "remember": _remember_command,
     "memo": _remember_command,
     "globalremember": _global_remember_command,
@@ -891,8 +902,9 @@ def handle_command(
         command_text = f"/{route.command}" if route.command else "/"
         reply = (
             f"暂不支持这个命令：{command_text}。"
-            "qqbot_lite 只提供 /search、/help、/reset、/remember、/globalremember、/memories、/forget。"
+            "qqbot_lite 只提供 /search、/skip、/help、/reset、/remember、/globalremember、/memories、/forget。"
         )
+
         outcome = CommandOutcome(
             code="unknown",
             facts=(),

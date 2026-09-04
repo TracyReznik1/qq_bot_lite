@@ -1,43 +1,38 @@
+from __future__ import annotations
+
 import copy
 import json
 import logging
-import re
-import time
-from dataclasses import replace
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from src.chat.prompt import _ensure_context, build_untrusted_context
-from src.memory.models import MemoryContext
-from src.config import config
-from src.search import get_search_orchestrator, reset_search_orchestrator
-from src.search.models import (
-    AllowedClaimScope,
-    AnswerCertainty,
-    AnswerGenerationMode,
-    AnswerState,
-    DisclosureCode,
-    EvidenceState,
-    RenderOutcome,
-    RenderedReply,
-    RequestSource,
-    RetrievalRequest,
-    SearchFailureCode,
-    SearchPipelineResult,
-    SearchTier,
-    SkipReason,
-    SupportLabel,
-    ValidatorRequirement,
-    ValidatorStatus,
-    WarningCode,
+from src.chat.prompt import (
+    _ensure_context,
+    build_search_system_prompt,
+    build_untrusted_context,
 )
-from src.search.policy import build_render_state, decide_answer_state
-from src.search.renderer import render_search_reply, render_plain_reply
+from src.config import config
+from src.memory.models import MemoryContext
+from src.search.simple.answering import SearchAnswerer
+from src.search.simple.factory import (
+    get_simple_search_pipeline,
+    reset_simple_search_pipeline,
+)
+from src.search.simple.planning import IMAGE_ONLY_FALLBACK_QUERY
+from src.search.simple.models import (
+    RequestSource,
+    SearchMode,
+    SearchRequest,
+)
+
+from src.search.simple.rendering import (
+    render_search_answer,
+    render_search_failure,
+)
 from src.services.llm_client import get_llm_client
 from src.services.llm_types import ChatResponse
 from src.utils.storage import read_json, safe_id, write_json
-
 
 logger = logging.getLogger("qq-bot")
 
@@ -45,7 +40,20 @@ llm = get_llm_client()
 chat_history: dict[str, list[dict[str, str]]] = {}
 chat_history_lock = Lock()
 
-_search_orchestrator = None
+_simple_search_pipeline = None
+
+
+def get_simple_search_pipeline_for_chat():
+    global _simple_search_pipeline
+    if _simple_search_pipeline is None:
+        _simple_search_pipeline = get_simple_search_pipeline()
+    return _simple_search_pipeline
+
+
+def reset_chat_search_pipeline() -> None:
+    global _simple_search_pipeline
+    _simple_search_pipeline = None
+    reset_simple_search_pipeline()
 
 
 # ── generic provider tool-protocol helpers ─────────────────────────────
@@ -101,19 +109,6 @@ def build_tool_messages(
     return messages
 
 
-def get_search_orchestrator_for_chat():
-    global _search_orchestrator
-    if _search_orchestrator is None:
-        _search_orchestrator = get_search_orchestrator()
-    return _search_orchestrator
-
-
-def reset_chat_search_orchestrator() -> None:
-    global _search_orchestrator
-    _search_orchestrator = None
-    reset_search_orchestrator()
-
-
 def _history_path(session_key: str) -> Path:
     return config.data_dir / "history" / f"{safe_id(session_key)}.json"
 
@@ -124,7 +119,11 @@ def _load_history_unlocked(session_key: str) -> list[dict[str, str]]:
     data = read_json(_history_path(session_key), {"messages": []})
     messages = data.get("messages", []) if isinstance(data, dict) else []
     limit = max(config.history_turns, 1) * 2
-    return [msg for msg in messages[-limit:] if isinstance(msg, dict) and "role" in msg and "content" in msg]
+    return [
+        msg
+        for msg in messages[-limit:]
+        if isinstance(msg, dict) and "role" in msg and "content" in msg
+    ]
 
 
 def _save_history_unlocked(session_key: str, history: list[dict[str, str]]) -> None:
@@ -191,70 +190,26 @@ def history_user_text(text: str, image_count: int) -> str:
     return "\n".join(parts)
 
 
-def _build_evidence_payload(result: SearchPipelineResult) -> str:
-    evidence = result.evidence
-    if evidence is None:
-        return ""
-    topic_labels = {
-        topic.topic_id: topic.label for topic in evidence.plan.required_topics
-    } if evidence.plan is not None and getattr(evidence.plan, "required_topics", None) else {}
-    rows = []
-    for item in evidence.evidence_items:
-        rows.append(
-            {
-                "evidence_id": item.evidence_id,
-                "title": item.title,
-                "url": item.url,
-                "excerpt": (item.excerpt or "")[:400],
-                "published_at": item.published_at.isoformat() if item.published_at else None,
-                "source_relation": item.source_relation.value,
-                "supported_topic_ids": list(item.supported_topic_ids),
-                "supported_topics": [topic_labels.get(tid, tid) for tid in item.supported_topic_ids],
-            }
-        )
-    payload = {
-        "evidence_items": rows,
-        "conflict_groups": list(evidence.conflict_groups),
-        "conflicts": [
-            {
-                "conflict_id": conflict.conflict_id,
-                "conflict_key": conflict.conflict_key,
-                "members": [
-                    {
-                        "evidence_id": member.evidence_id,
-                        "value": member.value,
-                        "published_at": member.published_at.isoformat() if member.published_at else None,
-                        "relation": member.relation,
-                    }
-                    for member in conflict.members
-                ],
-            }
-            for conflict in evidence.conflicts
-        ],
-        "missing_claim_topics": list(evidence.missing_claim_topics),
-        "evidence_state": evidence.evidence_state.value,
-    }
-    return json.dumps(payload, ensure_ascii=False)
+def _qq_limit() -> int:
+    """Return the shared QQ limit without coupling tests to unrelated config."""
+    return max(int(getattr(config, "max_reply_chars", 1700)), 200)
 
 
-def _build_messages(
+def _build_base_messages(
     mem_ctx: MemoryContext,
     text: str,
     images: list[str],
-    *,
-    evidence_payload: str,
-    include_memories: bool,
 ) -> list[dict[str, Any]]:
     _ensure_history_loaded(mem_ctx.session_key)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _system_prompt_for(mem_ctx, evidence_payload)},
+        {"role": "system", "content": build_search_system_prompt(mem_ctx)},
         {
             "role": "user",
             "content": build_untrusted_context(
                 mem_ctx,
                 query=text,
-                evidence_payload=evidence_payload,
-                include_memories=include_memories,
+                evidence_payload="",
+                include_memories=True,
             ),
         },
     ]
@@ -269,146 +224,39 @@ def _build_messages(
     return messages
 
 
-def _system_prompt_for(mem_ctx: MemoryContext, evidence_payload: str) -> str:
+def _plain_reply(
+    mem_ctx: MemoryContext,
+    text: str,
+    images: list[str],
+    *,
+    timeout_seconds: float,
+) -> str:
     from src.chat.prompt import build_system_prompt
-    return build_system_prompt(mem_ctx, evidence_payload=evidence_payload)
 
-
-def _generate_answer(trace, messages, *, temperature: float, timeout_seconds: float = 4.0) -> ChatResponse:
-    """Time the answer-model stage even when the provider raises."""
-    from src.search.stage_runner import run_stage
-    answer_started = time.monotonic()
-    try:
-        call_res = run_stage(
-            lambda: llm.chat(messages, temperature=temperature),
-            timeout_seconds=float(timeout_seconds),
-        )
-        if not call_res.completed or not isinstance(call_res.value, ChatResponse):
-            raise TimeoutError("answer model timed out")
-        return call_res.value
-    finally:
-        trace.answer_generation_latency_ms += max(
-            (time.monotonic() - answer_started) * 1000.0,
-            0.0,
-        )
-
-
-def _grounded_generation(
-    mem_ctx, text, images, result, answer_state
-) -> tuple[str, SearchPipelineResult]:
-    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
-    from src.search.models import SearchTier
-    route = result.plan.decision.route if result.plan else SearchTier.LIGHT
-    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(route)
-    evidence_payload = _build_evidence_payload(result)
-    messages = _build_messages(mem_ctx, text, images, evidence_payload=evidence_payload, include_memories=True)
-    response = _generate_answer(
-        result.trace,
-        messages,
-        temperature=0.2,
-        timeout_seconds=float(budget.answer_seconds),
+    _ensure_history_loaded(mem_ctx.session_key)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": build_system_prompt(mem_ctx)},
+        {
+            "role": "user",
+            "content": build_untrusted_context(
+                mem_ctx,
+                query=text,
+                evidence_payload="",
+                include_memories=True,
+            ),
+        },
+    ]
+    with chat_history_lock:
+        messages.extend(chat_history.get(mem_ctx.session_key, []).copy())
+    messages.append(
+        {
+            "role": "user",
+            "content": build_user_content(text, images),
+        }
     )
-    structural_started = time.monotonic()
-    try:
-        draft = _parse_draft(response.content)
-    except ValueError:
-        result.trace.structural_validation_latency_ms += max(
-            (time.monotonic() - structural_started) * 1000.0,
-            0.0,
-        )
-        return _handle_draft_failure(result, answer_state)
-    result.trace.structural_validation_latency_ms += max(
-        (time.monotonic() - structural_started) * 1000.0,
-        0.0,
-    )
-    try:
-        validation_res = _validate_draft(
-            draft,
-            result,
-            answer_state,
-            timeout_seconds=float(budget.validator_seconds),
-        )
-    except Exception:
-        logger.debug("grounded draft validation failed", exc_info=True)
-        return _handle_draft_failure(result, answer_state)
-    if validation_res is None:
-        return _handle_draft_failure(result, answer_state)
-    report = getattr(validation_res, "report", validation_res)
-    _record_validation_trace(result.trace, report)
-    if hasattr(validation_res, "structural_latency_ms"):
-        result.trace.structural_validation_latency_ms += validation_res.structural_latency_ms
-    if hasattr(validation_res, "semantic_latency_ms"):
-        result.trace.semantic_validation_latency_ms += validation_res.semantic_latency_ms
-    render_state = build_render_state(answer_state, report, result.evidence)
-    rendered = _render_view(render_state, result, timeout_seconds=float(budget.renderer_seconds))
-    return rendered.text, result
-
-
-def _handle_draft_failure(
-    result: SearchPipelineResult,
-    answer_state: AnswerState,
-) -> tuple[str, SearchPipelineResult]:
-    """A malformed draft cannot produce a definite grounded answer."""
-    result.trace.degradation_reason = SearchFailureCode.VALIDATION_FAILED
-    result.trace.validator_status = ValidatorStatus.MALFORMED
-    result.trace.validator_retained_claim_count = 0
-    result.trace.validator_removed_block_count = 0
-    failed_result = replace(result, failure_code=SearchFailureCode.VALIDATION_FAILED)
-    disclosures = [DisclosureCode.VALIDATION_FAILED]
-    if (
-        result.evidence is not None
-        and result.evidence.evidence_state is EvidenceState.CONFLICTING
-    ):
-        disclosures.append(DisclosureCode.SOURCE_CONFLICT)
-    failed_state = AnswerState(
-        None,
-        AnswerGenerationMode.FIXED,
-        AnswerCertainty.UNVERIFIED,
-        AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
-        tuple(disclosures),
-        answer_state.warning_codes,
-        answer_state.validator_requirement,
-    )
-    _record_answer_trace(result.trace, failed_state)
-    render_state = build_render_state(failed_state, None, failed_result.evidence)
-    rendered = _render_view(render_state, failed_result)
-    return rendered.text, failed_result
-
-
-class SemanticVerificationUnavailable(RuntimeError):
-    """Raised when the semantic verifier cannot run (e.g. provider failure)."""
-
-
-class _Verifier:
-    """Small semantic verifier wrapper over the LLM chain."""
-
-    def verify(self, payload):
-        prompt = (
-            "Judge each claim against the provided evidence excerpts. "
-            "Return a JSON object mapping claim_id to one of: supported, partial, conflict, unsupported."
-        )
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ]
-        try:
-            response = llm.chat(messages, temperature=0.0)
-            raw = str(getattr(response, "content", "") or "").strip()
-            fence_match = re.search(r"```(?:json)?[ \t]*\r?\n(?P<body>.*?)\r?\n```", raw, re.IGNORECASE | re.DOTALL)
-            if fence_match is not None:
-                raw = fence_match.group("body").strip()
-            first_brace = raw.find("{")
-            last_brace = raw.rfind("}")
-            if first_brace != -1 and last_brace > first_brace:
-                raw = raw[first_brace:last_brace + 1].strip()
-            parsed = json.loads(raw)
-            if not isinstance(parsed, dict):
-                raise SemanticVerificationUnavailable("verifier returned non-object")
-            return parsed
-        except SemanticVerificationUnavailable:
-            raise
-        except Exception as exc:
-            raise SemanticVerificationUnavailable(str(exc)) from exc
+    response = llm.chat(messages, temperature=0.7, timeout_seconds=timeout_seconds)
+    content = getattr(response, "content", "")
+    return str(content or "").strip()
 
 
 def generate_reply(
@@ -416,45 +264,74 @@ def generate_reply(
     text: str,
     image_data_urls: list[str] | None = None,
     *,
-    force_search: bool = False,
+    mode: SearchMode,
     history_text: str | None = None,
 ) -> str:
-    response_started = time.monotonic()
     mem_ctx = _ensure_context(context)
     session_key = mem_ctx.session_key
-    images = list(image_data_urls or [])
-    request_source = RequestSource.COMMAND if force_search else RequestSource.CHAT
+    normalized_text = " ".join(str(text or "").split())
+    images = [img for img in (image_data_urls or []) if str(img or "").strip()]
 
-    request = RetrievalRequest(
-        text,
-        force_search=force_search,
-        has_images=bool(images),
-        request_source=request_source,
-    )
-    result = get_search_orchestrator_for_chat().run(request)
-    result.trace.response_started_at = response_started
-    final_result = result
     reply: str | None = None
     try:
-        answer_state = decide_answer_state(
-            result.analysis,
-            result.evidence,
-            result.failure_code,
-        )
-        _record_answer_trace(result.trace, answer_state)
-        if answer_state.generation_mode is AnswerGenerationMode.PLAIN:
-            reply, final_result = _handle_plain(mem_ctx, text, images, result)
-        elif answer_state.generation_mode is AnswerGenerationMode.GROUNDED:
-            reply, final_result = _grounded_generation(
-                mem_ctx, text, images, result, answer_state
+        try:
+            timeout = float(getattr(config, "search_answer_timeout", 20.0))
+            if mode is SearchMode.SKIP:
+                reply = _plain_reply(
+                    mem_ctx,
+                    normalized_text,
+                    images,
+                    timeout_seconds=timeout,
+                )
+                return reply
+
+            request = SearchRequest(
+                mode=mode,
+                text=normalized_text,
+                images=tuple(images),
+                source=RequestSource.CHAT if mode is SearchMode.LIGHT else RequestSource.COMMAND,
             )
-        else:
-            reply, final_result = _handle_fixed(
-                mem_ctx, text, images, result, answer_state
+            pipeline = get_simple_search_pipeline_for_chat()
+            outcome = pipeline.run(request)
+
+            if outcome.failure is not None:
+                rendered = render_search_failure(
+                    outcome.failure,
+                    qq_limit=_qq_limit(),
+                    trace=outcome.trace,
+                )
+                reply = rendered.text
+                return reply
+
+            base_messages = _build_base_messages(mem_ctx, normalized_text, images)
+            answerer = SearchAnswerer(llm)
+            answer_res = answerer.answer(
+                question=normalized_text or IMAGE_ONLY_FALLBACK_QUERY,
+                results=outcome.results,
+                base_messages=base_messages,
+                timeout_seconds=timeout,
+                context=mem_ctx,
             )
-        return reply
+            outcome.trace.answer_degraded = answer_res.degraded
+            warning = outcome.warning
+            if answer_res.degraded and not warning:
+                warning = "信息可能不完整。"
+
+            rendered = render_search_answer(
+                answer_res.text,
+                outcome.results,
+                warning=warning,
+                show_sources=(mode is SearchMode.STANDARD),
+                qq_limit=_qq_limit(),
+                trace=outcome.trace,
+            )
+            reply = rendered.text
+            return reply
+        except Exception as exc:
+            logger.warning("generate_reply failed (%s)", type(exc).__name__)
+            reply = "在线搜索暂时不可用，请稍后再试。"
+            return reply
     finally:
-        finalize_search_trace(final_result, history_text)
         if reply is not None:
             stored_user_text = (
                 history_text
@@ -462,152 +339,3 @@ def generate_reply(
                 else history_user_text(text, len(images))
             )
             append_history(session_key, stored_user_text, reply)
-
-
-def _handle_plain(mem_ctx, text, images, result) -> tuple[str, SearchPipelineResult]:
-    # Ordinary closed tasks: normal answer call, no search tool, no citations.
-    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
-    from src.search.models import SearchTier
-    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(SearchTier.LIGHT)
-    messages = _build_messages(mem_ctx, text, images, evidence_payload="", include_memories=True)
-    response = _generate_answer(
-        result.trace,
-        messages,
-        temperature=0.75,
-        timeout_seconds=float(budget.answer_seconds),
-    )
-    rendered = render_plain_reply(
-        response.content,
-        trace=result.trace,
-        qq_limit=_qq_limit(),
-    )
-    result.trace.render_outcome = RenderOutcome.ANSWER
-    result.trace.render_citation_count = 0
-    result.trace.render_source_count = 0
-    return rendered.text, result
-
-
-def _handle_fixed(
-    mem_ctx,
-    text,
-    images,
-    result,
-    answer_state,
-) -> tuple[str, SearchPipelineResult]:
-    # Fixed output (no-web limitation or external-fact failure): never invoke the
-    # ordinary answer model to invent facts.
-    del mem_ctx, text, images
-    from src.search.budget import DEFAULT_SEARCH_BUDGET_POLICY
-    from src.search.models import SearchTier
-    route = result.plan.decision.route if result.plan else SearchTier.LIGHT
-    budget = DEFAULT_SEARCH_BUDGET_POLICY.for_route(route)
-    render_state = build_render_state(answer_state, None, result.evidence)
-    rendered = _render_view(render_state, result, timeout_seconds=float(budget.renderer_seconds))
-    return rendered.text, result
-
-
-def _render_view(
-    render_state,
-    result: SearchPipelineResult,
-    *,
-    timeout_seconds: float = 1.0,
-) -> "RenderedReply":
-    from src.search.stage_runner import run_stage
-    started = time.monotonic()
-    call_res = run_stage(
-        lambda: render_search_reply(render_state, qq_limit=_qq_limit()),
-        timeout_seconds=float(timeout_seconds),
-    )
-    result.trace.qq_render_latency_ms = max(
-        (time.monotonic() - started) * 1000.0,
-        0.0,
-    )
-    if not call_res.completed or not isinstance(call_res.value, RenderedReply):
-        result.trace.render_outcome = RenderOutcome.TIMEOUT
-        result.trace.render_citation_count = 0
-        result.trace.render_source_count = 0
-        return RenderedReply("回复格式化超时，请稍后重试。", (), (), (), ())
-    rendered = call_res.value
-    result.trace.citation_count = len(rendered.shown_source_urls)
-    result.trace.render_outcome = render_state.outcome
-    result.trace.render_citation_count = len(rendered.used_evidence_ids)
-    result.trace.render_source_count = len(rendered.shown_source_urls)
-    return rendered
-
-
-def _record_answer_trace(trace, answer_state) -> None:
-    trace.answer_generation_mode = answer_state.generation_mode
-    trace.answer_certainty = answer_state.certainty
-    trace.answer_claim_scope = answer_state.allowed_claim_scope
-    trace.answer_disclosure_codes = answer_state.disclosure_codes
-    trace.answer_warning_codes = answer_state.warning_codes
-
-
-def _record_validation_trace(trace, report) -> None:
-    trace.validator_status = report.status
-    trace.validator_retained_claim_count = len(report.retained_claims)
-    trace.validator_removed_block_count = len(report.removed_block_ids)
-    if hasattr(report, "draft") and report.draft is not None:
-        trace.claim_count = len(report.draft.claims)
-    trace.supported_claim_count = sum(
-        1
-        for claim in getattr(report, "retained_claims", ())
-        if getattr(report, "claim_labels", {}).get(claim.claim_id) is SupportLabel.SUPPORTED
-    )
-
-
-def _fixed_answer_state(
-    answer_state: AnswerState,
-    disclosure: DisclosureCode,
-) -> AnswerState:
-    return AnswerState(
-        None,
-        AnswerGenerationMode.FIXED,
-        AnswerCertainty.UNVERIFIED,
-        AllowedClaimScope.NO_EXTERNAL_FACTUAL_CLAIMS,
-        (disclosure,),
-        answer_state.warning_codes,
-        answer_state.validator_requirement,
-    )
-
-
-def _parse_draft(content: str):
-    from src.search.validation import parse_grounded_draft
-    return parse_grounded_draft(content)
-
-
-def _validate_draft(draft, result, answer_state, *, timeout_seconds: float = 4.0):
-    from src.search.stage_runner import run_stage
-    from src.search.validation import LLMClaimDiscoverer, validate_and_filter
-    verifier = _Verifier()
-    started = time.monotonic()
-    result.trace.claim_count = len(draft.claims)
-    result.trace.supported_claim_count = 0
-    try:
-        call_res = run_stage(
-            lambda: validate_and_filter(
-                draft,
-                result.evidence,
-                answer_state,
-                claim_discoverer=LLMClaimDiscoverer(llm),
-                semantic_verifier=verifier,
-                timeout_seconds=timeout_seconds,
-            ),
-            timeout_seconds=float(timeout_seconds),
-        )
-    finally:
-        result.trace.semantic_validation_latency_ms += max((time.monotonic() - started) * 1000.0, 0.0)
-    if not call_res.completed:
-        return None
-    return call_res.value
-
-
-def finalize_search_trace(result: SearchPipelineResult, history_text: str | None) -> None:
-    del history_text
-    from src.search.orchestrator import finalize_search_trace as _finalize
-    _finalize(result.trace, response_finished_at=time.monotonic())
-
-
-def _qq_limit() -> int:
-    """Return the shared QQ limit without coupling tests to unrelated config."""
-    return max(int(getattr(config, "max_reply_chars", 1700)), 200)

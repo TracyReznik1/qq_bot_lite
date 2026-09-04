@@ -2,15 +2,17 @@ import copy
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 from src.chat import chat_service
 from src.chat.prompt import build_system_prompt
+from src.commands import CommandContext
 import src.commands.search as search_command
 from src.config import BASE_DIR, Config
 from src.persona import Persona
+from src.search.simple.models import SearchMode
 from src.services.llm_types import ChatResponse
-from tests.search_fakes import make_analysis
 
 
 class CapturingLlm:
@@ -74,19 +76,7 @@ class IdentityConfigurationTests(unittest.TestCase):
             patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            # A social/emotional skip uses a single plain answer call.
-            from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
-            skip = RetrievalDecision(
-                route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
-            )
-            chat_service._search_orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
-                skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
-                analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
-            ))
-            try:
-                reply = chat_service.generate_reply("identity:test", "你好")
-            finally:
-                chat_service._search_orchestrator = None
+            reply = chat_service.generate_reply("identity:test", "你好", mode=SearchMode.SKIP)
 
         self.assertEqual("按身份回答", reply)
         for messages in fake_llm.messages:
@@ -95,91 +85,55 @@ class IdentityConfigurationTests(unittest.TestCase):
             self.assertIn(persona.content, messages[0]["content"])
 
     def test_search_failure_context_uses_current_role_not_atri(self):
-        from src.search.models import (
-            SearchTier,
-            SearchTrace,
-            RetrievalDecision,
-            Factuality,
-            Freshness,
-            RiskLevel,
-            RequestSource,
-            SearchPipelineResult,
-            Actionability,
-            PotentialHarm,
-            SearchFailureCode,
-        )
-        failed = RetrievalDecision(
-            route=SearchTier.LIGHT, skip_reason=None, must_search=True, reason_codes=(),
-        )
-        empty_plan = None
-        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
-            failed, empty_plan, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.LIGHT),
-            SearchFailureCode.PROVIDER_NOT_CONFIGURED,
-            analysis=make_analysis(),
-        ))
         with (
             patch.object(search_command, "normalize_search_query", return_value="测试"),
             patch.object(search_command, "generate_reply", return_value="无法确认") as generate,
         ):
-            chat_service._search_orchestrator = orchestrator
-            try:
-                search_command.search_reply("测试", "private:1", "/search 测试")
-            finally:
-                chat_service._search_orchestrator = None
+            reply = search_command.search_reply(
+                "测试",
+                CommandContext(uid="1", session_key="private:1", raw_message="/search 测试"),
+            )
 
-        self.assertEqual("无法确认", generate.return_value)
+        self.assertEqual("无法确认", reply)
+        self.assertEqual(SearchMode.STANDARD, generate.call_args.kwargs["mode"])
 
     def test_search_command_model_call_keeps_identity(self):
         fake_llm = ReplyingLlm()
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
-        from src.search.models import (
-            SearchTier,
-            SkipReason,
+        from src.search.simple.models import (
+            SearchOutcome,
+            SearchPlan,
+            SearchQuery,
+            SearchResult,
             SearchTrace,
-            RetrievalDecision,
-            Factuality,
-            Freshness,
-            RiskLevel,
             RequestSource,
-            SearchPipelineResult,
-            Actionability,
-            PotentialHarm,
         )
-        skip = RetrievalDecision(
-            route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
-        )
-        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
-            skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
-            analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
-        ))
+
+        plan = SearchPlan(SearchMode.STANDARD, (SearchQuery("q1", "测试"),))
+        trace = SearchTrace("req-1", RequestSource.COMMAND, SearchMode.STANDARD)
+        results = (SearchResult(result_id="1", title="title", url="https://example.com", excerpt="snippet", provider="tavily"),)
+        mock_pipeline = mock.Mock()
+        mock_pipeline.run.return_value = SearchOutcome(plan=plan, results=results, trace=trace)
+
         with (
-            patch.object(search_command, "normalize_search_query", return_value="测试"),
             patch.object(chat_service, "llm", fake_llm),
+            patch("src.chat.chat_service.get_simple_search_pipeline_for_chat", return_value=mock_pipeline),
             patch("src.chat.prompt.get_persona", return_value=persona),
             patch.object(chat_service, "_ensure_history_loaded"),
             patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            chat_service._search_orchestrator = orchestrator
-            try:
-                reply = search_command.search_reply("测试", "identity:search", "/search 测试")
-            finally:
-                chat_service._search_orchestrator = None
+            reply = search_command.search_reply(
+                "测试",
+                CommandContext(uid="1", session_key="identity:search", raw_message="/search 测试"),
+            )
 
-        self.assertEqual("按身份回答", reply)
+        self.assertIn("按身份回答", reply)
         self.assertIn("你扮演 小Q。", fake_llm.messages[0][0]["content"])
 
     def test_multimodal_model_call_keeps_identity(self):
         fake_llm = ReplyingLlm()
         persona = Persona("小Q", "# 角色\n\n- 名字：小Q\n\n冷静、专业，先给结论。")
-        from src.search.models import SearchTier, SkipReason, SearchTrace, RetrievalDecision, Factuality, Freshness, RiskLevel, RequestSource, SearchPipelineResult, Actionability, PotentialHarm
-        skip = RetrievalDecision(
-            route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
-        )
-        orchestrator = SimpleNamespace(run=lambda req: SearchPipelineResult(
-            skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
-            analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
-        ))
         with (
             patch.object(chat_service, "llm", fake_llm),
             patch("src.chat.prompt.get_persona", return_value=persona),
@@ -187,15 +141,12 @@ class IdentityConfigurationTests(unittest.TestCase):
             patch("src.chat.prompt.MemoryRetriever", return_value=SimpleNamespace(retrieve=lambda ctx, query: [])),
             patch.object(chat_service, "append_history"),
         ):
-            chat_service._search_orchestrator = orchestrator
-            try:
-                reply = chat_service.generate_reply(
-                    "identity:image",
-                    "请看图",
-                    image_data_urls=["data:image/png;base64,cG5n"],
-                )
-            finally:
-                chat_service._search_orchestrator = None
+            reply = chat_service.generate_reply(
+                "identity:image",
+                "请看图",
+                image_data_urls=["data:image/png;base64,cG5n"],
+                mode=SearchMode.SKIP,
+            )
 
         self.assertEqual("按身份回答", reply)
         self.assertIn("你扮演 小Q。", fake_llm.messages[0][0]["content"])

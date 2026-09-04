@@ -231,5 +231,71 @@ class CommandRenderingIntegrationTests(unittest.TestCase):
         self.assertEqual("already-rendered-search", result.reply)
 
 
+IMAGE_DATA_URL = "data:image/png;base64,cG5n"
+
+
+def command_context(raw_message: str, images: tuple[str, ...] = ()) -> CommandContext:
+    return CommandContext(
+        uid="1001",
+        session_key="private:1001",
+        raw_message=raw_message,
+        image_data_urls=images,
+    )
+
+
+class IdentityRenderer:
+    def render(self, facts, fallback):
+        return fallback
+
+
+def identity_renderer():
+    return IdentityRenderer()
+
+
+class DeterministicCommandTests(unittest.TestCase):
+    def test_search_passes_standard_mode_images_and_original_history(self):
+        from src.router import route_message
+        from src.search.simple.models import SearchMode
+
+        context = command_context("/search 看看", images=(IMAGE_DATA_URL,))
+        with mock.patch("src.commands.search.generate_reply", return_value="answer") as generate:
+            result = handle_command(route_message("/search 看看"), context, renderer=identity_renderer())
+        generate.assert_called_once_with(
+            context.memory_context, "看看", [IMAGE_DATA_URL],
+            mode=SearchMode.STANDARD, history_text="/search 看看",
+        )
+        self.assertEqual("answer", result.reply)
+
+    def test_skip_empty_without_images_returns_usage_and_calls_no_chat(self):
+        from src.router import route_message
+
+        context = command_context("/skip")
+        with mock.patch("src.commands.skip.generate_reply") as generate:
+            result = handle_command(route_message("/skip"), context, renderer=identity_renderer())
+        self.assertEqual("用法：/skip <内容>，也可以附带图片。", result.reply)
+        generate.assert_not_called()
+
+    def test_skip_image_only_calls_plain_multimodal_mode(self):
+        from src.router import route_message
+        from src.search.simple.models import SearchMode
+
+        context = command_context("/skip", images=(IMAGE_DATA_URL,))
+        with mock.patch("src.commands.skip.generate_reply", return_value="看到了") as generate:
+            result = handle_command(route_message("/skip"), context, renderer=identity_renderer())
+        generate.assert_called_once_with(
+            context.memory_context, "", [IMAGE_DATA_URL],
+            mode=SearchMode.SKIP, history_text="/skip",
+        )
+        self.assertEqual("看到了", result.reply)
+
+    def test_help_and_unknown_output_list_skip(self):
+        from src.commands.help import help_text
+        from src.router import route_message
+
+        self.assertIn("/skip", help_text())
+        self.assertIn("/skip", handle_command(route_message("/unknown"), command_context("/unknown")).reply)
+
+
 if __name__ == "__main__":
     unittest.main()
+

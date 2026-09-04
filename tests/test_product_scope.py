@@ -6,8 +6,9 @@ from unittest import mock
 import src.commands.search as search_command
 import src.services.search_service as search_service
 import src.services.url_fetch_service as url_fetch_service
-from src.commands import COMMANDS
+from src.commands import COMMANDS, CommandContext
 from src.config import Config
+from src.search.simple.models import SearchMode
 from src.services.onebot_client import OneBotClient
 from src.services.search_service import SearchResult
 from src.search.models import RequestSource, SearchFailureCode, SearchTier, SearchTrace
@@ -38,7 +39,7 @@ class ProductScopeTests(unittest.TestCase):
 
     def test_expected_commands_are_preserved(self):
         self.assertTrue(
-            {"search", "help", "reset", "remember", "globalremember"}.issubset(COMMANDS)
+            {"search", "help", "reset", "remember", "globalremember", "skip"}.issubset(COMMANDS)
         )
 
     def test_search_with_url_uses_keyword_search_not_direct_fetch(self):
@@ -55,12 +56,17 @@ class ProductScopeTests(unittest.TestCase):
             ) as generate,
         ):
             result = search_command.search_reply(
-                "https://example.com/page", "private:1", "/search https://example.com/page"
+                "https://example.com/page",
+                CommandContext(
+                    uid="1",
+                    session_key="private:1",
+                    raw_message="/search https://example.com/page",
+                ),
             )
 
         self.assertEqual("answer", result)
         generate.assert_called_once()
-        self.assertTrue(generate.call_args.kwargs["force_search"])
+        self.assertEqual(SearchMode.STANDARD, generate.call_args.kwargs["mode"])
 
     def test_search_internal_page_fetch_is_preserved(self):
         from src.search import get_search_orchestrator, reset_search_orchestrator

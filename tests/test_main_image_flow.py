@@ -9,8 +9,16 @@ from unittest import mock
 import src.chat.chat_service as chat_service
 import src.main as main
 from src.commands import CommandResult
+from src.search.simple.models import (
+    RequestSource,
+    SearchMode,
+    SearchOutcome,
+    SearchPlan,
+    SearchQuery,
+    SearchResult,
+    SearchTrace,
+)
 from src.services.llm_types import ChatResponse
-from tests.search_fakes import make_analysis
 
 
 IMAGE_URL = "https://img.example/a.png?token=temporary-secret"
@@ -29,27 +37,22 @@ def private_event(raw_message, message, message_id=10):
     }
 
 
-def _skip_orchestrator():
-    from src.search.models import (
-        Actionability,
-        Factuality,
-        Freshness,
-        PotentialHarm,
-        RequestSource,
-        RetrievalDecision,
-        RiskLevel,
-        SearchPipelineResult,
-        SearchTier,
-        SearchTrace,
-        SkipReason,
+def _light_outcome():
+    return SearchOutcome(
+        plan=SearchPlan(SearchMode.LIGHT, (SearchQuery("q1", "帮我看看"),)),
+        results=(
+            SearchResult(
+                "R1",
+                "Title",
+                "https://example.com/1",
+                "Excerpt",
+                "tavily",
+                0.9,
+            ),
+        ),
+        trace=SearchTrace("req-1", RequestSource.CHAT, SearchMode.LIGHT),
     )
-    skip = RetrievalDecision(
-        route=SearchTier.SKIP, skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL, must_search=False, reason_codes=(),
-    )
-    return SimpleNamespace(run=lambda req: SearchPipelineResult(
-        skip, None, None, SearchTrace("req-1", RequestSource.CHAT, SearchTier.SKIP), None,
-        analysis=make_analysis(skip_reason=SkipReason.SOCIAL_OR_EMOTIONAL),
-    ))
+
 
 
 def group_event(raw_message, message, message_id=11):
@@ -297,7 +300,7 @@ class MainImageFlowTests(unittest.TestCase):
             image_url_resolver=main.onebot.get_image_url,
         )
         generate.assert_called_once_with(
-            "private:1", "", image_data_urls=[IMAGE_DATA_URL]
+            "private:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
         )
         send.assert_called_once_with("1", "看到了", is_group=False)
 
@@ -320,7 +323,7 @@ class MainImageFlowTests(unittest.TestCase):
             image_url_resolver=main.onebot.get_image_url,
         )
         generate.assert_called_once_with(
-            "private:1", "", image_data_urls=[IMAGE_DATA_URL]
+            "private:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
         )
         send.assert_called_once_with("1", "看到了", is_group=False)
 
@@ -341,7 +344,7 @@ class MainImageFlowTests(unittest.TestCase):
             main.process_message(event)
 
         generate.assert_called_once_with(
-            "private:1", "帮我看看", image_data_urls=[IMAGE_DATA_URL]
+            "private:1", "帮我看看", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
         )
 
     def test_group_image_requires_and_accepts_bot_mention(self):
@@ -361,7 +364,7 @@ class MainImageFlowTests(unittest.TestCase):
             main.process_message(event)
 
         generate.assert_called_once_with(
-            "group:20:1", "", image_data_urls=[IMAGE_DATA_URL]
+            "group:20:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
         )
         send.assert_called_once_with(20, "群图", is_group=True)
 
@@ -381,51 +384,79 @@ class MainImageFlowTests(unittest.TestCase):
         generate.assert_not_called()
         send.assert_not_called()
 
-    def test_command_with_image_routes_without_downloading_image(self):
+    def test_search_command_downloads_and_passes_images(self):
         event = private_event(
-            f"/help [CQ:image,file=a.png,url={IMAGE_URL}]",
+            f"/search 看看 [CQ:image,file=a.png,url={IMAGE_URL}]",
             [
-                {"type": "text", "data": {"text": "/help "}},
+                {"type": "text", "data": {"text": "/search 看看 "}},
                 {"type": "image", "data": {"url": IMAGE_URL}},
             ],
         )
         with (
-            mock.patch.object(main, "load_chat_images", create=True) as load,
+            mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL], create=True) as load,
             mock.patch.object(
-                main, "handle_command", return_value=CommandResult(True, "帮助")
+                main, "handle_command", return_value=CommandResult(True, "结果")
             ) as handle,
-            mock.patch.object(main, "generate_reply") as generate,
             mock.patch.object(main.onebot, "send_msg") as send,
             mock.patch.object(main.time, "sleep"),
         ):
             main.process_message(event)
 
-        load.assert_not_called()
-        generate.assert_not_called()
-        self.assertEqual("help", handle.call_args.args[0].command)
-        self.assertEqual("/help", handle.call_args.args[1].raw_message)
-        send.assert_called_once_with("1", "帮助", is_group=False)
+        load.assert_called_once()
+        self.assertEqual((IMAGE_DATA_URL,), handle.call_args.args[1].image_data_urls)
+        send.assert_called_once_with("1", "结果", is_group=False)
 
-    def test_command_with_file_only_image_does_not_resolve_or_download(self):
+    def test_skip_command_downloads_file_only_image(self):
         event = private_event(
-            "/help [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
-            "/help [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+            "/skip [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
+            "/skip [CQ:image,file=opaque-file-id,sub_type=0,url=,file_size=123]",
         )
         with (
-            mock.patch.object(main, "load_chat_images") as load,
+            mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL]) as load,
             mock.patch.object(main.onebot, "get_image_url") as resolve,
             mock.patch.object(
-                main, "handle_command", return_value=CommandResult(True, "帮助")
-            ),
-            mock.patch.object(main, "generate_reply") as generate,
+                main, "handle_command", return_value=CommandResult(True, "跳过")
+            ) as handle,
             mock.patch.object(main.onebot, "send_msg"),
             mock.patch.object(main.time, "sleep"),
         ):
             main.process_message(event)
 
-        resolve.assert_not_called()
-        load.assert_not_called()
-        generate.assert_not_called()
+        load.assert_called_once_with(
+            ("",),
+            image_file_ids=("opaque-file-id",),
+            image_url_resolver=resolve,
+        )
+        self.assertEqual((IMAGE_DATA_URL,), handle.call_args.args[1].image_data_urls)
+
+    def test_command_image_loading_error_is_returned_to_user(self):
+        event = private_event(
+            f"/search 看看 [CQ:image,file=a.png,url={IMAGE_URL}]",
+            [
+                {"type": "text", "data": {"text": "/search 看看 "}},
+                {"type": "image", "data": {"url": IMAGE_URL}},
+            ],
+        )
+        from src.services.image_input_service import ImageInputError
+
+        with (
+            mock.patch.object(
+                main,
+                "load_chat_images",
+                side_effect=ImageInputError("图片读取失败，请重新发送。"),
+                create=True,
+            ),
+            mock.patch.object(main, "handle_command") as handle,
+            mock.patch.object(main.onebot, "send_msg") as send,
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+
+        handle.assert_not_called()
+        send.assert_called_once_with(
+            "1", "图片读取失败，请重新发送。", is_group=False
+        )
+
 
     def test_parse_error_is_returned_to_user_without_chat_or_download(self):
         event = private_event(
@@ -532,14 +563,15 @@ class MainImageFlowTests(unittest.TestCase):
                     "chat",
                     return_value=ChatResponse(content="看到了"),
                 ),
+                mock.patch.object(
+                    chat_service,
+                    "get_simple_search_pipeline_for_chat",
+                    return_value=SimpleNamespace(run=lambda req: _light_outcome()),
+                ),
                 mock.patch.object(main.onebot, "send_msg"),
                 mock.patch.object(main.time, "sleep"),
             ):
-                chat_service._search_orchestrator = _skip_orchestrator()
-                try:
-                    main.process_message(event)
-                finally:
-                    chat_service._search_orchestrator = None
+                main.process_message(event)
 
             history_files = list(
                 (Path(temp_dir) / "history").glob("*.json")
@@ -555,5 +587,56 @@ class MainImageFlowTests(unittest.TestCase):
         self.assertNotIn("temporary-secret", raw_history)
 
 
+class MainDeterministicModeTests(unittest.TestCase):
+    def setUp(self):
+        self.memory_service = mock.Mock()
+        self.memory_service.stage_event.return_value = 1
+        service_patch = mock.patch.object(
+            main,
+            "get_memory_service",
+            return_value=self.memory_service,
+        )
+        service_patch.start()
+        self.addCleanup(service_patch.stop)
+
+    def test_ordinary_text_image_and_mixed_messages_are_light(self):
+        for text, images in (("hello", []), ("", [IMAGE_DATA_URL]), ("hello", [IMAGE_DATA_URL])):
+            with self.subTest(text=text, images=images):
+                raw_msg = f"{text} [CQ:image,url={IMAGE_URL}]" if images else text
+                parsed_msg = [
+                    *([{"type": "text", "data": {"text": text}}] if text else []),
+                    *([{"type": "image", "data": {"url": IMAGE_URL}}] if images else []),
+                ]
+                event = private_event(raw_msg, parsed_msg if parsed_msg else raw_msg)
+                with (
+                    mock.patch.object(main, "load_chat_images", return_value=images, create=True),
+                    mock.patch.object(main, "generate_reply", return_value="reply") as generate_reply,
+                    mock.patch.object(main.onebot, "send_msg"),
+                    mock.patch.object(main.time, "sleep"),
+                ):
+                    main.process_message(event)
+                    generate_reply.assert_called_once_with(
+                        "private:1", text, image_data_urls=images, mode=SearchMode.LIGHT
+                    )
+
+    def test_search_command_downloads_and_passes_images(self):
+        event = private_event(
+            f"/search 看看 [CQ:image,file=a.png,url={IMAGE_URL}]",
+            [
+                {"type": "text", "data": {"text": "/search 看看 "}},
+                {"type": "image", "data": {"url": IMAGE_URL}},
+            ],
+        )
+        with (
+            mock.patch.object(main, "load_chat_images", return_value=[IMAGE_DATA_URL], create=True) as load,
+            mock.patch.object(main, "handle_command", return_value=CommandResult(True, "结果")) as handle,
+            mock.patch.object(main.onebot, "send_msg"),
+            mock.patch.object(main.time, "sleep"),
+        ):
+            main.process_message(event)
+        load.assert_called_once()
+        self.assertEqual((IMAGE_DATA_URL,), handle.call_args.args[1].image_data_urls)
+
 if __name__ == "__main__":
     unittest.main()
+
