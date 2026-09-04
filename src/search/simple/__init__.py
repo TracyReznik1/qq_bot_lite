@@ -1,4 +1,9 @@
 from .ddgs import DDGSSearchProvider
+from .factory import (
+    get_search_readiness,
+    get_simple_search_pipeline,
+    reset_simple_search_pipeline,
+)
 from .models import (
     OutputKind,
     RequestSource,
@@ -12,6 +17,7 @@ from .models import (
     SearchResult,
     SearchTrace,
 )
+from .pipeline import SearchTimeouts, SimpleSearchPipeline
 from .planning import IMAGE_ONLY_FALLBACK_QUERY, QueryPlanner
 from .providers import (
     ProviderErrorCode,
@@ -50,6 +56,11 @@ __all__ = (
     "SearchRequest",
     "SearchResponse",
     "SearchResult",
+    "SearchTimeouts",
     "SearchTrace",
+    "SimpleSearchPipeline",
     "TavilySearchProvider",
+    "get_search_readiness",
+    "get_simple_search_pipeline",
+    "reset_simple_search_pipeline",
 )
