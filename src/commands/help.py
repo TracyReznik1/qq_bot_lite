@@ -4,7 +4,7 @@ from src.persona import get_persona
 def help_text() -> str:
     persona = get_persona()
     return (
-        f"我是 {persona.name}（qqbot_lite 严格版），默认进行日常对话，必要时自动联网检索或解读网页。\n\n"
+        f"我是 {persona.name}，默认进行日常对话，必要时自动联网检索或解读网页。\n\n"
         "常用指令：\n"
         "/search <关键词>：强制在线搜索并汇总回答\n"
         "/skip [问题]：跳过在线搜索，直接回答\n"
