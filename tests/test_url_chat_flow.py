@@ -14,7 +14,7 @@ from src.search.simple.models import (
     SearchTrace,
 )
 from src.services.llm_types import ChatResponse
-from src.services.url_fetch_service import UrlDocumentResult
+from src.services.url_fetch_service import UrlDocumentResult, extract_first_url
 
 
 class UrlChatFlowTests(unittest.TestCase):
@@ -116,6 +116,74 @@ class UrlChatFlowTests(unittest.TestCase):
                 mode=SearchMode.SKIP,
             )
         mock_fetch.assert_not_called()
+
+    def test_extract_first_url_with_adjoining_cjk_and_punctuation(self):
+        cases = [
+            (
+                "https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay给我讲解一下这个项目",
+                "https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay",
+            ),
+            (
+                "看这个链接https://example.com/repo/test，非常好用！",
+                "https://example.com/repo/test",
+            ),
+            (
+                "网址是:https://example.com/item?id=123&type=a#section，请核对",
+                "https://example.com/item?id=123&type=a#section",
+            ),
+            (
+                "[点击这里](https://example.com/doc/page)",
+                "https://example.com/doc/page",
+            ),
+            (
+                "'https://example.com/path'",
+                "https://example.com/path",
+            ),
+            (
+                "\"https://example.com/quoted\"",
+                "https://example.com/quoted",
+            ),
+            (
+                "（https://example.com/fullwidth）",
+                "https://example.com/fullwidth",
+            ),
+        ]
+        for raw_input, expected in cases:
+            with self.subTest(raw_input=raw_input):
+                self.assertEqual(expected, extract_first_url(raw_input))
+
+    @patch("src.chat.chat_service.get_simple_search_pipeline_for_chat")
+    @patch("src.chat.chat_service.fetch_document")
+    def test_url_direct_fetch_with_adjoining_chinese_without_space(
+        self,
+        mock_fetch,
+        mock_get_pipeline,
+    ):
+        mock_fetch.return_value = UrlDocumentResult(
+            ok=True,
+            status="success",
+            requested_url="https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay",
+            final_url="https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay",
+            title="Valorant-CN-OBS-Overlay",
+            content_type="text/html",
+            text="无畏契约国服 OBS 直播间插件",
+        )
+        fake_llm = MagicMock()
+        fake_llm.chat.return_value = ChatResponse(content="这是一个 OBS 插件项目。")
+
+        with patch.object(chat_service, "llm", fake_llm):
+            reply = generate_reply(
+                "private:url_test_user",
+                "https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay给我讲解一下这个项目",
+                mode=SearchMode.LIGHT,
+            )
+
+        self.assertEqual("这是一个 OBS 插件项目。", reply)
+        mock_fetch.assert_called_once_with(
+            "https://github.com/TracyReznik1/Valorant-CN-OBS-Overlay",
+            timeout_seconds=5.0,
+        )
+        mock_get_pipeline.assert_not_called()
 
 
 if __name__ == "__main__":
