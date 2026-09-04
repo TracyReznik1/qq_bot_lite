@@ -10,7 +10,7 @@
 
 - **💬 上下文对话**：基于 FIFO 队列保障会话顺序，支持角色设定（`config/persona.md`）与多轮历史管理。
 - **🌐 网页 URL 直读**：自动识别聊天中的 HTTP/HTTPS 链接，5 秒快速直读正文并注入 XML 沙箱作答，自动短路冗余搜索；历史记录轻量化防 Token 膨胀。
-- **🔍 确定性联网检索**：Tavily 是主搜索提供者，遇到异常平滑回退至 DDGS（DDGS 的阶段超时默认为 15 秒）。普通聊天始终固定为 `LIGHT 模式`（单查询，普通回复不展示任何来源编号、标题或 URL），显式 `/search` 为 `STANDARD 模式`（多查询，附带来源），支持 `/skip` 跳过搜索。遇到网络不可用、证据不足、名称/前提不一致时清晰说明，固定边界降级，确保基于已有可用证据生成，不伪造在线证据；遇到服务拒绝有效范围参数时移除日期过滤后重试一次 Tavily；安全 Trace 全程记录但剔除敏感正文。
+- **🔍 确定性联网检索**：Tavily 是主搜索提供者，遇到异常平滑回退至 DDGS（DDGS 的阶段超时默认为 15 秒）。普通聊天始终固定为由轻量检索路由（SearchRouter，基于检索收益判定）在无需搜索与 `LIGHT 模式`（单查询快速检索，普通回复不展示任何来源编号、标题或 URL）之间动态裁决，绝不越级触发多查询；显式 `/search` 为 `STANDARD 模式`（多查询，附带来源），支持 `/skip` 跳过搜索。遇到网络不可用、证据不足、名称/前提不一致时清晰说明，固定边界降级，确保基于已有可用证据生成，不伪造在线证据；遇到服务拒绝有效范围参数时移除日期过滤后重试一次 Tavily；安全 Trace 全程记录但剔除敏感正文。
 - **🛡️ 三层 Prompt 注入防御**：
   1. **XML 语义沙箱**：外部网页正文严格实体转义，封装于 `<external_webpage_content>` 标签；
   2. **权威边界约束**：System Prompt 声明最高安全级，严禁模型执行网页中的任何诱导指令；
@@ -79,9 +79,11 @@ python run_bot.py
 ### 模型链与 API Key 隔离配置
 - 模型链格式为 `提供商:模型名`（多个用逗号隔开），首个为主模型，后续为故障回退。支持 `gemini` 和 `deepseek`。
 - Gemini 使用原生 `generateContent` REST API（默认 `GEMINI_URL=https://generativelanguage.googleapis.com/v1`），DeepSeek 使用 OpenAI 兼容端点。
+- **平滑回退链抗拥堵推荐**：针对 Google Gemini API 偶尔出现的 503 服务高负荷拥堵（High Demand），强烈建议在 `CHAT_MODELS` 中配置回退链（例如 `CHAT_MODELS=gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite` 或接入 DeepSeek）。当首选模型出现 503 或网络超时时，系统会毫秒级无缝切换到下一顺位模型，保障服务连续性。
+- **免搜索回复与检索错误严格隔离**：普通对话（免搜索或检索路由裁决为无需搜索）若因模型过载等故障失败，将直接提示服务繁忙，绝不会误报为“在线搜索网络不可用”，清晰区隔故障源。
 - **前后台配额物理隔离**：前台聊天对话使用 `GEMINI_API_KEY`；后台异步记忆提取可独立配置 `MEMORY_GEMINI_API_KEY`。两者配额彻底隔离，杜绝高频聊天时争抢 15 RPM 免费层并发触发 429 限流；留空时自动回退复用主 Key。示例：
   ```dotenv
-  CHAT_MODELS=gemini:gemini-2.5-flash,deepseek:deepseek-chat
+  CHAT_MODELS=gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,deepseek:deepseek-chat
   GEMINI_API_KEY=your_chat_gemini_key
   DEEPSEEK_API_KEY=your_deepseek_key
 
@@ -100,7 +102,7 @@ python run_bot.py
 | `ONEBOT_ACCESS_TOKEN` | 条件必需 | 空 | qqbot → OneBot 请求的 Bearer 访问令牌。 |
 | `REQUIRE_GROUP_AT` | 可选 | `true` | 群聊中是否要求必须 `@` 机器人账号才响应。 |
 | `ADMIN_QQ_IDS` | 条件必需 | 空 | 具备管理员权限的 QQ 号列表（逗号或分号分隔），用于 `/globalremember`。 |
-| `CHAT_MODELS` | 必需 | 无 | 对话模型链，例如 `gemini:gemini-2.5-flash`。每个列出的提供商都需配置对应 Key。 |
+| `CHAT_MODELS` | 必需 | 无 | 对话模型链，例如 `gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite`。每个列出的提供商都需配置对应 Key。 |
 | `MEMORY_MODELS` | 可选 | 空 | 结构化记忆提取与合并的专用模型链；留空时自动复用 `CHAT_MODELS`。 |
 | `MEMORY_GEMINI_API_KEY` | 可选 | 空 | 记忆提取专用 Gemini Key；留空时自动复用 `GEMINI_API_KEY`。配置可实现前后台配额物理隔离。 |
 | `MEMORY_DEEPSEEK_API_KEY` | 可选 | 空 | 记忆提取专用 DeepSeek Key；留空时自动复用 `DEEPSEEK_API_KEY`。 |
@@ -110,7 +112,7 @@ python run_bot.py
 | `DEEPSEEK_URL` | 可选 | `https://api.deepseek.com/chat/completions` | DeepSeek 对话端点地址。 |
 | `TAVILY_API_KEY` | 可选 | 空 | 主搜索引擎 Tavily API Key；未配置或不可用时自动回退至 DDGS。 |
 | `PROXY_URL` | 可选 | 空 | 全局 HTTP/HTTPS 代理地址，例如 `http://127.0.0.1:7890`。 |
-| `SEARCH_ROUTER_MODEL` | 可选 | `gemini-3.1-flash-lite` | 检索路由模型名称，用于在无命令时判断是否需要搜索及提炼检索主题。 |
+| `SEARCH_ROUTER_MODEL` | 可选 | `gemini-3.1-flash-lite` | 检索路由模型名称，用于在无命令时基于检索收益动态判断是否需要搜索（跳过搜索或 LIGHT 模式）。 |
 | `SEARCH_ROUTER_TIMEOUT` | 可选 | `5.0` | 检索路由决策阶段超时（秒）。 |
 | `SEARCH_MAX_RESULTS` | 可选 | `4` | 每次搜索检索返回的文档数量上限。 |
 | `SEARCH_PLANNER_TIMEOUT` | 可选 | `8.0` | 搜索查询规划阶段超时（秒）。 |
@@ -130,7 +132,10 @@ python run_bot.py
 
 ## 使用方法
 
-非 `/` 开头的消息直接进入日常对话。若消息中包含 HTTP/HTTPS 链接，会自动前置直读网页全文并沙箱总结，短路跳过搜索；常规问题默认以 LIGHT 模式按需联网搜索并基于证据回答。
+非 `/` 开头的消息直接进入日常对话：
+- **网页直读与短路**：若消息中包含 HTTP/HTTPS 链接，会自动前置直读网页全文并沙箱总结，短路跳过搜索；
+- **智能检索路由（SearchRouter）**：普通对话由轻量路由根据“检索收益（Retrieval Benefit）”智能裁决——日常闲聊、逻辑创作或无需外部事实的问题跳过搜索直接由模型生成；当问题依赖外部事实或时效信息时，自动触发 `LIGHT 模式`（单查询快速检索，普通回复不展示任何来源编号、标题或 URL，基于证据生成）；绝不在普通聊天中静默发起高开销多查询；
+- **确定性命令边界**：若需要多查询深度搜索并附带来源链接，显式使用 `/search`（STANDARD 模式）；若需要强制免搜索快速回答，使用 `/skip`。
 
 | 指令 | 别名 | 功能说明 |
 |---|---|---|
@@ -199,8 +204,10 @@ python run_bot.py
 ## 开发与回归测试
 
 ```powershell
-# 运行全量单元测试（512 项测试）
+# 运行全量单元测试（529 项测试）
 python -B -m unittest discover -s tests -t . -v
+# 或使用 pytest 快速并发测试
+pytest -q
 
 # 检查代码语法与编译
 python -B -m compileall -q src tests run_bot.py

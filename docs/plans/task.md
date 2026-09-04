@@ -26,3 +26,4 @@
 | Task 40 | 修复 `src/chat/chat_service.py` 与 `src/util.py` 异常错误类型隔离（区分免搜索与搜索异常，优化代理 ReadTimeout 直接失败切换，避免误报为在线搜索不可用） | COMPLETED | `python -B -m unittest tests.test_simple_search_chat_flow -v` (14 passed) |
 | Task 41 | 配置 `.env` 多模型平滑回退链（`gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite` 及超时底线保护，抵御 503 拥堵） | COMPLETED | 实测平滑降级（3.5 触发 503 时无缝由 3.1 毫秒级生成回复） |
 | Task 42 | 针对性单测更新与全量回归（覆盖普通对话异常与搜索异常区分测试，全量 pytest 校验） | COMPLETED | `pytest -q` (529 passed in 22.81s), `compileall` clean, `git diff --check` clean |
+| Task 43 | 文档同步升级（更新 `README.md` 与 `README_EN.md`，记录检索收益路由机制、多模型回退链抗拥堵建议、普通对话错误隔离及 529 项全量测试验证） | COMPLETED | `python -B -m unittest tests.test_readme_guide -v` (10 passed), `pytest -q` (529 passed) |

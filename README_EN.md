@@ -10,7 +10,7 @@
 
 - **💬 Conversational Context**: Guarantees FIFO session ordering, supports custom persona configurations (`config/persona.md`), and provides multi-turn history management.
 - **🌐 Automatic URL Direct-Reading**: Automatically detects HTTP/HTTPS URLs in user messages, fetches webpage content within a 5-second timeout, and injects it into an XML sandbox to summarize/answer, short-circuiting redundant web searches; prevents token bloating in persistent chat history.
-- **🔍 Deterministic Grounded Search**: Tavily is the primary search provider, with seamless fallback to DDGS (DDGS stage timeout defaults to 15s). Normal chat is strictly locked to `LIGHT mode` (single query, replies do not expose source numbers, titles, or URLs), while explicit `/search` uses `STANDARD mode` (multi-query with source citations). Supports `/skip` to bypass web search entirely. Transparently handles network unavailability, insufficient evidence, and inconsistent premise/entity names with fixed boundary degradation, ensuring answers are grounded only on available evidence without hallucinating online sources. Automatically removes date filters and retries Tavily once if parameter range constraints are rejected. Search traces record audit metadata while stripping all sensitive content.
+- **🔍 Deterministic Grounded Search**: Tavily is the primary search provider, with seamless fallback to DDGS (DDGS stage timeout defaults to 15s). Non-command conversational messages are dynamically routed by a lightweight SearchRouter (based on retrieval benefit) between skipping search or running in `LIGHT mode` (single fast query; replies do not expose source numbers, titles, or URLs), never silently escalating to multi-query; explicit `/search` uses `STANDARD mode` (multi-query with source citations). Supports `/skip` to bypass web search entirely. Transparently handles network unavailability, insufficient evidence, and inconsistent premise/entity names with fixed boundary degradation, ensuring answers are grounded only on available evidence without hallucinating online sources. Automatically removes date filters and retries Tavily once if parameter range constraints are rejected. Search traces record audit metadata while stripping all sensitive content.
 - **🛡️ Triple-Layer Prompt Injection Defense**:
   1. **XML Semantic Sandbox**: External webpage text is fully escaped with XML entities and encapsulated within `<external_webpage_content>` tags;
   2. **Authoritative Boundary Constraints**: System prompt enforces the highest security hierarchy, forbidding the model from executing any instructions or roleplay prompts contained in external web content;
@@ -79,9 +79,11 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 ### Model Chain & API Key Isolation Configuration
 - Model chains use `provider:model_name` syntax (comma-separated). The first entry is the primary model; subsequent entries serve as fallbacks. Supported providers: `gemini` and `deepseek`.
 - Gemini uses native `generateContent` REST API (default `GEMINI_URL=https://generativelanguage.googleapis.com/v1`), while DeepSeek uses an OpenAI-compatible endpoint.
+- **Resilient Fallback Chain Recommendation**: Due to transient 503 high-demand surges on Google Gemini models (e.g. preview or lite models), configuring a multi-model fallback chain in `CHAT_MODELS` is strongly recommended (e.g., `CHAT_MODELS=gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite` or with DeepSeek). If the primary model hits a 503 or network timeout, the system switches to the next model in milliseconds to maintain uninterrupted service.
+- **Strict Error Isolation for Non-Search Replies**: If an unsearched reply (either skipped via command or decided as skip by SearchRouter) fails due to LLM provider downtime or overload, the bot directly informs the user that the service is busy, and will never misreport the error as an "online search network unavailable" failure.
 - **Physical Quota Isolation**: Foreground chat uses `GEMINI_API_KEY`, while background memory extraction can optionally use a dedicated `MEMORY_GEMINI_API_KEY`. This physically isolates API quotas and completely prevents 15 RPM free tier 429 rate limiting during chat; automatically falls back to the primary key if unset. Example:
   ```dotenv
-  CHAT_MODELS=gemini:gemini-2.5-flash,deepseek:deepseek-chat
+  CHAT_MODELS=gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,deepseek:deepseek-chat
   GEMINI_API_KEY=your_chat_gemini_key
   DEEPSEEK_API_KEY=your_deepseek_key
 
@@ -100,7 +102,7 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 | `ONEBOT_ACCESS_TOKEN` | Conditional | Empty | Bearer token for qqbot → OneBot API requests. |
 | `REQUIRE_GROUP_AT` | Optional | `true` | Whether an explicit `@` mention is required in group chats. |
 | `ADMIN_QQ_IDS` | Conditional | Empty | Comma/semicolon-separated QQ IDs with admin rights for `/globalremember`. |
-| `CHAT_MODELS` | Required | None | Conversation model chain, e.g. `gemini:gemini-2.5-flash`. Keys required for listed providers. |
+| `CHAT_MODELS` | Required | None | Conversation model chain, e.g. `gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite`. Keys required for listed providers. |
 | `MEMORY_MODELS` | Optional | Empty | Dedicated model chain for structured memory extraction; defaults to `CHAT_MODELS` if unset. |
 | `MEMORY_GEMINI_API_KEY` | Optional | Empty | Dedicated Gemini Key for memory extraction; defaults to `GEMINI_API_KEY`. Isolates foreground & background quotas. |
 | `MEMORY_DEEPSEEK_API_KEY` | Optional | Empty | Dedicated DeepSeek Key for memory extraction; defaults to `DEEPSEEK_API_KEY`. |
@@ -110,7 +112,7 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 | `DEEPSEEK_URL` | Optional | `https://api.deepseek.com/chat/completions` | API endpoint for DeepSeek chat completions. |
 | `TAVILY_API_KEY` | Optional | Empty | API Key for primary search provider Tavily; falls back to DDGS if unset or unavailable. |
 | `PROXY_URL` | Optional | Empty | Global HTTP/HTTPS proxy address, e.g. `http://127.0.0.1:7890`. |
-| `SEARCH_ROUTER_MODEL` | Optional | `gemini-3.1-flash-lite` | Search router model used for deciding if search is needed and extracting search topics. |
+| `SEARCH_ROUTER_MODEL` | Optional | `gemini-3.1-flash-lite` | Search router model used for dynamically deciding whether search is needed (skip vs LIGHT mode) based on retrieval benefit. |
 | `SEARCH_ROUTER_TIMEOUT` | Optional | `5.0` | Timeout in seconds for search router decision stage. |
 | `SEARCH_MAX_RESULTS` | Optional | `4` | Maximum number of search documents returned per query. |
 | `SEARCH_PLANNER_TIMEOUT` | Optional | `8.0` | Timeout in seconds for search query planning. |
@@ -130,7 +132,10 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 
 ## Usage & Commands
 
-Messages not starting with `/` enter normal conversation. If a message contains an HTTP/HTTPS URL, the bot will automatically direct-read the webpage content in a sandbox, short-circuiting search; general questions will trigger grounded web search in LIGHT mode as needed.
+Messages not starting with `/` enter normal conversation:
+- **URL Direct-Reading & Short-Circuiting**: If a message contains an HTTP/HTTPS URL, the bot will automatically fetch the webpage in a sandbox and answer based on it, short-circuiting external search engines.
+- **Smart SearchRouter**: Conversational messages are dynamically routed based on "Retrieval Benefit" — casual banter, creative writing, and self-contained tasks skip search entirely for instant response; queries depending on external facts or real-time info automatically trigger `LIGHT mode` (single fast query, grounded on evidence without exposing noisy source links); never silently triggers heavy multi-query searches.
+- **Deterministic Command Boundaries**: When you want multi-query in-depth search with source links, explicitly use `/search` (STANDARD mode); to force direct model generation without search, use `/skip`.
 
 | Command | Alias | Description |
 |---|---|---|
@@ -199,8 +204,10 @@ Ensure OneBot provides reachable image URLs, verify whether proxy settings affec
 ## Development & Testing
 
 ```powershell
-# Run full unit test suite (512 tests)
+# Run full unit test suite (529 tests)
 python -B -m unittest discover -s tests -t . -v
+# Or run with pytest for fast execution
+pytest -q
 
 # Syntax and compilation check
 python -B -m compileall -q src tests run_bot.py
