@@ -377,6 +377,10 @@ class MemoryStore:
             "mentioned_qq_ids": event.mentioned_qq_ids,
             "reply_to_message_id": event.reply_to_message_id,
             "reply_to_user_id": event.reply_to_user_id,
+            "prior_dialogue_context": [
+                [role, content]
+                for role, content in event.prior_dialogue_context
+            ],
         }
         payload_json = json.dumps(
             payload,
@@ -1988,6 +1992,11 @@ def _job_from_row(row: sqlite3.Row) -> MemoryJob:
         error_type=row["error_type"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
+        prior_dialogue_context=tuple(
+            (str(turn[0]), str(turn[1]))
+            for turn in payload.get("prior_dialogue_context", ())
+            if isinstance(turn, (list, tuple)) and len(turn) == 2
+        ),
     )
 
 

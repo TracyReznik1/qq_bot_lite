@@ -168,6 +168,31 @@ def _ensure_history_loaded(session_key: str) -> None:
             history.extend(loaded)
 
 
+def get_recent_dialogue_context(
+    session_key: str,
+    turns: int = 1,
+) -> tuple[tuple[str, str], ...]:
+    """Return the most recent dialogue turns as a tuple of (role, content) pairs.
+
+    Each turn is typically a user message and assistant reply (up to 2 messages per turn).
+    Safe to call concurrently.
+    """
+    _ensure_history_loaded(session_key)
+    with chat_history_lock:
+        messages = chat_history.get(session_key, [])
+        if not messages:
+            return ()
+        message_count = max(int(turns), 1) * 2
+        slice_messages = messages[-message_count:]
+        result: list[tuple[str, str]] = []
+        for msg in slice_messages:
+            role = str(msg.get("role", "")).strip()
+            content = str(msg.get("content", "")).strip()
+            if role and content:
+                result.append((role, content))
+        return tuple(result)
+
+
 def build_user_content(text: str, image_data_urls: list[str]):
     text = str(text or "").strip()
     if not image_data_urls:

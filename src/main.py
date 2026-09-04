@@ -7,7 +7,7 @@ from typing import Any
 
 from flask import Flask, request
 
-from src.chat.chat_service import generate_reply
+from src.chat.chat_service import generate_reply, get_recent_dialogue_context
 from src.commands import CommandContext, handle_command
 from src.commands.renderer import PersonaCommandRenderer
 from src.config import BASE_DIR, config
@@ -306,6 +306,7 @@ def _process_message(data: dict[str, Any]) -> None:
                 if data.get("reply_to_user_id")
                 else None
             )
+        prior_context = get_recent_dialogue_context(session_key, turns=1)
         mem_event = MemoryEvent(
             context=mem_ctx,
             message_id=str(data.get("message_id") or ""),
@@ -315,6 +316,7 @@ def _process_message(data: dict[str, Any]) -> None:
             mentioned_qq_ids=tuple(str(qid) for qid in data.get("mentioned_qq_ids") or ()),
             reply_to_message_id=reply_to_message_id,
             reply_to_user_id=reply_to_user_id,
+            prior_dialogue_context=prior_context,
         )
         memory_service = get_memory_service()
         job_id: int | None = None

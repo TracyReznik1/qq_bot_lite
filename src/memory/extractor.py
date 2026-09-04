@@ -83,6 +83,11 @@ their modality and must never be upgraded to certain facts. A correction or
 withdrawal may request supersede or retract, but the downstream policy makes
 every storage and lifecycle decision. valid_from and valid_to must be null or
 an ISO-8601 timestamp.
+When recent_dialogue_context is provided in metadata, use it strictly to resolve
+pronouns or anaphoric references (such as "前者", "后者", "它", "那个", "this", "that")
+in message_text to their concrete named entities in claims value.
+DO NOT extract claims from recent_dialogue_context itself; candidate claims must
+only capture what the speaker expresses in the current message_text.
 """
 
 
@@ -152,6 +157,10 @@ class MemoryExtractor:
             "mentioned_qq_ids": list(event.mentioned_qq_ids),
             "has_reply_target": bool(event.reply_to_user_id),
             "reply_target_qq": event.reply_to_user_id,
+            "recent_dialogue_context": [
+                {"role": role, "content": content}
+                for role, content in event.prior_dialogue_context
+            ],
             "message_text": event.text,
             "image_count": len(image_data_urls),
         }

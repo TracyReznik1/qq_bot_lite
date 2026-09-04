@@ -25,6 +25,7 @@ class MemoryEvent:
     mentioned_qq_ids: tuple[str, ...] = ()
     reply_to_message_id: str | None = None
     reply_to_user_id: str | None = None
+    prior_dialogue_context: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class MemoryJob:
     error_type: str | None
     created_at: str
     updated_at: str
+    prior_dialogue_context: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)

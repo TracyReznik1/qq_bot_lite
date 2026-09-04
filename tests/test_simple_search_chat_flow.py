@@ -147,6 +147,33 @@ class SimpleSearchChatFlowTests(unittest.TestCase):
         self.assertNotIn("信息可能不完整", reply)
         self.assertNotIn("不完整", reply)
 
+    def test_get_recent_dialogue_context(self):
+        from src.chat.chat_service import append_history, get_recent_dialogue_context, reset_history
+
+        session = "private:context_test"
+        reset_history(session)
+        self.assertEqual((), get_recent_dialogue_context(session))
+
+        append_history(session, "你好", "你好！有什么我可以帮你的？")
+        append_history(session, "Python和Go哪个好？", "各有特点，Python开发快，Go并发好。")
+
+        # 默认 1 轮（最后 2 条消息）
+        last_turn = get_recent_dialogue_context(session, turns=1)
+        self.assertEqual(
+            (
+                ("user", "Python和Go哪个好？"),
+                ("assistant", "各有特点，Python开发快，Go并发好。"),
+            ),
+            last_turn,
+        )
+
+        # 2 轮
+        last_two_turns = get_recent_dialogue_context(session, turns=2)
+        self.assertEqual(4, len(last_two_turns))
+        self.assertEqual(("user", "你好"), last_two_turns[0])
+
+        reset_history(session)
+
 
 if __name__ == "__main__":
     unittest.main()

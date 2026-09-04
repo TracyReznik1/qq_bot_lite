@@ -588,6 +588,67 @@ class MemoryServiceTests(unittest.TestCase):
         self.assertEqual("retry", job_after.state)
         self.assertEqual("abandoned", job_after.error_type)
 
+    def test_ephemeral_images_fifo_eviction_when_capacity_exceeded(self):
+        service = MemoryService(store=self.store, max_ephemeral_images=3)
+        ctx = MemoryContext(user_id="1001", session_key="private:1001", is_group=False)
+
+        job_ids = []
+        for i in range(4):
+            event = MemoryEvent(
+                context=ctx,
+                message_id=f"msg_cap_{i}",
+                sequence=i + 1,
+                text=f"图片测试{i}",
+                image_count=1,
+            )
+            job_id = service.stage_event(event)
+            service.release_job(job_id, image_data_urls=[f"data:image/png;base64,{i}"])
+            job_ids.append(job_id)
+
+        self.assertEqual(3, len(service._ephemeral_images))
+        self.assertNotIn(job_ids[0], service._ephemeral_images)
+        self.assertIn(job_ids[1], service._ephemeral_images)
+        self.assertIn(job_ids[2], service._ephemeral_images)
+        self.assertIn(job_ids[3], service._ephemeral_images)
+
+    def test_job_with_missing_images_falls_back_to_text_extraction(self):
+        fake_extractor = MagicMock()
+        fake_extractor.extract.return_value = (
+            CandidateClaim(
+                subject_ref="speaker",
+                predicate="name",
+                value="小明",
+                memory_type="identity",
+                modality="asserted",
+                confidence="high",
+            ),
+        )
+        service = MemoryService(store=self.store, extractor=fake_extractor)
+        ctx = MemoryContext(user_id="1001", session_key="private:1001", is_group=False)
+        event = MemoryEvent(
+            context=ctx,
+            message_id="msg_restarted_job",
+            sequence=1,
+            text="我叫小明",
+            image_count=2,
+        )
+        job_id = service.stage_event(event)
+        # release without images (or recovered from db after reboot)
+        self.store.mark_job_ready(job_id)
+
+        claimed = self.store.claim_next_job("private:1001")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(2, claimed.image_count)
+
+        service._process_claimed_job(claimed)
+
+        fake_extractor.extract.assert_called_once()
+        called_args, called_kwargs = fake_extractor.extract.call_args
+        self.assertEqual((), called_kwargs.get("image_data_urls"))
+
+        job_after = self.store.get_job(job_id)
+        self.assertEqual("done", job_after.state)
+
 
 if __name__ == "__main__":
     unittest.main()

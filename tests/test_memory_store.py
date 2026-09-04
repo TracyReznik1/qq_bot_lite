@@ -472,6 +472,7 @@ class MemoryStoreTests(unittest.TestCase):
                 "mentioned_qq_ids",
                 "reply_to_message_id",
                 "reply_to_user_id",
+                "prior_dialogue_context",
             },
             set(payload),
         )
@@ -482,6 +483,24 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertNotIn(bare_image_base64.lower(), serialized)
         self.assertNotIn("sk-secret-value", serialized)
         self.assertNotIn("4111 1111 1111 1111", serialized)
+
+    def test_job_preserves_and_deserializes_prior_dialogue_context(self):
+        context_turns = (("user", "A和B哪个好？"), ("assistant", "A性能好，B开发快。"))
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="10001",
+                session_key="private:10001",
+                is_group=False,
+            ),
+            message_id="msg-context-1",
+            sequence=1,
+            text="我更喜欢前者",
+            prior_dialogue_context=context_turns,
+        )
+        job_id, created = self.store.create_job(event)
+        self.assertTrue(created)
+        job = self.store.get_job(job_id)
+        self.assertEqual(context_turns, job.prior_dialogue_context)
 
     def test_job_payload_redacts_all_explicitly_forbidden_secret_categories(self):
         forbidden_values = (

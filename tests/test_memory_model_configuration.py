@@ -73,6 +73,15 @@ class MemoryModelConfigurationTests(unittest.TestCase):
         self.assertEqual("chat-main", chat_client._chain[0].model)
         self.assertEqual("memory-cheap", memory_client._chain[0].model)
 
+    def test_memory_extractor_uses_memory_llm_client_by_default(self):
+        from src.memory.extractor import MemoryExtractor
+
+        fake_memory_client = object()
+        with mock.patch("src.memory.extractor.get_memory_llm_client", return_value=fake_memory_client):
+            extractor = MemoryExtractor()
+
+        self.assertIs(extractor.llm, fake_memory_client)
+
 
 if __name__ == "__main__":
     unittest.main()

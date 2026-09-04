@@ -14,6 +14,9 @@ from src.memory.store import MemoryStore
 logger = logging.getLogger("qq-bot")
 
 
+MAX_EPHEMERAL_IMAGE_ENTRIES: int = 16
+
+
 def _utc_now_offset(seconds: int) -> str:
     dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
     return dt.isoformat()
@@ -24,11 +27,13 @@ class MemoryService:
         self,
         store: MemoryStore | None = None,
         extractor: MemoryExtractor | None = None,
+        max_ephemeral_images: int = MAX_EPHEMERAL_IMAGE_ENTRIES,
     ) -> None:
         db_path = store.path if store else config.memory_database_path
         self.store = store or MemoryStore(db_path)
         self._extractor = extractor or MemoryExtractor()
         self._policy = MemoryPolicy(self.store)
+        self._max_ephemeral_images = max(int(max_ephemeral_images), 1)
         self._ephemeral_images: dict[int, tuple[str, ...]] = {}
         self._pending_sequences: dict[str, set[int]] = {}
         self._lock = Lock()
@@ -114,6 +119,14 @@ class MemoryService:
                 self._cond.notify_all()
                 return
             if image_data_urls:
+                while len(self._ephemeral_images) >= self._max_ephemeral_images:
+                    oldest_job_id = next(iter(self._ephemeral_images))
+                    self._ephemeral_images.pop(oldest_job_id, None)
+                    logger.warning(
+                        "Ephemeral images limit reached (%s), evicted oldest job_id=%s",
+                        self._max_ephemeral_images,
+                        oldest_job_id,
+                    )
                 self._ephemeral_images[job_id] = tuple(image_data_urls)
             self._cond.notify_all()
 
@@ -194,6 +207,13 @@ class MemoryService:
         with self._lock:
             images = self._ephemeral_images.get(job.id, ())
 
+        if job.image_count > 0 and not images:
+            logger.info(
+                "Memory job image data unavailable (evicted or recovered after restart), falling back to text extraction job_id=%s scope_key=%s",
+                job.id,
+                job.scope_key,
+            )
+
         try:
             event = MemoryEvent(
                 context=job.context,
@@ -204,6 +224,7 @@ class MemoryService:
                 mentioned_qq_ids=job.mentioned_qq_ids,
                 reply_to_message_id=job.reply_to_message_id,
                 reply_to_user_id=job.reply_to_user_id,
+                prior_dialogue_context=job.prior_dialogue_context,
             )
             candidates = self._extractor.extract(
                 event,

@@ -308,6 +308,75 @@ class MemoryExtractorTests(unittest.TestCase):
         self.assertNotIn("data:image", messages[0]["content"])
         self.assertNotIn("角色设定", messages[0]["content"])
 
+    def test_messages_includes_recent_dialogue_context(self):
+        self.llm.chat.return_value = ChatResponse(content='{"claims": []}')
+        context_turns = (("user", "Python和Go哪个好？"), ("assistant", "Python开发简单，Go性能强。"))
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="10001",
+                session_key="private:10001",
+                is_group=False,
+            ),
+            message_id="m-context",
+            sequence=1,
+            text="我更喜欢前者",
+            prior_dialogue_context=context_turns,
+        )
+        self.extractor.extract(event)
+
+        messages = self.llm.chat.call_args.args[0]
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual(
+            [
+                {"role": "user", "content": "Python和Go哪个好？"},
+                {"role": "assistant", "content": "Python开发简单，Go性能强。"},
+            ],
+            payload.get("recent_dialogue_context"),
+        )
+        self.assertEqual("我更喜欢前者", payload.get("message_text"))
+
+    def test_system_prompt_contains_dialogue_context_pronoun_guidance(self):
+        from src.memory.extractor import EXTRACTION_SYSTEM_PROMPT
+
+        self.assertIn("recent_dialogue_context", EXTRACTION_SYSTEM_PROMPT)
+        self.assertIn("前者", EXTRACTION_SYSTEM_PROMPT)
+        self.assertIn("DO NOT extract claims from recent_dialogue_context", EXTRACTION_SYSTEM_PROMPT)
+
+    def test_extract_resolves_pronoun_candidate_claims(self):
+        self.llm.chat.return_value = ChatResponse(
+            content=json.dumps(
+                {
+                    "claims": [
+                        {
+                            "subject_ref": "speaker",
+                            "predicate": "likes",
+                            "value": "Python",
+                            "memory_type": "preference",
+                            "modality": "asserted",
+                            "confidence": "high",
+                            "operation": "add",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+        event = MemoryEvent(
+            context=MemoryContext(
+                user_id="10001",
+                session_key="private:10001",
+                is_group=False,
+            ),
+            message_id="m-resolved",
+            sequence=1,
+            text="我更喜欢前者",
+            prior_dialogue_context=(("user", "Python和Go"), ("assistant", "各有优缺点")),
+        )
+        claims = self.extractor.extract(event)
+        self.assertEqual(1, len(claims))
+        self.assertEqual("Python", claims[0].value)
+        self.assertEqual("likes", claims[0].predicate)
+
 
 if __name__ == "__main__":
     unittest.main()
