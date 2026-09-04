@@ -135,6 +135,18 @@ class SimpleSearchChatFlowTests(unittest.TestCase):
         self.assertIn("[图片]", user_msg)
         self.assertNotIn("data:image/png", user_msg)
 
+    def test_degraded_answer_does_not_add_incomplete_information_warning(self):
+        engine = FakeEngine(success_outcome(SearchMode.LIGHT))
+        with patch("src.chat.chat_service.SearchAnswerer") as mock_answerer_cls:
+            mock_answerer_instance = MagicMock()
+            mock_answerer_instance.answer.return_value = AnswerResult(text="降级回答", degraded=True)
+            mock_answerer_cls.return_value = mock_answerer_instance
+            with patch.object(chat_service, "get_simple_search_pipeline_for_chat", return_value=engine):
+                reply = generate_reply("private:1", "搜索提问", mode=SearchMode.LIGHT)
+        self.assertEqual("降级回答", reply)
+        self.assertNotIn("信息可能不完整", reply)
+        self.assertNotIn("不完整", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

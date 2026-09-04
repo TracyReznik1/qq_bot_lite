@@ -152,13 +152,34 @@ class SearchAnsweringTests(unittest.TestCase):
         response = render_search_answer(
             "回答" * 1000,
             results(),
-            warning="信息可能不完整。",
+            warning="注意：测试",
             show_sources=True,
             qq_limit=200,
             trace=trace(),
         )
         self.assertLessEqual(len(response.text), 200)
-        self.assertEqual(1, response.text.count("信息可能不完整。"))
+        self.assertEqual(1, response.text.count("注意：测试"))
+
+    def test_incomplete_or_reliability_disclaimer_is_suppressed(self):
+        suppressed_warning = render_search_answer(
+            "这是搜索回答。",
+            results(),
+            warning="信息可能不完整。",
+            show_sources=False,
+            trace=trace(),
+        )
+        self.assertEqual("这是搜索回答。", suppressed_warning.text)
+        self.assertNotIn("信息可能不完整", suppressed_warning.text)
+
+        trailing_disclaimer = render_search_answer(
+            "这是搜索回答。\n\n注：搜索信息可能不完整，以上内容仅供参考，无法保证完全可靠。",
+            results(),
+            show_sources=False,
+            trace=trace(),
+        )
+        self.assertEqual("这是搜索回答。", trailing_disclaimer.text)
+        self.assertNotIn("仅供参考", trailing_disclaimer.text)
+        self.assertNotIn("信息可能不完整", trailing_disclaimer.text)
 
     def test_failure_rendering_exact_messages_and_trace_kind(self):
         tr1 = trace()

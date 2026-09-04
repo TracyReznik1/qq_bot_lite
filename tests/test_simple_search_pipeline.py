@@ -136,12 +136,12 @@ class SimpleSearchPipelineTests(unittest.TestCase):
         self.assertIs(SearchMode.STANDARD, outcome.plan.mode)
         self.assertEqual(SearchFailure.PROVIDER_UNAVAILABLE, outcome.failure)
 
-    def test_ranker_degradation_preserves_results_and_adds_warning(self):
+    def test_ranker_degradation_preserves_results_and_omits_warning(self):
         pipeline, _ = make_pipeline(ranker_degraded=True)
         outcome = pipeline.run(SearchRequest(SearchMode.LIGHT, "q"))
         self.assertTrue(outcome.results)
         self.assertTrue(outcome.trace.ranker_degraded)
-        self.assertEqual("信息可能不完整。", outcome.warning)
+        self.assertIsNone(outcome.warning)
 
     def test_no_usable_result_and_unexpected_exception_are_nonthrowing(self):
         empty, _ = make_pipeline(results=())

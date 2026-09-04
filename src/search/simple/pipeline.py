@@ -121,14 +121,14 @@ class SimpleSearchPipeline:
                 (self._clock() - ranker_started) * 1000.0, 0.0
             )
             trace.ranker_degraded = ranking.degraded
-            warning = "信息可能不完整。" if ranking.degraded else None
+            warning = None
 
             if not ranking.results:
                 return SearchOutcome(
                     plan=plan,
                     results=(),
                     trace=trace,
-                    warning=warning,
+                    warning=None,
                     failure=SearchFailure.NO_RESULTS,
                 )
 
@@ -136,7 +136,7 @@ class SimpleSearchPipeline:
                 plan=plan,
                 results=ranking.results,
                 trace=trace,
-                warning=warning,
+                warning=None,
                 failure=None,
             )
         except Exception as error:

@@ -313,14 +313,10 @@ def generate_reply(
                 context=mem_ctx,
             )
             outcome.trace.answer_degraded = answer_res.degraded
-            warning = outcome.warning
-            if answer_res.degraded and not warning:
-                warning = "信息可能不完整。"
-
             rendered = render_search_answer(
                 answer_res.text,
                 outcome.results,
-                warning=warning,
+                warning=None,
                 show_sources=(mode is SearchMode.STANDARD),
                 qq_limit=_qq_limit(),
                 trace=outcome.trace,
