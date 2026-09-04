@@ -117,6 +117,15 @@ class Config:
         object.__setattr__(self, "chat_models", chat_models)
         object.__setattr__(self, "memory_models", memory_models)
         object.__setattr__(self, "search_max_results", max(int(self.search_max_results), 1))
+        for field_name in (
+            "search_planner_timeout",
+            "search_tavily_timeout",
+            "search_ddgs_timeout",
+            "search_reader_timeout",
+            "search_ranker_timeout",
+            "search_answer_timeout",
+        ):
+            object.__setattr__(self, field_name, max(float(getattr(self, field_name)), 0.1))
     onebot_url: str = os.getenv("ONEBOT_API_URL", "http://127.0.0.1:3000").rstrip("/")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
     callback_secret: str = os.getenv("CALLBACK_SECRET", "")
@@ -138,6 +147,12 @@ class Config:
         return self.data_dir / "memory.sqlite3"
 
     search_max_results: int = env_int("SEARCH_MAX_RESULTS", 4)
+    search_planner_timeout: float = env_float("SEARCH_PLANNER_TIMEOUT", 8.0)
+    search_tavily_timeout: float = env_float("SEARCH_TAVILY_TIMEOUT", 8.0)
+    search_ddgs_timeout: float = env_float("SEARCH_DDGS_TIMEOUT", 15.0)
+    search_reader_timeout: float = env_float("SEARCH_READER_TIMEOUT", 5.0)
+    search_ranker_timeout: float = env_float("SEARCH_RANKER_TIMEOUT", 10.0)
+    search_answer_timeout: float = env_float("SEARCH_ANSWER_TIMEOUT", 20.0)
     history_turns: int = env_int("HISTORY_TURNS", 8)
     persist_history: bool = env_bool("PERSIST_HISTORY", True)
     message_workers: int = field(default_factory=lambda: max(env_int("MESSAGE_WORKERS", 8), 1))
