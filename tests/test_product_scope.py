@@ -8,10 +8,18 @@ import src.services.search_service as search_service
 import src.services.url_fetch_service as url_fetch_service
 from src.commands import COMMANDS, CommandContext
 from src.config import Config
-from src.search.simple.models import SearchMode
+from src.search.simple.models import (
+    RequestSource,
+    SearchFailure,
+    SearchMode,
+    SearchOutcome,
+    SearchPlan,
+    SearchQuery,
+    SearchResult as SimpleSearchResult,
+    SearchTrace,
+)
 from src.services.onebot_client import OneBotClient
 from src.services.search_service import SearchResult
-from src.search.models import RequestSource, SearchFailureCode, SearchTier, SearchTrace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,54 +76,43 @@ class ProductScopeTests(unittest.TestCase):
         generate.assert_called_once()
         self.assertEqual(SearchMode.STANDARD, generate.call_args.kwargs["mode"])
 
-    def test_search_internal_page_fetch_is_preserved(self):
-        from src.search import get_search_orchestrator, reset_search_orchestrator
-        reset_search_orchestrator()
-        self.assertTrue(callable(get_search_orchestrator))
+    def test_search_pipeline_factory_is_preserved(self):
+        from src.search import get_simple_search_pipeline, reset_simple_search_pipeline
+        reset_simple_search_pipeline()
+        self.assertTrue(callable(get_simple_search_pipeline))
 
-    def test_compatibility_search_finalizes_trace_once_on_early_failure(self):
-        trace = SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchTier.LIGHT)
-        pipeline_result = SimpleNamespace(
-            decision=SimpleNamespace(route=SearchTier.LIGHT),
-            evidence=None,
-            failure_code=SearchFailureCode.PROVIDER_NOT_CONFIGURED,
-            trace=trace,
+    def test_compatibility_search_failure_has_no_status_banner(self):
+        outcome = SearchOutcome(
+            plan=SearchPlan(SearchMode.STANDARD, (SearchQuery("q1", "什么是光合作用"),)),
+            results=(),
+            trace=SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchMode.STANDARD),
+            failure=SearchFailure.PROVIDER_UNAVAILABLE,
         )
-        orchestrator = mock.Mock(run=mock.Mock(return_value=pipeline_result))
-        with (
-            mock.patch.object(search_service, "get_search_orchestrator", return_value=orchestrator),
-            mock.patch("src.search.orchestrator.finalize_search_trace") as finalize,
-        ):
+        pipeline = mock.Mock(run=mock.Mock(return_value=outcome))
+        with mock.patch.object(search_service, "get_simple_search_pipeline", return_value=pipeline):
             result = search_service.search("什么是光合作用")
         self.assertFalse(result.ok)
-        finalize.assert_called_once()
-        self.assertIsNotNone(trace.response_started_at)
+        self.assertEqual("在线检索未完成。", result.text)
 
     def test_compatibility_search_success_has_no_status_banner(self):
-        trace = SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchTier.LIGHT)
-        evidence = SimpleNamespace(
-            evidence_items=(
-                SimpleNamespace(
+        outcome = SearchOutcome(
+            plan=SearchPlan(SearchMode.STANDARD, (SearchQuery("q1", "当前版本是什么"),)),
+            results=(
+                SimpleSearchResult(
+                    result_id="r1",
                     title="Example",
                     url="https://example.com/page",
                     excerpt="版本是3.2",
+                    provider="tavily",
                 ),
             ),
+            trace=SearchTrace("req-1", RequestSource.COMPATIBILITY, SearchMode.STANDARD),
         )
-        pipeline_result = SimpleNamespace(
-            decision=SimpleNamespace(route=SearchTier.LIGHT),
-            evidence=evidence,
-            failure_code=None,
-            trace=trace,
-        )
-        orchestrator = mock.Mock(run=mock.Mock(return_value=pipeline_result))
-        with (
-            mock.patch.object(
-                search_service,
-                "get_search_orchestrator",
-                return_value=orchestrator,
-            ),
-            mock.patch("src.search.orchestrator.finalize_search_trace"),
+        pipeline = mock.Mock(run=mock.Mock(return_value=outcome))
+        with mock.patch.object(
+            search_service,
+            "get_simple_search_pipeline",
+            return_value=pipeline,
         ):
             result = search_service.search("当前版本是什么")
 

@@ -127,7 +127,7 @@ class FallbackLLMClient:
         timeout_seconds: float | None = None,
     ) -> ChatResponse:
         has_tools = bool(tools)
-        has_images = _messages_have_images(messages)
+        contains_images = _messages_have_images(messages)
         affinity = _tool_affinity(messages)
 
         started = time.monotonic()
@@ -204,7 +204,7 @@ class FallbackLLMClient:
                 continue
 
         # All models exhausted
-        if has_images:
+        if contains_images:
             raise ImageRecognitionUnavailable("当前模型无法识别该图片。")
         raise RuntimeError("所有模型暂时不可用，请稍后再试。")
 

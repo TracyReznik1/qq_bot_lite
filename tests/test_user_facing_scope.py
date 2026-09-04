@@ -40,7 +40,7 @@ class UserFacingScopeTests(unittest.TestCase):
 
     def test_user_facing_search_paths_do_not_show_success_status_banner(self):
         for relative_path in (
-            "src/search/renderer.py",
+            "src/search/simple/rendering.py",
             "src/services/search_service.py",
             "src/commands/search.py",
         ):

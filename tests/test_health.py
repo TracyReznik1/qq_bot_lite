@@ -42,7 +42,7 @@ class HealthModelChainTests(unittest.TestCase):
         self.assertIn("search_providers", response)
 
     def test_health_search_providers_without_secrets(self):
-        from src.search.models import ProviderReadiness
+        from src.search import ProviderReadiness
         fake_config = SimpleNamespace(
             gemini_api_key="secret-g",
             deepseek_api_key="secret-d",
@@ -54,8 +54,8 @@ class HealthModelChainTests(unittest.TestCase):
             ),
         )
         readiness = (
-            ProviderReadiness("ddgs", True, True, None),
-            ProviderReadiness("tavily", True, True, None),
+            ProviderReadiness("ddgs", True, True),
+            ProviderReadiness("tavily", True, True),
         )
         orchestrator = SimpleNamespace(_providers=(_ReadinessProvider(readiness[0]), _ReadinessProvider(readiness[1])))
 

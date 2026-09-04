@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 import unittest
 
 from src.config import Config
@@ -70,3 +71,89 @@ class SimpleSearchModelTests(unittest.TestCase):
             for value in (math.nan, math.inf, -math.inf, 0.0, -1.0):
                 with self.subTest(field=field, value=value):
                     self.assertEqual(0.1, getattr(Config(**{field: value}), field))
+
+
+LEGACY_RUNTIME_PATHS = (
+    "src/search/providers/__init__.py",
+    "src/search/providers/base.py",
+    "src/search/providers/tavily.py",
+    "src/search/providers/ddgs.py",
+    "src/search/budget.py",
+    "src/search/evidence.py",
+    "src/search/extraction.py",
+    "src/search/models.py",
+    "src/search/orchestrator.py",
+    "src/search/outcomes.py",
+    "src/search/planner.py",
+    "src/search/policy.py",
+    "src/search/renderer.py",
+    "src/search/router.py",
+    "src/search/stage_runner.py",
+    "src/search/validation.py",
+    "tests/search_fakes.py",
+    "tests/test_chat_retrieval_flow.py",
+    "tests/test_search_blind_acceptance_runner.py",
+    "tests/test_search_budget.py",
+    "tests/test_search_evidence.py",
+    "tests/test_search_extraction.py",
+    "tests/test_search_models.py",
+    "tests/test_search_orchestrator.py",
+    "tests/test_search_outcomes.py",
+    "tests/test_search_planner.py",
+    "tests/test_search_policy.py",
+    "tests/test_search_provider_batches.py",
+    "tests/test_search_providers.py",
+    "tests/test_search_renderer.py",
+    "tests/test_search_router.py",
+    "tests/test_search_simplification_baseline.py",
+    "tests/test_search_stage_runner.py",
+    "tests/test_search_validation.py",
+    "tools/run_search_blind_acceptance.py",
+)
+
+LEGACY_IMPORTS = (
+    "src.search." + "providers",
+    "src.search." + "models",
+    "src.search." + "orchestrator",
+    "src.search." + "planner",
+    "src.search." + "router",
+    "src.search." + "evidence",
+    "src.search." + "validation",
+    "src.search." + "policy",
+    "src.search." + "renderer",
+    "src.search." + "outcomes",
+    "src.search." + "budget",
+    "src.search." + "stage_runner",
+    "src.search." + "extraction",
+)
+
+LEGACY_SYMBOLS = (
+    "Route" + "Planner",
+    "force_" + "search",
+    "has_" + "images",
+    "Search" + "Tier",
+    "Grounded" + "Draft",
+    "Claim" + "Discovery",
+    "Semantic" + "Verifier",
+    "Repair" + "Plan",
+    "fail_" + "closed",
+    "fresh" + "ness",
+    "risk_" + "policy",
+)
+
+
+class LegacyRemovalTests(unittest.TestCase):
+    def test_legacy_runtime_paths_are_absent(self):
+        for relative in LEGACY_RUNTIME_PATHS:
+            self.assertFalse(Path(relative).exists(), relative)
+
+    def test_live_tree_has_no_legacy_imports_or_symbols(self):
+        roots = tuple(Path(root) for root in ("src", "tests", "tools"))
+        this_test = Path(__file__).resolve()
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in roots for path in root.rglob("*.py")
+            if path.resolve() != this_test
+        )
+        for forbidden in LEGACY_IMPORTS + LEGACY_SYMBOLS:
+            self.assertNotIn(forbidden, source)

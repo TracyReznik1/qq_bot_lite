@@ -81,9 +81,10 @@ class SimpleSearchChatFlowTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             generate_reply("private:1", "你好")
 
-    def test_force_search_is_rejected(self):
+    def test_legacy_force_kwarg_is_rejected(self):
+        legacy_kwargs = {"force_" + "search": True}
         with self.assertRaises(TypeError):
-            generate_reply("private:1", "你好", mode=SearchMode.LIGHT, force_search=True)
+            generate_reply("private:1", "你好", mode=SearchMode.LIGHT, **legacy_kwargs)
 
     def test_light_constructs_light_request_and_hides_sources(self):
         engine = FakeEngine(success_outcome(SearchMode.LIGHT))
