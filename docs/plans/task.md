@@ -11,3 +11,5 @@
 | Task 25 | 模型客户端层改造（`GeminiClient`、`DeepSeekClient`、`FallbackLLMClient`、`get_memory_llm_client` 支持独立 Key 注入） | COMPLETED | `python -B -m unittest tests.test_llm_image_fallback tests.test_llm_tool_affinity tests.test_memory_model_configuration -v` (14 passed) |
 | Task 26 | 文档与示例同步（`.env.example`、`README.md`、`README_EN.md` 同步更新满足 AST 校验） | COMPLETED | `python -B -m unittest tests.test_readme_guide -v` (10 passed) |
 | Task 27 | 单元测试与全量回归（`tests/test_memory_api_key_isolation.py` 及全量测试验证，推送 git） | COMPLETED | `python -B -m unittest discover -s tests -t . -v` (517 passed), `compileall` clean, `git diff --check` clean |
+| Task 28 | 聊天层平滑回退（`src/chat/chat_service.py` 在 `SearchMode.LIGHT` 搜索无结果时无感平滑回退至 `_plain_reply`） | COMPLETED | `python -B -m unittest tests.test_simple_search_chat_flow -v` (12 passed) |
+| Task 29 | 针对性单测与全量回归（`tests/test_simple_search_chat_flow.py` 覆盖 LIGHT 回退与 STANDARD 报错保留，全量回归并推送 git） | COMPLETED | `python -B -m unittest discover -s tests -t . -v` (519 passed), `compileall` clean, `git diff --check` clean |

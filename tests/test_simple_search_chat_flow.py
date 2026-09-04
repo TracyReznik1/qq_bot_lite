@@ -147,6 +147,31 @@ class SimpleSearchChatFlowTests(unittest.TestCase):
         self.assertNotIn("信息可能不完整", reply)
         self.assertNotIn("不完整", reply)
 
+    def test_light_search_no_results_falls_back_to_plain_chat(self):
+        trace = SearchTrace("req1", RequestSource.CHAT, SearchMode.LIGHT)
+        failure_outcome = SearchOutcome(
+            plan=SearchPlan(SearchMode.LIGHT, (SearchQuery("q1", "你个笨蛋"),)),
+            results=(),
+            trace=trace,
+            failure=SearchFailure.NO_RESULTS,
+        )
+        engine = FakeEngine(failure_outcome)
+        fake_llm = FakeLLM("哼，才不是笨蛋呢！")
+        reply = run_reply(engine, mode=SearchMode.LIGHT, text="你个笨蛋", fake_llm=fake_llm)
+        self.assertEqual("哼，才不是笨蛋呢！", reply)
+
+    def test_standard_search_no_results_retains_failure_message(self):
+        trace = SearchTrace("req1", RequestSource.COMMAND, SearchMode.STANDARD)
+        failure_outcome = SearchOutcome(
+            plan=SearchPlan(SearchMode.STANDARD, (SearchQuery("q1", "冷门关键词"),)),
+            results=(),
+            trace=trace,
+            failure=SearchFailure.NO_RESULTS,
+        )
+        engine = FakeEngine(failure_outcome)
+        reply = run_reply(engine, mode=SearchMode.STANDARD, text="冷门关键词")
+        self.assertEqual("没有找到可用的在线搜索结果。", reply)
+
     def test_get_recent_dialogue_context(self):
         from src.chat.chat_service import append_history, get_recent_dialogue_context, reset_history
 

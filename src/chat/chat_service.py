@@ -363,6 +363,19 @@ def generate_reply(
             outcome = pipeline.run(request)
 
             if outcome.failure is not None:
+                if mode is SearchMode.LIGHT:
+                    logger.info(
+                        "Light search yielded no usable results (%s), falling back to plain conversation",
+                        outcome.failure.value,
+                    )
+                    reply = _plain_reply(
+                        mem_ctx,
+                        normalized_text,
+                        images,
+                        timeout_seconds=timeout,
+                    )
+                    return reply
+
                 rendered = render_search_failure(
                     outcome.failure,
                     qq_limit=_qq_limit(),
