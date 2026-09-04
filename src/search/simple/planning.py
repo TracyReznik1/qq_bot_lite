@@ -41,7 +41,15 @@ _TEXT_TRANSFORM_RE = re.compile(
     r"(?:翻译|改写|重写|润色|校对|纠错|缩写|扩写|总结|概括|摘要|paraphrase|rewrite|translate|summari[sz]e)",
     re.IGNORECASE,
 )
-_QUOTED_TEXT_RE = re.compile(r"[“‘\"']\s*([^”’\"']+)\s*[”’\"']")
+_QUOTED_TEXT_RE = re.compile(r'“([^”]+)”|‘([^’]+)’|"([^"]+)"')
+_EXPLICIT_SUPPLIED_CONTENT_RE = re.compile(
+    r"(?:以下|下列)(?:的)?(?:文字|文本|内容)|下面(?:的)?(?:文字|文本|内容)|"
+    r"这段(?:文字|文本|内容)|原文|"
+    r"(?:the\s+)?following\s+(?:text|passage|content)|(?:the\s+)?(?:text|passage|content)\s+below|"
+    r"(?:this|provided|supplied|original)\s+(?:text|passage|content)",
+    re.IGNORECASE,
+)
+_TRANSLATION_TRANSFORM_RE = re.compile(r"(?:翻译|translate)", re.IGNORECASE)
 _FRESHNESS_CUE_RE = re.compile(
     r"(?:最新|最近|近期|今天|今日|当前|现在|实时|今年|本周|本月|latest|current|today|recent)",
     re.IGNORECASE,
@@ -51,11 +59,8 @@ _LOOKUP_TOPIC_CUE_RE = re.compile(
     r"news|updates?|vulnerabilit(?:y|ies)|version|weather|price|score|ranking)",
     re.IGNORECASE,
 )
-_SUPPLIED_CONTENT_CUE_RE = re.compile(
-    r"[,，。；;！!]|(?:新闻|消息|动态|进展|漏洞|版本|天气|价格|股价|汇率|行情|比分|排名|政策|规定|数据)"
-    r"\s*(?:是(?!什么|否|怎么|如何)|为(?!什么|何)|包括|有|称|显示|指出|报道|宣布)",
-    re.IGNORECASE,
-)
+_STATEMENT_PUNCTUATION_RE = re.compile(r"[,，。；;！!]")
+_ASSERTION_RE = re.compile(r"(?:是(?!什么|否|怎么|如何)|\b(?:is|are|was|were)\b)", re.IGNORECASE)
 _ALLOWED_ARITHMETIC_OPERATORS = (
     ast.Add,
     ast.Sub,
@@ -218,24 +223,44 @@ def _is_self_contained_creative(text: str) -> bool:
 def _is_supplied_text_transform(text: str) -> bool:
     if not _TEXT_TRANSFORM_RE.search(text):
         return False
+    if _EXPLICIT_SUPPLIED_CONTENT_RE.search(text):
+        return True
 
-    source_texts: list[str] = []
+    source_texts = _transform_payloads(text)
+    if _is_fresh_lookup_topic(text):
+        return any(
+            _is_unambiguous_self_contained_payload(source, text)
+            and _ASSERTION_RE.search(source)
+            for source in source_texts
+        )
+    return any(
+        _is_unambiguous_self_contained_payload(source, text) for source in source_texts
+    )
+
+
+def _transform_payloads(text: str) -> list[str]:
+    payloads: list[str] = []
     delimiter = re.search(r"[:：]\s*(\S.*)$", text)
     if delimiter:
-        source_texts.append(delimiter.group(1).strip())
-    source_texts.extend(match.group(1).strip() for match in _QUOTED_TEXT_RE.finditer(text))
+        payloads.append(delimiter.group(1).strip())
+    for match in _QUOTED_TEXT_RE.finditer(text):
+        payload = next(group for group in match.groups() if group is not None).strip()
+        if payload:
+            payloads.append(payload)
+    return payloads
+
+
+def _is_unambiguous_self_contained_payload(payload: str, request: str) -> bool:
+    if not payload or re.search(r"[?？]", payload):
+        return False
     return bool(
-        source_texts
-        and not any(_is_fresh_lookup_topic(source) for source in source_texts)
+        _STATEMENT_PUNCTUATION_RE.search(payload)
+        or _TRANSLATION_TRANSFORM_RE.search(request)
     )
 
 
 def _is_fresh_lookup_topic(text: str) -> bool:
-    return bool(
-        _FRESHNESS_CUE_RE.search(text)
-        and _LOOKUP_TOPIC_CUE_RE.search(text)
-        and not _SUPPLIED_CONTENT_CUE_RE.search(text)
-    )
+    return bool(_FRESHNESS_CUE_RE.search(text) and _LOOKUP_TOPIC_CUE_RE.search(text))
 
 
 def _is_valid_arithmetic_expression(text: str) -> bool:

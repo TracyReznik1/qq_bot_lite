@@ -50,6 +50,9 @@ class RoutePlannerTests(unittest.TestCase):
             "总结：今天的新闻",
             "总结一下“今天的新闻”",
             "总结一下“今天的新闻是什么？”",
+            "总结今天的新闻：发生了什么？",
+            "总结：“今天的新闻，是什么？”",
+            'summarize "today\'s news"',
         ):
             with self.subTest(question=question):
                 plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
@@ -70,12 +73,28 @@ class RoutePlannerTests(unittest.TestCase):
         supplied_current_text = RoutePlanner(
             FakeLLM(error=RuntimeError("planner unavailable"))
         ).plan(SearchRequest("翻译成英文：今天下雨"), timeout_seconds=8)
+        explicitly_supplied_current_text = RoutePlanner(
+            FakeLLM(error=RuntimeError("planner unavailable"))
+        ).plan(SearchRequest("润色以下文字：今天我去公园"), timeout_seconds=8)
         unsupplied = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
             SearchRequest("把 OpenSSL 最新漏洞报告翻译成英文"), timeout_seconds=8
         )
         self.assertEqual(SearchMode.SKIP, supplied.mode)
         self.assertEqual(SearchMode.SKIP, supplied_current_text.mode)
+        self.assertEqual(SearchMode.SKIP, explicitly_supplied_current_text.mode)
         self.assertEqual(SearchMode.LIGHT, unsupplied.mode)
+
+    def test_planner_error_does_not_treat_colon_or_quotes_alone_as_supplied_text(self):
+        for question in (
+            "总结：季度报告",
+            "总结一下“季度报告”",
+            "总结：“今天的新闻，列出重点”",
+        ):
+            with self.subTest(question=question):
+                plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
+                    SearchRequest(question), timeout_seconds=8
+                )
+                self.assertEqual(SearchMode.LIGHT, plan.mode)
 
     def test_planner_error_skips_self_contained_summary_source_text(self):
         for question in (
