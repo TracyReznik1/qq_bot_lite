@@ -11,7 +11,7 @@ from .models import (
     SearchResult,
     SearchTrace,
 )
-from .planning import RoutePlanner
+from .planning import IMAGE_ONLY_FALLBACK_QUERY, QueryPlanner
 from .providers import (
     ProviderErrorCode,
     ProviderHit,
@@ -22,14 +22,15 @@ from .providers import (
 )
 
 __all__ = (
+    "IMAGE_ONLY_FALLBACK_QUERY",
     "OutputKind",
     "ProviderErrorCode",
     "ProviderHit",
     "ProviderReadiness",
     "ProviderResult",
     "ProviderStatus",
+    "QueryPlanner",
     "RequestSource",
-    "RoutePlanner",
     "SearchFailure",
     "SearchMode",
     "SearchOutcome",
