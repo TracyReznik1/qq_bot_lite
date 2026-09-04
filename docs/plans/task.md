@@ -13,3 +13,7 @@
 | Task 27 | 单元测试与全量回归（`tests/test_memory_api_key_isolation.py` 及全量测试验证，推送 git） | COMPLETED | `python -B -m unittest discover -s tests -t . -v` (517 passed), `compileall` clean, `git diff --check` clean |
 | Task 28 | 聊天层平滑回退（`src/chat/chat_service.py` 在 `SearchMode.LIGHT` 搜索无结果时无感平滑回退至 `_plain_reply`） | COMPLETED | `python -B -m unittest tests.test_simple_search_chat_flow -v` (12 passed) |
 | Task 29 | 针对性单测与全量回归（`tests/test_simple_search_chat_flow.py` 覆盖 LIGHT 回退与 STANDARD 报错保留，全量回归并推送 git） | COMPLETED | `python -B -m unittest discover -s tests -t . -v` (519 passed), `compileall` clean, `git diff --check` clean |
+| Task 30 | 精简 `src/chat/prompt.py`（剔除废弃 Grounded JSON、清理负面废话与过期限制，吸纳 my_bot 优点统一基础模板，汉化搜索 Grounding，优化上下文拼接） | COMPLETED | `python -B -m unittest tests.test_identity_configuration tests.test_url_chat_injection_defense tests.test_user_facing_scope tests.test_memory_retrieval tests.test_simple_search_chat_flow tests.test_url_chat_flow -v` (66 passed) |
+| Task 31 | 精简 `config/persona.md`（提炼 ATRI 核心性格与少女语气口吻，去除重复条文与 7 组 Few-Shot 对话示例，压缩至 50 行左右） | COMPLETED | `python -B -m unittest tests.test_persona_file tests.test_identity_configuration tests.test_qqbot_branding -v` (17 passed) |
+| Task 32 | 优化 `src/commands/renderer.py`（指令语气分类使用轻量级角色设定摘要，避免传入整篇 8.7KB 人设长文） | COMPLETED | `python -B -m unittest tests.test_command_renderer -v` (10 passed) |
+| Task 33 | 针对性单测与全量回归验证（确保 prompt/persona/safety/injection/user_facing 各测试及全量测试全部通过） | COMPLETED | `pytest -q` (519 passed in 16.43s), `compileall` clean, `git diff --check` clean |
