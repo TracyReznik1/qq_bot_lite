@@ -1,3 +1,4 @@
+from .answering import AnswerResult, SearchAnswerer
 from .ddgs import DDGSSearchProvider
 from .factory import (
     get_search_readiness,
@@ -29,10 +30,16 @@ from .providers import (
 )
 from .ranking import EvidenceRanker, RankingResult
 from .reader import OnDemandReader
+from .rendering import (
+    render_search_answer,
+    render_search_failure,
+    split_qq_reply,
+)
 from .retrieval import ProviderRunner
 from .tavily import TavilySearchProvider
 
 __all__ = (
+    "AnswerResult",
     "DDGSSearchProvider",
     "EvidenceRanker",
     "IMAGE_ONLY_FALLBACK_QUERY",
@@ -47,6 +54,7 @@ __all__ = (
     "QueryPlanner",
     "RankingResult",
     "RequestSource",
+    "SearchAnswerer",
     "SearchFailure",
     "SearchMode",
     "SearchOutcome",
@@ -62,5 +70,9 @@ __all__ = (
     "TavilySearchProvider",
     "get_search_readiness",
     "get_simple_search_pipeline",
+    "render_search_answer",
+    "render_search_failure",
     "reset_simple_search_pipeline",
+    "split_qq_reply",
 )
+
