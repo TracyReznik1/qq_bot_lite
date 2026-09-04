@@ -98,6 +98,8 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 | `ADMIN_QQ_IDS` | Conditional | Empty | Comma/semicolon-separated QQ IDs with admin rights for `/globalremember`. |
 | `CHAT_MODELS` | Required | None | Conversation model chain, e.g. `gemini:gemini-2.5-flash`. Keys required for listed providers. |
 | `MEMORY_MODELS` | Optional | Empty | Dedicated model chain for structured memory extraction; defaults to `CHAT_MODELS` if unset. |
+| `MEMORY_GEMINI_API_KEY` | Optional | Empty | Dedicated Gemini Key for memory extraction; defaults to `GEMINI_API_KEY`. Isolates foreground & background quotas. |
+| `MEMORY_DEEPSEEK_API_KEY` | Optional | Empty | Dedicated DeepSeek Key for memory extraction; defaults to `DEEPSEEK_API_KEY`. |
 | `GEMINI_API_KEY` | Conditional | Empty | API Key for Google Gemini. |
 | `GEMINI_URL` | Optional | `https://generativelanguage.googleapis.com/v1` | Base API URL for Gemini (appends generateContent automatically). |
 | `DEEPSEEK_API_KEY` | Conditional | Empty | API Key for DeepSeek. |

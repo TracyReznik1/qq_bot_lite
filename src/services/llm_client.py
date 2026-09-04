@@ -110,8 +110,18 @@ class FallbackLLMClient:
         sequence.
     """
 
-    def __init__(self, chain: list[LLMModelSpec]) -> None:
+    def __init__(
+        self,
+        chain: list[LLMModelSpec],
+        cfg: Config | None = None,
+        *,
+        gemini_api_key: str | None = None,
+        deepseek_api_key: str | None = None,
+    ) -> None:
         self._chain = chain
+        self._cfg = cfg or config
+        self._gemini_api_key = gemini_api_key.strip() if gemini_api_key else None
+        self._deepseek_api_key = deepseek_api_key.strip() if deepseek_api_key else None
         self._clients: dict[str, DeepSeekClient | GeminiClient] = {}
 
     # ── public API ──────────────────────────────────────────────────
@@ -214,9 +224,15 @@ class FallbackLLMClient:
         key = f"{spec.provider}:{spec.model}"
         if key not in self._clients:
             if spec.provider == "deepseek":
-                self._clients[key] = DeepSeekClient(config)
+                self._clients[key] = DeepSeekClient(
+                    self._cfg,
+                    api_key=self._deepseek_api_key,
+                )
             elif spec.provider == "gemini":
-                self._clients[key] = GeminiClient(config)
+                self._clients[key] = GeminiClient(
+                    self._cfg,
+                    api_key=self._gemini_api_key,
+                )
             else:
                 raise RuntimeError(
                     f"Unknown LLM provider: {spec.provider}"
@@ -254,7 +270,12 @@ def get_llm_client() -> FallbackLLMClient:
     """Return the singleton ``FallbackLLMClient`` built from config."""
     global _llm_client
     if _llm_client is None:
-        _llm_client = FallbackLLMClient(_build_chain())
+        _llm_client = FallbackLLMClient(
+            _build_chain(),
+            cfg=config,
+            gemini_api_key=getattr(config, "gemini_api_key", None),
+            deepseek_api_key=getattr(config, "deepseek_api_key", None),
+        )
     return _llm_client
 
 
@@ -262,7 +283,20 @@ def get_memory_llm_client() -> FallbackLLMClient:
     """Return the memory-extraction client with its own fallback chain."""
     global _memory_llm_client
     if _memory_llm_client is None:
+        memory_gemini_key = getattr(
+            config,
+            "memory_gemini_api_key",
+            None,
+        ) or getattr(config, "gemini_api_key", None)
+        memory_deepseek_key = getattr(
+            config,
+            "memory_deepseek_api_key",
+            None,
+        ) or getattr(config, "deepseek_api_key", None)
         _memory_llm_client = FallbackLLMClient(
-            _build_chain(models=config.memory_models)
+            _build_chain(models=config.memory_models),
+            cfg=config,
+            gemini_api_key=memory_gemini_key,
+            deepseek_api_key=memory_deepseek_key,
         )
     return _memory_llm_client

@@ -98,6 +98,8 @@ python run_bot.py
 | `ADMIN_QQ_IDS` | 条件必需 | 空 | 具备管理员权限的 QQ 号列表（逗号或分号分隔），用于 `/globalremember`。 |
 | `CHAT_MODELS` | 必需 | 无 | 对话模型链，例如 `gemini:gemini-2.5-flash`。每个列出的提供商都需配置对应 Key。 |
 | `MEMORY_MODELS` | 可选 | 空 | 结构化记忆提取与合并的专用模型链；留空时自动复用 `CHAT_MODELS`。 |
+| `MEMORY_GEMINI_API_KEY` | 可选 | 空 | 记忆提取专用 Gemini Key；留空时自动复用 `GEMINI_API_KEY`。配置可实现前后台配额物理隔离。 |
+| `MEMORY_DEEPSEEK_API_KEY` | 可选 | 空 | 记忆提取专用 DeepSeek Key；留空时自动复用 `DEEPSEEK_API_KEY`。 |
 | `GEMINI_API_KEY` | 条件必需 | 空 | Google Gemini API 密钥。 |
 | `GEMINI_URL` | 可选 | `https://generativelanguage.googleapis.com/v1` | Gemini Developer API 基础地址（会自动追加 generateContent）。 |
 | `DEEPSEEK_API_KEY` | 条件必需 | 空 | DeepSeek API 密钥。 |

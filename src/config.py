@@ -80,6 +80,14 @@ class Config:
         ).strip()
     )
 
+    # ── Dedicated Memory Extraction Keys (Optional, fallback to primary keys) ──
+    memory_gemini_api_key: str = field(
+        default_factory=lambda: os.getenv("MEMORY_GEMINI_API_KEY", "").strip()
+    )
+    memory_deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("MEMORY_DEEPSEEK_API_KEY", "").strip()
+    )
+
     _chat_models_raw: str = field(
         default_factory=lambda: os.getenv("CHAT_MODELS", ""),
         repr=False,
@@ -102,6 +110,10 @@ class Config:
             provider_api_keys=provider_api_keys,
             gemini_url=self.gemini_url,
         )
+        memory_provider_api_keys = {
+            "gemini": self.memory_gemini_api_key or self.gemini_api_key,
+            "deepseek": self.memory_deepseek_api_key or self.deepseek_api_key,
+        }
         if str(self._memory_models_raw or "").strip():
             memory_models = parse_model_chain(
                 self._memory_models_raw,
@@ -109,7 +121,7 @@ class Config:
             )
             validate_model_configuration(
                 memory_models,
-                provider_api_keys=provider_api_keys,
+                provider_api_keys=memory_provider_api_keys,
                 gemini_url=self.gemini_url,
                 setting_name="MEMORY_MODELS",
             )

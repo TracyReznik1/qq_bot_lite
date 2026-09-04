@@ -46,8 +46,13 @@ def _clean_messages(
 
 
 class DeepSeekClient:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, api_key: str | None = None) -> None:
         self._cfg = cfg
+        self._api_key = api_key.strip() if api_key else None
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key or self._cfg.deepseek_api_key
 
     def chat(
         self,
@@ -60,7 +65,8 @@ class DeepSeekClient:
         tool_choice: str | dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
     ) -> ChatResponse:
-        if not self._cfg.deepseek_api_key:
+        api_key = self.api_key
+        if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not configured")
         model_name = str(model or "").strip()
         if not model_name:
@@ -81,7 +87,7 @@ class DeepSeekClient:
             proxies=self._cfg.proxies,
             json=payload,
             headers={
-                "Authorization": f"Bearer {self._cfg.deepseek_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             timeout=min(self._cfg.request_timeout, timeout_seconds)
