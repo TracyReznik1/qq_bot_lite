@@ -16,6 +16,7 @@ from .models import (
     SearchRequest,
     SearchResponse,
     SearchResult,
+    SearchRouteDecision,
     SearchTrace,
 )
 from .pipeline import SearchTimeouts, SimpleSearchPipeline
@@ -36,6 +37,7 @@ from .rendering import (
     split_qq_reply,
 )
 from .retrieval import ProviderRunner
+from .router import SearchRouter
 from .tavily import TavilySearchProvider
 
 __all__ = (
@@ -64,6 +66,8 @@ __all__ = (
     "SearchRequest",
     "SearchResponse",
     "SearchResult",
+    "SearchRouteDecision",
+    "SearchRouter",
     "SearchTimeouts",
     "SearchTrace",
     "SimpleSearchPipeline",

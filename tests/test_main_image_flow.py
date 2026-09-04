@@ -300,7 +300,7 @@ class MainImageFlowTests(unittest.TestCase):
             image_url_resolver=main.onebot.get_image_url,
         )
         generate.assert_called_once_with(
-            "private:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
+            "private:1", "", image_data_urls=[IMAGE_DATA_URL]
         )
         send.assert_called_once_with("1", "看到了", is_group=False)
 
@@ -323,7 +323,7 @@ class MainImageFlowTests(unittest.TestCase):
             image_url_resolver=main.onebot.get_image_url,
         )
         generate.assert_called_once_with(
-            "private:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
+            "private:1", "", image_data_urls=[IMAGE_DATA_URL]
         )
         send.assert_called_once_with("1", "看到了", is_group=False)
 
@@ -344,7 +344,7 @@ class MainImageFlowTests(unittest.TestCase):
             main.process_message(event)
 
         generate.assert_called_once_with(
-            "private:1", "帮我看看", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
+            "private:1", "帮我看看", image_data_urls=[IMAGE_DATA_URL]
         )
 
     def test_group_image_requires_and_accepts_bot_mention(self):
@@ -364,7 +364,7 @@ class MainImageFlowTests(unittest.TestCase):
             main.process_message(event)
 
         generate.assert_called_once_with(
-            "group:20:1", "", image_data_urls=[IMAGE_DATA_URL], mode=SearchMode.LIGHT
+            "group:20:1", "", image_data_urls=[IMAGE_DATA_URL]
         )
         send.assert_called_once_with(20, "群图", is_group=True)
 
@@ -599,7 +599,7 @@ class MainDeterministicModeTests(unittest.TestCase):
         service_patch.start()
         self.addCleanup(service_patch.stop)
 
-    def test_ordinary_text_image_and_mixed_messages_are_light(self):
+    def test_ordinary_text_image_and_mixed_messages_delegate_to_router_without_explicit_mode(self):
         for text, images in (("hello", []), ("", [IMAGE_DATA_URL]), ("hello", [IMAGE_DATA_URL])):
             with self.subTest(text=text, images=images):
                 raw_msg = f"{text} [CQ:image,url={IMAGE_URL}]" if images else text
@@ -616,7 +616,7 @@ class MainDeterministicModeTests(unittest.TestCase):
                 ):
                     main.process_message(event)
                     generate_reply.assert_called_once_with(
-                        "private:1", text, image_data_urls=images, mode=SearchMode.LIGHT
+                        "private:1", text, image_data_urls=images
                     )
 
     def test_search_command_downloads_and_passes_images(self):

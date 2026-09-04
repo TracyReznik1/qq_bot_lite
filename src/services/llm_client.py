@@ -157,9 +157,10 @@ class FallbackLLMClient:
             try:
                 remaining = timeout_seconds
                 if timeout_seconds is not None:
-                    remaining = max(timeout_seconds - (time.monotonic() - started), 0.0)
-                    if remaining <= 0:
+                    spent = time.monotonic() - started
+                    if spent >= timeout_seconds * 1.8:
                         raise TimeoutError("LLM deadline expired")
+                    remaining = max(timeout_seconds - spent, 8.0)
                 result = client.chat(
                     messages,
                     model=spec.model,
@@ -300,3 +301,36 @@ def get_memory_llm_client() -> FallbackLLMClient:
             deepseek_api_key=memory_deepseek_key,
         )
     return _memory_llm_client
+
+
+_router_llm_client: FallbackLLMClient | None = None
+
+
+def get_router_llm_client() -> FallbackLLMClient:
+    """Return the search router client built from configured router model."""
+    global _router_llm_client
+    if _router_llm_client is None:
+        raw_model = str(getattr(config, "search_router_model", "gemini-3.1-flash-lite") or "").strip() or "gemini-3.1-flash-lite"
+        if ":" in raw_model:
+            provider, _, model_name = raw_model.partition(":")
+        else:
+            provider, model_name = "gemini", raw_model
+        router_spec = [
+            LLMModelSpec(
+                provider=provider.strip(),
+                model=model_name.strip(),
+                supports_tools=_model_supports_tools(provider.strip(), model_name.strip()),
+            )
+        ]
+        chat_chain = _build_chain()
+        fallback_specs = [
+            m for m in chat_chain
+            if (m.provider, m.model) != (provider.strip(), model_name.strip())
+        ]
+        _router_llm_client = FallbackLLMClient(
+            router_spec + fallback_specs,
+            cfg=config,
+            gemini_api_key=getattr(config, "gemini_api_key", None),
+            deepseek_api_key=getattr(config, "deepseek_api_key", None),
+        )
+    return _router_llm_client

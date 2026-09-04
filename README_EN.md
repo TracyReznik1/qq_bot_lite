@@ -110,6 +110,8 @@ All configurations are maintained in `.env` (`KEY=value` format, lines starting 
 | `DEEPSEEK_URL` | Optional | `https://api.deepseek.com/chat/completions` | API endpoint for DeepSeek chat completions. |
 | `TAVILY_API_KEY` | Optional | Empty | API Key for primary search provider Tavily; falls back to DDGS if unset or unavailable. |
 | `PROXY_URL` | Optional | Empty | Global HTTP/HTTPS proxy address, e.g. `http://127.0.0.1:7890`. |
+| `SEARCH_ROUTER_MODEL` | Optional | `gemini-3.1-flash-lite` | Search router model used for deciding if search is needed and extracting search topics. |
+| `SEARCH_ROUTER_TIMEOUT` | Optional | `5.0` | Timeout in seconds for search router decision stage. |
 | `SEARCH_MAX_RESULTS` | Optional | `4` | Maximum number of search documents returned per query. |
 | `SEARCH_PLANNER_TIMEOUT` | Optional | `8.0` | Timeout in seconds for search query planning. |
 | `SEARCH_TAVILY_TIMEOUT` | Optional | `8.0` | Timeout in seconds for Tavily query stage. |

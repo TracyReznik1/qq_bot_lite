@@ -30,11 +30,31 @@ class OutputKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class SearchRouteDecision:
+    mode: SearchMode
+    reason_code: str
+    retrieval_topics: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        mode = SearchMode(self.mode)
+        reason_code = str(self.reason_code or "").strip()
+        topics = tuple(
+            t
+            for item in self.retrieval_topics
+            if (t := " ".join(str(item or "").split())[:500])
+        )
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "reason_code", reason_code)
+        object.__setattr__(self, "retrieval_topics", topics)
+
+
+@dataclass(frozen=True)
 class SearchRequest:
     mode: SearchMode
     text: str
     images: tuple[str, ...] = ()
     source: RequestSource = RequestSource.CHAT
+    topics: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         mode = SearchMode(self.mode)
@@ -44,12 +64,18 @@ class SearchRequest:
             for item in self.images
             if (normalized := str(item or "").strip())
         )
-        if not text and not images:
+        topics = tuple(
+            t
+            for item in self.topics
+            if (t := " ".join(str(item or "").split())[:500])
+        )
+        if not text and not images and not topics:
             raise ValueError("text or images must be provided")
         object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "text", text[:500])
         object.__setattr__(self, "images", images)
         object.__setattr__(self, "source", RequestSource(self.source))
+        object.__setattr__(self, "topics", topics)
 
 
 @dataclass(frozen=True)

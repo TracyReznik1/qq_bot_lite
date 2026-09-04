@@ -70,12 +70,19 @@ class SimpleSearchPipeline:
 
         try:
             planner_started = self._clock()
-            plan = self._planner.plan(
-                mode=request.mode,
-                text=request.text,
-                images=request.images,
-                timeout_seconds=self._timeouts.planner,
-            )
+            if request.mode is SearchMode.LIGHT and request.topics:
+                plan = SearchPlan(
+                    mode=SearchMode.LIGHT,
+                    queries=(SearchQuery("q1", request.topics[0]),),
+                    planner_degraded=False,
+                )
+            else:
+                plan = self._planner.plan(
+                    mode=request.mode,
+                    text=request.text,
+                    images=request.images,
+                    timeout_seconds=self._timeouts.planner,
+                )
             trace.stage_latency_ms["planner"] = max(
                 (self._clock() - planner_started) * 1000.0, 0.0
             )

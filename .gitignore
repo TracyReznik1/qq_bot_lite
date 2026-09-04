@@ -18,3 +18,5 @@ atri_data.backup-*/
 _google_backup_tmp*/
 gemini*/
 CLAUDE_*.md
+.tmp.driveupload/
+websearch-simplification-report.md

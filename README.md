@@ -110,6 +110,8 @@ python run_bot.py
 | `DEEPSEEK_URL` | 可选 | `https://api.deepseek.com/chat/completions` | DeepSeek 对话端点地址。 |
 | `TAVILY_API_KEY` | 可选 | 空 | 主搜索引擎 Tavily API Key；未配置或不可用时自动回退至 DDGS。 |
 | `PROXY_URL` | 可选 | 空 | 全局 HTTP/HTTPS 代理地址，例如 `http://127.0.0.1:7890`。 |
+| `SEARCH_ROUTER_MODEL` | 可选 | `gemini-3.1-flash-lite` | 检索路由模型名称，用于在无命令时判断是否需要搜索及提炼检索主题。 |
+| `SEARCH_ROUTER_TIMEOUT` | 可选 | `5.0` | 检索路由决策阶段超时（秒）。 |
 | `SEARCH_MAX_RESULTS` | 可选 | `4` | 每次搜索检索返回的文档数量上限。 |
 | `SEARCH_PLANNER_TIMEOUT` | 可选 | `8.0` | 搜索查询规划阶段超时（秒）。 |
 | `SEARCH_TAVILY_TIMEOUT` | 可选 | `8.0` | Tavily 查询阶段超时（秒）。 |

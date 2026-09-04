@@ -156,5 +156,21 @@ class SimpleSearchPipelineTests(unittest.TestCase):
         )
 
 
+    def test_light_mode_with_topics_bypasses_planner(self):
+        pipeline, calls = make_pipeline()
+        request = SearchRequest(
+            SearchMode.LIGHT,
+            "raw text",
+            topics=("ANSYS Bonded MPC",),
+        )
+        outcome = pipeline.run(request)
+        self.assertEqual(SearchMode.LIGHT, outcome.plan.mode)
+        self.assertEqual(1, len(outcome.plan.queries))
+        self.assertEqual("ANSYS Bonded MPC", outcome.plan.queries[0].text)
+        # Verify planner was NOT called
+        planner_calls = [c for c in calls if c.startswith("planner:")]
+        self.assertEqual([], planner_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

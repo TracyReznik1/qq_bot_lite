@@ -12,7 +12,6 @@ from src.commands import CommandContext, handle_command
 from src.commands.renderer import PersonaCommandRenderer
 from src.config import BASE_DIR, config
 from src.persona import PersonaConfigurationError, get_persona
-from src.search.simple.models import SearchMode
 
 from src.messaging import (
     MessageQueue,
@@ -348,7 +347,6 @@ def _process_message(data: dict[str, Any]) -> None:
                 session_key,
                 parsed_message.text,
                 image_data_urls=image_data_urls,
-                mode=SearchMode.LIGHT,
             )
             logger.info("Chat reply generated session_key=%s reply_chars=%s", session_key, len(reply or ""))
             send_reply(target_id, reply, is_group)

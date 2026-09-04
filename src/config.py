@@ -131,6 +131,7 @@ class Config:
         object.__setattr__(self, "memory_models", memory_models)
         object.__setattr__(self, "search_max_results", max(int(self.search_max_results), 1))
         for field_name in (
+            "search_router_timeout",
             "search_planner_timeout",
             "search_tavily_timeout",
             "search_ddgs_timeout",
@@ -162,6 +163,10 @@ class Config:
     def memory_database_path(self) -> Path:
         return self.data_dir / "memory.sqlite3"
 
+    search_router_model: str = field(
+        default_factory=lambda: os.getenv("SEARCH_ROUTER_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
+    )
+    search_router_timeout: float = env_float("SEARCH_ROUTER_TIMEOUT", 5.0)
     search_max_results: int = env_int("SEARCH_MAX_RESULTS", 4)
     search_planner_timeout: float = env_float("SEARCH_PLANNER_TIMEOUT", 8.0)
     search_tavily_timeout: float = env_float("SEARCH_TAVILY_TIMEOUT", 8.0)

@@ -16,6 +16,7 @@ from src.search.simple.models import (
     SearchQuery,
     SearchRequest,
     SearchResult,
+    SearchRouteDecision,
     SearchTrace,
 )
 
@@ -62,12 +63,20 @@ class FakeLLM:
         return SimpleNamespace(content=self.content)
 
 
-def run_reply(engine, *, mode: SearchMode, text: str, images=None, fake_llm=None):
+def run_reply(
+    engine,
+    *,
+    mode: SearchMode | None = None,
+    text: str,
+    images=None,
+    fake_llm=None,
+    router=None,
+):
     if fake_llm is None:
         fake_llm = FakeLLM("模型生成的搜索回答")
     with patch.object(chat_service, "get_simple_search_pipeline_for_chat", return_value=engine), \
          patch.object(chat_service, "llm", fake_llm):
-        return generate_reply("private:1", text, images, mode=mode)
+        return generate_reply("private:1", text, images, mode=mode, router=router)
 
 
 class SimpleSearchChatFlowTests(unittest.TestCase):
@@ -77,9 +86,42 @@ class SimpleSearchChatFlowTests(unittest.TestCase):
     def tearDown(self):
         chat_service.reset_history("private:1")
 
-    def test_generate_reply_requires_explicit_mode(self):
-        with self.assertRaises(TypeError):
-            generate_reply("private:1", "你好")
+    def test_generate_reply_without_mode_routes_to_skip(self):
+        fake_router = MagicMock()
+        fake_router.route.return_value = SearchRouteDecision(
+            mode=SearchMode.SKIP,
+            reason_code="casual_chat",
+            retrieval_topics=(),
+        )
+        fake_llm = FakeLLM("你好呀！")
+        with patch.object(chat_service, "get_simple_search_pipeline_for_chat") as factory, \
+             patch.object(chat_service, "llm", fake_llm):
+            reply = generate_reply("private:1", "你好", router=fake_router)
+        factory.assert_not_called()
+        fake_router.route.assert_called_once_with("你好", ())
+        self.assertEqual("你好呀！", reply)
+
+    def test_generate_reply_without_mode_routes_to_light_with_topics(self):
+        fake_router = MagicMock()
+        fake_router.route.return_value = SearchRouteDecision(
+            mode=SearchMode.LIGHT,
+            reason_code="external_fact",
+            retrieval_topics=("DeepSeek V3 架构",),
+        )
+        engine = FakeEngine(success_outcome(SearchMode.LIGHT))
+        reply = run_reply(engine, mode=None, text="DeepSeek V3 架构怎样", router=fake_router)
+        self.assertEqual(SearchMode.LIGHT, engine.requests[0].mode)
+        self.assertEqual(("DeepSeek V3 架构",), engine.requests[0].topics)
+        fake_router.route.assert_called_once_with("DeepSeek V3 架构怎样", ())
+        self.assertEqual("模型生成的搜索回答", reply)
+
+    def test_plain_reply_failure_returns_service_busy_not_search_error(self):
+        failing_llm = MagicMock()
+        failing_llm.chat.side_effect = RuntimeError("All models failed")
+        with patch.object(chat_service, "llm", failing_llm):
+            reply = generate_reply("private:1", "你是笨蛋吗", mode=SearchMode.SKIP)
+        self.assertEqual("暂时无法回复，请稍后再试。", reply)
+        self.assertNotIn("在线搜索", reply)
 
     def test_legacy_force_kwarg_is_rejected(self):
         legacy_kwargs = {"force_" + "search": True}
