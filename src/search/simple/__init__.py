@@ -11,10 +11,12 @@ from .models import (
     SearchResult,
     SearchTrace,
 )
+from .planning import RoutePlanner
 
 __all__ = (
     "OutputKind",
     "RequestSource",
+    "RoutePlanner",
     "SearchFailure",
     "SearchMode",
     "SearchOutcome",
