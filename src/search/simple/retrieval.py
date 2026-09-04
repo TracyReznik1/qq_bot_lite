@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import ipaddress
-from typing import Iterable
+from typing import Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from src.search.simple.models import SearchMode, SearchPlan, SearchQuery, SearchResult, SearchTrace
+from src.search.simple.models import (
+    SearchMode,
+    SearchPlan,
+    SearchQuery,
+    SearchResult,
+    SearchTrace,
+)
+from src.search.simple.providers import (
+    ProviderHit,
+    ProviderResult,
+    ProviderStatus,
+    SearchProvider,
+)
 from src.search.url_policy import canonicalize_public_http_url
 
 _TRACKING_QUERY_KEYS = frozenset(
@@ -26,11 +38,11 @@ _TRACKING_QUERY_KEYS = frozenset(
 
 
 class ProviderRunner:
-    """Run named legacy providers concurrently, preferring Tavily per query."""
+    """Run simple providers concurrently, preferring Tavily per query."""
 
     def __init__(
         self,
-        providers: Iterable[object],
+        providers: Sequence[SearchProvider],
         tavily_timeout: float,
         ddgs_timeout: float,
         max_results_per_query: int,
@@ -38,7 +50,7 @@ class ProviderRunner:
         self._providers = {
             str(provider.name).strip().lower(): provider
             for provider in providers
-            if str(getattr(provider, "name", "")).strip()
+            if hasattr(provider, "name") and str(provider.name).strip()
         }
         self._timeouts = {
             "tavily": tavily_timeout,
@@ -52,41 +64,27 @@ class ProviderRunner:
             trace.candidate_count = 0
             return ()
 
-        executor = ThreadPoolExecutor(
-            max_workers=len(queries),
-            thread_name_prefix="simple-search-provider",
-        )
         statuses: dict[str, list[str]] = {}
-        collected_hits: list[object] = []
-        unresolved = list(queries)
-        try:
-            tavily_results = self._run_provider(
-                executor,
-                "tavily",
-                queries,
+        collected_hits: list[ProviderHit] = []
+
+        tavily_hits, unresolved = self._execute_provider_batch(
+            "tavily",
+            queries,
+            plan.mode,
+            self._timeouts["tavily"],
+            statuses,
+        )
+        collected_hits.extend(tavily_hits)
+
+        if unresolved:
+            ddgs_hits, _ = self._execute_provider_batch(
+                "ddgs",
+                tuple(unresolved),
                 plan.mode,
+                self._timeouts["ddgs"],
                 statuses,
             )
-            unresolved = []
-            for query, result in zip(queries, tavily_results):
-                if result.status == "success" and result.hits:
-                    collected_hits.extend(result.hits)
-                else:
-                    unresolved.append(query)
-
-            if unresolved:
-                ddgs_results = self._run_provider(
-                    executor,
-                    "ddgs",
-                    tuple(unresolved),
-                    plan.mode,
-                    statuses,
-                )
-                for result in ddgs_results:
-                    if result.status == "success" and result.hits:
-                        collected_hits.extend(result.hits)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            collected_hits.extend(ddgs_hits)
 
         trace.provider_statuses.update(
             (provider, _summarize_statuses(values))
@@ -97,62 +95,83 @@ class ProviderRunner:
         trace.candidate_count = len(results)
         return results
 
-    def _run_provider(
+    def _execute_provider_batch(
         self,
-        executor: ThreadPoolExecutor,
         provider_name: str,
         queries: tuple[SearchQuery, ...],
         mode: SearchMode,
+        timeout: float,
         statuses: dict[str, list[str]],
-    ) -> tuple["_CallResult", ...]:
+    ) -> tuple[list[ProviderHit], list[SearchQuery]]:
         provider = self._providers.get(provider_name)
-        readiness_status = _readiness_status(provider)
-        if readiness_status is not None:
-            statuses.setdefault(provider_name, []).extend(
-                [readiness_status] * len(queries)
-            )
-            return tuple(_CallResult(readiness_status) for _ in queries)
+        if provider is None:
+            statuses.setdefault(provider_name, []).extend(["unavailable"] * len(queries))
+            return [], list(queries)
 
-        futures = [
-            executor.submit(
-                provider.search,
-                _legacy_query(query, mode),
-                tier=_legacy_tier(mode),
-                max_results=self._max_results_per_query,
-                timeout_seconds=self._timeouts[provider_name],
-            )
-            for query in queries
-        ]
-        output: list[_CallResult] = []
-        for future in futures:
+        readiness = _check_readiness(provider)
+        if readiness is not None:
+            statuses.setdefault(provider_name, []).extend([readiness] * len(queries))
+            return [], list(queries)
+
+        executor = ThreadPoolExecutor(
+            max_workers=len(queries),
+            thread_name_prefix=f"simple-search-{provider_name}",
+        )
+        futures_map = {}
+        try:
+            for query in queries:
+                future = executor.submit(
+                    provider.search,
+                    query,
+                    mode=mode,
+                    max_results=self._max_results_per_query,
+                    timeout_seconds=timeout,
+                )
+                futures_map[query] = future
+
+            wait(tuple(futures_map.values()), timeout=timeout)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        resolved_hits: list[ProviderHit] = []
+        unresolved_queries: list[SearchQuery] = []
+
+        for query in queries:
+            future = futures_map[query]
+            if not future.done():
+                statuses.setdefault(provider_name, []).append("timeout")
+                unresolved_queries.append(query)
+                continue
+
             try:
-                provider_result = future.result()
+                res = future.result()
             except TimeoutError:
-                result = _CallResult("timeout")
+                statuses.setdefault(provider_name, []).append("timeout")
+                unresolved_queries.append(query)
             except Exception:
-                result = _CallResult("error")
+                statuses.setdefault(provider_name, []).append("error")
+                unresolved_queries.append(query)
             else:
-                status = _status_value(getattr(provider_result, "status", "error"))
-                hits = tuple(getattr(provider_result, "hits", ()) or ())
-                if status == "success" and not hits:
-                    status = "empty"
-                result = _CallResult(status, hits if status == "success" else ())
-            statuses.setdefault(provider_name, []).append(result.status)
-            output.append(result)
-        return tuple(output)
+                status_val = getattr(res.status, "value", str(res.status)).lower()
+                usable_hits = [
+                    hit
+                    for hit in res.hits
+                    if _safe_canonical_url(hit.url) is not None
+                ]
+                if status_val == "success" and usable_hits:
+                    statuses.setdefault(provider_name, []).append("success")
+                    resolved_hits.extend(usable_hits)
+                else:
+                    norm_status = status_val if status_val in {
+                        "empty", "timeout", "error", "not_configured", "unavailable"
+                    } else "empty"
+                    statuses.setdefault(provider_name, []).append(norm_status)
+                    unresolved_queries.append(query)
+
+        return resolved_hits, unresolved_queries
 
 
-class _CallResult:
-    __slots__ = ("status", "hits")
-
-    def __init__(self, status: str, hits: tuple[object, ...] = ()) -> None:
-        self.status = status
-        self.hits = hits
-
-
-def _readiness_status(provider: object | None) -> str | None:
-    if provider is None:
-        return "unavailable"
+def _check_readiness(provider: SearchProvider) -> str | None:
     try:
         readiness = provider.readiness()
     except Exception:
@@ -164,14 +183,6 @@ def _readiness_status(provider: object | None) -> str | None:
     return None
 
 
-def _status_value(status: object) -> str:
-    value = getattr(status, "value", status)
-    normalized = str(value).strip().lower()
-    return normalized if normalized in {
-        "success", "empty", "timeout", "error", "not_configured", "unavailable"
-    } else "error"
-
-
 def _summarize_statuses(statuses: list[str]) -> str:
     if not statuses:
         return "unavailable"
@@ -181,31 +192,27 @@ def _summarize_statuses(statuses: list[str]) -> str:
     return ",".join(f"{status}:{counts[status]}" for status in sorted(counts))
 
 
-def _convert_hits(hits: Iterable[object], *, limit: int) -> tuple[SearchResult, ...]:
+def _convert_hits(
+    hits: Sequence[ProviderHit],
+    *,
+    limit: int,
+) -> tuple[SearchResult, ...]:
     results: list[SearchResult] = []
     seen_urls: set[str] = set()
     for hit in hits:
-        canonical = _safe_canonical_url(str(getattr(hit, "url", "") or ""))
+        canonical = _safe_canonical_url(hit.url)
         if canonical is None or canonical in seen_urls:
             continue
         seen_urls.add(canonical)
-        score = getattr(hit, "score", None)
-        try:
-            normalized_score = 0.5 if score is None else float(score)
-        except (TypeError, ValueError):
-            normalized_score = 0.5
+        score = hit.score if hit.score is not None else 0.5
         results.append(
             SearchResult(
                 result_id=f"R{len(results) + 1}",
-                title=str(getattr(hit, "title", "") or "").strip(),
+                title=hit.title,
                 url=canonical,
-                excerpt=str(
-                    getattr(hit, "snippet", None)
-                    or getattr(hit, "raw_content", None)
-                    or ""
-                ).strip(),
-                provider=str(getattr(hit, "provider", "") or "").strip(),
-                score=normalized_score,
+                excerpt=hit.snippet or hit.raw_content or "",
+                provider=hit.provider,
+                score=score,
             )
         )
         if len(results) >= limit:
@@ -239,19 +246,3 @@ def _safe_canonical_url(raw_url: str) -> str | None:
         parsed._replace(query=urlencode(filtered_query, doseq=True))
     )
     return canonicalize_public_http_url(without_tracking)
-
-
-def _legacy_query(query: SearchQuery, mode: SearchMode):
-    from src.search.models import QueryPurpose, SearchQuery as OldQuery, SearchRoundKind
-    return OldQuery(
-        query_id=query.query_id,
-        query_index=int(query.query_id.removeprefix("q")),
-        round_kind=SearchRoundKind.INITIAL,
-        purpose=QueryPurpose.DIRECT,
-        text=query.text,
-    )
-
-
-def _legacy_tier(mode: SearchMode):
-    from src.search.models import SearchTier
-    return SearchTier.LIGHT if mode is SearchMode.LIGHT else SearchTier.STANDARD

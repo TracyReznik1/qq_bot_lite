@@ -1,3 +1,4 @@
+from .ddgs import DDGSSearchProvider
 from .models import (
     OutputKind,
     RequestSource,
@@ -20,14 +21,18 @@ from .providers import (
     ProviderStatus,
     SearchProvider,
 )
+from .retrieval import ProviderRunner
+from .tavily import TavilySearchProvider
 
 __all__ = (
+    "DDGSSearchProvider",
     "IMAGE_ONLY_FALLBACK_QUERY",
     "OutputKind",
     "ProviderErrorCode",
     "ProviderHit",
     "ProviderReadiness",
     "ProviderResult",
+    "ProviderRunner",
     "ProviderStatus",
     "QueryPlanner",
     "RequestSource",
@@ -41,4 +46,5 @@ __all__ = (
     "SearchResponse",
     "SearchResult",
     "SearchTrace",
+    "TavilySearchProvider",
 )
