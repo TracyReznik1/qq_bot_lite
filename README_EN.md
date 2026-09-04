@@ -16,7 +16,7 @@
   2. **Authoritative Boundary Constraints**: System prompt enforces the highest security hierarchy, forbidding the model from executing any instructions or roleplay prompts contained in external web content;
   3. **Outbound Credential Redaction**: All replies pass through an automated secret scanner before dispatch via OneBot, redacting API keys, passwords, and private keys into `[redacted:credential]`.
 - **🖼️ Multimodal Vision Input**: Supports sending single images or mixed image+text messages (up to 4 images per message, max 5 MiB each) for visual recognition and understanding; image generation, editing, or proactive image sending are not supported.
-- **🧠 Fine-Grained Structured Memory**: SQLite-backed persistent memory supporting private, group, and global scopes, with full lifecycle management including automatic extraction, correction, retraction, disputing, and physical deletion.
+- **🧠 Fine-Grained Structured Memory**: SQLite-backed persistent memory supporting private, group, and global scopes, with full lifecycle management including automatic extraction, correction, retraction, disputing, and physical deletion. Supports dedicated memory keys (`MEMORY_GEMINI_API_KEY`) for physical quota isolation between foreground chat and background memory, preventing 15 RPM rate limiting.
 - **Clean Scope**: Intentionally focused with clear boundaries; does not support video understanding, weather/Bilibili plugins, or complex multi-agent setups. `/search <keyword>` focuses strictly on keyword search (does not provide standalone URL direct-fetch); chat-based URL direct-reading is handled automatically by the system.
 
 ```text
@@ -76,13 +76,17 @@ Communication between qqbot and OneBot clients (e.g. NapCat, Lagrange) uses a tw
 
 All configurations are maintained in `.env` (`KEY=value` format, lines starting with `#` are comments).
 
-### Model Chain Configuration
+### Model Chain & API Key Isolation Configuration
 - Model chains use `provider:model_name` syntax (comma-separated). The first entry is the primary model; subsequent entries serve as fallbacks. Supported providers: `gemini` and `deepseek`.
-- Gemini uses native `generateContent` REST API (default `GEMINI_URL=https://generativelanguage.googleapis.com/v1`), while DeepSeek uses an OpenAI-compatible endpoint. Example:
+- Gemini uses native `generateContent` REST API (default `GEMINI_URL=https://generativelanguage.googleapis.com/v1`), while DeepSeek uses an OpenAI-compatible endpoint.
+- **Physical Quota Isolation**: Foreground chat uses `GEMINI_API_KEY`, while background memory extraction can optionally use a dedicated `MEMORY_GEMINI_API_KEY`. This physically isolates API quotas and completely prevents 15 RPM free tier 429 rate limiting during chat; automatically falls back to the primary key if unset. Example:
   ```dotenv
   CHAT_MODELS=gemini:gemini-2.5-flash,deepseek:deepseek-chat
-  GEMINI_API_KEY=your_gemini_key
+  GEMINI_API_KEY=your_chat_gemini_key
   DEEPSEEK_API_KEY=your_deepseek_key
+
+  # Dedicated background memory key (optional, falls back to primary key if empty):
+  MEMORY_GEMINI_API_KEY=your_second_gemini_key
   ```
 
 ### Complete Parameter Summary Table

@@ -16,7 +16,7 @@
   2. **权威边界约束**：System Prompt 声明最高安全级，严禁模型执行网页中的任何诱导指令；
   3. **出站凭据脱敏拦截**：所有回复在经 OneBot 发送前统一执行硬凭据扫描，自动脱敏保护 API Key、密码与私钥。
 - **🖼️ 多模态图片理解**：支持接收单图或图文混合输入（每条消息最多 4 张，每张最多 5 MiB），由视觉模型识别分析；不支持图片生成、图片编辑与主动发图。
-- **🧠 细粒度结构化记忆**：基于 SQLite 持久化，支持私聊、群聊及全局作用域，涵盖自动学习、纠正、撤回、争议与物理删除机制。
+- **🧠 细粒度结构化记忆**：基于 SQLite 持久化，支持私聊、群聊及全局作用域，涵盖自动学习、纠正、撤回、争议与物理删除机制。支持独立配置记忆 API Key（`MEMORY_GEMINI_API_KEY`），实现前后台模型配额物理隔离，杜绝 15 RPM 限流争抢。
 - **清晰边界**：保持实用窄边界，不支持视频理解、天气或 B 站等外部专用工具插件或复杂 Agent。`/search <关键词>` 专注于关键词证据化检索（不提供独立 URL 直读）；聊天中的网页直读由系统自动安全处理。
 
 ```text
@@ -76,13 +76,17 @@ python run_bot.py
 
 配置统一在 `.env` 中维护（格式为 `KEY=value`，注释以 `#` 开头）。
 
-### 模型链配置
+### 模型链与 API Key 隔离配置
 - 模型链格式为 `提供商:模型名`（多个用逗号隔开），首个为主模型，后续为故障回退。支持 `gemini` 和 `deepseek`。
-- Gemini 使用原生 `generateContent` REST API（默认 `GEMINI_URL=https://generativelanguage.googleapis.com/v1`），DeepSeek 使用 OpenAI 兼容端点。示例：
+- Gemini 使用原生 `generateContent` REST API（默认 `GEMINI_URL=https://generativelanguage.googleapis.com/v1`），DeepSeek 使用 OpenAI 兼容端点。
+- **前后台配额物理隔离**：前台聊天对话使用 `GEMINI_API_KEY`；后台异步记忆提取可独立配置 `MEMORY_GEMINI_API_KEY`。两者配额彻底隔离，杜绝高频聊天时争抢 15 RPM 免费层并发触发 429 限流；留空时自动回退复用主 Key。示例：
   ```dotenv
   CHAT_MODELS=gemini:gemini-2.5-flash,deepseek:deepseek-chat
-  GEMINI_API_KEY=your_gemini_key
+  GEMINI_API_KEY=your_chat_gemini_key
   DEEPSEEK_API_KEY=your_deepseek_key
+
+  # 后台记忆提取专属 Key（可选，留空则自动复用主 Key）：
+  MEMORY_GEMINI_API_KEY=your_second_gemini_key
   ```
 
 ### 全部参数汇总表
