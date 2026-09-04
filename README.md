@@ -1,5 +1,7 @@
 # qqbot — qqbot_lite
 
+**[简体中文](README.md)** | **[English](README_EN.md)**
+
 > 基于 OneBot 协议的轻量级 QQ 聊天机器人，接入 Gemini 与 DeepSeek 大模型。支持上下文对话、网页 URL 自动前置直读、确定性证据化联网检索、多模态视觉理解与细粒度结构化记忆，并内置三层 Prompt 注入防御机制。
 
 ---
