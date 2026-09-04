@@ -131,7 +131,7 @@ class ReadmeGuideTests(unittest.TestCase):
 
     def test_readme_records_core_usage_and_runtime_behavior(self):
         usage = readme_section(self.readme, "使用方法")
-        for command in ("/search", "/remember", "/globalremember", "/reset"):
+        for command in ("/search", "/skip", "/remember", "/globalremember", "/reset"):
             self.assertIn(f"`{command}", usage)
         self.assertIn("不会删除个人记忆或全局记忆", usage)
 
@@ -203,28 +203,35 @@ class ReadmeGuideTests(unittest.TestCase):
         self.assertNotIn("DDGS 是主搜索提供者", self.readme)
         self.assertIn("DDGS 的阶段超时默认为 15 秒", self.readme)
         self.assertIn(
-            "不会向 QQ 用户展示引用编号、来源标题或 URL",
+            "普通回复不展示任何来源编号、标题或 URL",
             self.readme,
         )
         self.assertIn(
-            "证据映射仅保留在后台校验与 Trace 中",
+            "安全 Trace",
             self.readme,
         )
         self.assertIn(
-            "`light` 约 58 秒、`standard` 约 112 秒",
+            "普通聊天始终固定为",
             self.readme,
         )
-        self.assertIn("在线搜索服务暂时不可用", self.readme)
-        self.assertIn("暂未找到足以确认结论的信息", self.readme)
-        self.assertIn("名称或前提不一致", self.readme)
+        self.assertIn(
+            "LIGHT 模式",
+            self.readme,
+        )
+        self.assertIn(
+            "STANDARD 模式",
+            self.readme,
+        )
+        self.assertIn("网络不可用", self.readme)
+        self.assertIn("证据不足", self.readme)
+        self.assertIn("名称/前提不一致", self.readme)
 
     def test_readme_describes_resilient_search_recovery(self):
-        self.assertIn("事件时间", self.readme)
-        self.assertIn("网页发布时间", self.readme)
         self.assertIn("移除日期过滤后重试一次 Tavily", self.readme)
-        self.assertIn("搜索摘要", self.readme)
-        self.assertIn("低置信度", self.readme)
-        self.assertIn("不会额外调用 LLM 复核", self.readme)
+        self.assertIn("固定边界降级", self.readme)
+        self.assertIn("已有可用证据生成", self.readme)
+        self.assertIn("/skip", self.readme)
+        self.assertIn("不伪造在线证据", self.readme)
 
     def test_operator_docs_remove_old_model_variables(self):
         env_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
