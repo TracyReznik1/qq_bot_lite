@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -125,7 +126,10 @@ class Config:
             "search_ranker_timeout",
             "search_answer_timeout",
         ):
-            object.__setattr__(self, field_name, max(float(getattr(self, field_name)), 0.1))
+            timeout = float(getattr(self, field_name))
+            if not math.isfinite(timeout):
+                timeout = 0.1
+            object.__setattr__(self, field_name, max(timeout, 0.1))
     onebot_url: str = os.getenv("ONEBOT_API_URL", "http://127.0.0.1:3000").rstrip("/")
     onebot_access_token: str = os.getenv("ONEBOT_ACCESS_TOKEN", "")
     callback_secret: str = os.getenv("CALLBACK_SECRET", "")

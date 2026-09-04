@@ -36,7 +36,7 @@ class SearchRequest:
     has_images: bool = False
     request_source: RequestSource = RequestSource.CHAT
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         question = str(self.question or "").strip()
         if not question:
             raise ValueError("question must be non-empty")
@@ -53,7 +53,7 @@ class SearchQuery:
     exclude_domains: tuple[str, ...] = ()
     news: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         query_id = str(self.query_id or "").strip()
         text = " ".join(str(self.text or "").split())
         if not query_id or not text:
@@ -72,14 +72,16 @@ class SearchPlan:
     queries: tuple[SearchQuery, ...]
     planner_degraded: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        mode = SearchMode(self.mode)
         queries = tuple(self.queries)
-        if self.mode is SearchMode.SKIP and queries:
+        if mode is SearchMode.SKIP and queries:
             raise ValueError("skip cannot carry queries")
-        if self.mode is SearchMode.LIGHT and len(queries) != 1:
+        if mode is SearchMode.LIGHT and len(queries) != 1:
             raise ValueError("light requires exactly one query")
-        if self.mode is SearchMode.STANDARD and not 1 <= len(queries) <= 3:
+        if mode is SearchMode.STANDARD and not 1 <= len(queries) <= 3:
             raise ValueError("standard requires one to three queries")
+        object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "queries", queries)
 
 
@@ -92,7 +94,7 @@ class SearchResult:
     provider: str
     score: float = 0.5
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         score = float(self.score)
         score = min(max(score, 0.0), 1.0) if math.isfinite(score) else 0.5
         object.__setattr__(self, "score", score)
