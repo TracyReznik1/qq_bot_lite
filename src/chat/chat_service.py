@@ -11,7 +11,9 @@ from src.chat.prompt import (
     _ensure_context,
     build_search_system_prompt,
     build_untrusted_context,
+    format_external_webpage_sandbox,
 )
+from src.services.url_fetch_service import extract_first_url, fetch_document
 from src.config import config
 from src.memory.models import MemoryContext
 from src.search.simple.answering import SearchAnswerer
@@ -255,6 +257,7 @@ def _plain_reply(
     images: list[str],
     *,
     timeout_seconds: float,
+    webpage_payload: str = "",
 ) -> str:
     from src.chat.prompt import build_system_prompt
 
@@ -268,6 +271,7 @@ def _plain_reply(
                 query=text,
                 evidence_payload="",
                 include_memories=True,
+                webpage_payload=webpage_payload,
             ),
         },
     ]
@@ -301,6 +305,45 @@ def generate_reply(
     try:
         try:
             timeout = float(getattr(config, "search_answer_timeout", 20.0))
+
+            # ── 聊天 URL 前置自动直读与注入 ──
+            url = extract_first_url(normalized_text)
+            webpage_payload = ""
+            if url:
+                try:
+                    doc = fetch_document(url, timeout_seconds=5.0)
+                    if doc.ok:
+                        webpage_payload = format_external_webpage_sandbox(
+                            url=doc.final_url or url,
+                            title=doc.title,
+                            text=doc.text,
+                        )
+                        logger.info(
+                            "URL direct fetch succeeded url=%s title=%s chars=%s",
+                            url,
+                            doc.title,
+                            len(doc.text),
+                        )
+                    else:
+                        logger.info("URL direct fetch degraded url=%s status=%s", url, doc.status)
+                except Exception as fetch_err:
+                    logger.warning(
+                        "URL direct fetch unexpected error url=%s err=%s",
+                        url,
+                        type(fetch_err).__name__,
+                    )
+
+            if webpage_payload:
+                # 抓取到完整网页正文后，直接基于正文回答，短路冗余网络搜索
+                reply = _plain_reply(
+                    mem_ctx,
+                    normalized_text,
+                    images,
+                    timeout_seconds=timeout,
+                    webpage_payload=webpage_payload,
+                )
+                return reply
+
             if mode is SearchMode.SKIP:
                 reply = _plain_reply(
                     mem_ctx,
@@ -354,6 +397,9 @@ def generate_reply(
             return reply
     finally:
         if reply is not None:
+            from src.memory.privacy import redact_hard_secrets
+
+            reply = redact_hard_secrets(reply)
             stored_user_text = (
                 history_text
                 if history_text is not None

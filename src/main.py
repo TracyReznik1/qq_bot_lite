@@ -156,6 +156,17 @@ def split_reply(text: str) -> list[str]:
 
 
 def send_reply(target_id: Any, text: str, is_group: bool) -> None:
+    from src.memory.privacy import redact_hard_secrets
+
+    clean_text = redact_hard_secrets(text)
+    if clean_text != text:
+        logger.warning(
+            "Outbound reply contained sensitive secrets, redacted before sending target_id=%s is_group=%s",
+            target_id,
+            is_group,
+        )
+        text = clean_text
+
     parts = split_reply(text)
     if not parts:
         logger.info("Reply skipped: empty text target_id=%s is_group=%s", target_id, is_group)
