@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Sequence
 
 from src.search.simple.models import (
@@ -92,31 +91,10 @@ def render_search_answer(
                 source_lines.append(f"{i}. {r.url}")
         sources_suffix = "\n\n来源：\n" + "\n".join(source_lines)
 
-    body = text.strip()
-    lines = body.splitlines()
-    while lines:
-        last_line = lines[-1].strip()
-        if not last_line:
-            lines.pop()
-            continue
-        is_disclaimer = (
-            any(prefix in last_line for prefix in ("注：", "注:", "提示：", "提示:", "免责声明：", "免责声明:"))
-            and any(kw in last_line for kw in ("不完整", "仅供参考", "可靠", "时效", "准确"))
-        ) or (
-            any(kw in last_line for kw in ("仅供参考", "无法保证完全可靠", "可靠性未知", "信息可能不完整", "搜索信息可能不完整"))
-            and len(last_line) <= 60
-        )
-        if is_disclaimer:
-            lines.pop()
-        else:
-            break
-    body = "\n".join(lines).strip()
-
     cleaned_warning = (warning or "").strip()
-    if cleaned_warning in ("信息可能不完整。", "信息不完整。", "信息不完整", "信息可能不完整"):
-        cleaned_warning = ""
     warn_suffix = f"\n\n{cleaned_warning}" if cleaned_warning else ""
 
+    body = text.strip()
     if cleaned_warning and cleaned_warning in body:
         body = body.replace(cleaned_warning, "").strip()
 
