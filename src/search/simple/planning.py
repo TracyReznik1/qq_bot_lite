@@ -41,7 +41,21 @@ _TEXT_TRANSFORM_RE = re.compile(
     r"(?:翻译|改写|重写|润色|校对|纠错|缩写|扩写|总结|概括|摘要|paraphrase|rewrite|translate|summari[sz]e)",
     re.IGNORECASE,
 )
-_QUOTED_TEXT_RE = re.compile(r"[“‘\"']\s*[^”’\"']+\s*[”’\"']")
+_QUOTED_TEXT_RE = re.compile(r"[“‘\"']\s*([^”’\"']+)\s*[”’\"']")
+_FRESHNESS_CUE_RE = re.compile(
+    r"(?:最新|最近|近期|今天|今日|当前|现在|实时|今年|本周|本月|latest|current|today|recent)",
+    re.IGNORECASE,
+)
+_LOOKUP_TOPIC_CUE_RE = re.compile(
+    r"(?:新闻|消息|动态|进展|漏洞|版本|天气|价格|股价|汇率|行情|比分|排名|政策|规定|数据|"
+    r"news|updates?|vulnerabilit(?:y|ies)|version|weather|price|score|ranking)",
+    re.IGNORECASE,
+)
+_SUPPLIED_CONTENT_CUE_RE = re.compile(
+    r"[,，。；;！!]|(?:新闻|消息|动态|进展|漏洞|版本|天气|价格|股价|汇率|行情|比分|排名|政策|规定|数据)"
+    r"\s*(?:是(?!什么|否|怎么|如何)|为(?!什么|何)|包括|有|称|显示|指出|报道|宣布)",
+    re.IGNORECASE,
+)
 _ALLOWED_ARITHMETIC_OPERATORS = (
     ast.Add,
     ast.Sub,
@@ -204,9 +218,24 @@ def _is_self_contained_creative(text: str) -> bool:
 def _is_supplied_text_transform(text: str) -> bool:
     if not _TEXT_TRANSFORM_RE.search(text):
         return False
+
+    source_texts: list[str] = []
     delimiter = re.search(r"[:：]\s*(\S.*)$", text)
-    has_delimited_source = bool(delimiter and delimiter.group(1).strip())
-    return bool(has_delimited_source or _QUOTED_TEXT_RE.search(text))
+    if delimiter:
+        source_texts.append(delimiter.group(1).strip())
+    source_texts.extend(match.group(1).strip() for match in _QUOTED_TEXT_RE.finditer(text))
+    return bool(
+        source_texts
+        and not any(_is_fresh_lookup_topic(source) for source in source_texts)
+    )
+
+
+def _is_fresh_lookup_topic(text: str) -> bool:
+    return bool(
+        _FRESHNESS_CUE_RE.search(text)
+        and _LOOKUP_TOPIC_CUE_RE.search(text)
+        and not _SUPPLIED_CONTENT_CUE_RE.search(text)
+    )
 
 
 def _is_valid_arithmetic_expression(text: str) -> bool:

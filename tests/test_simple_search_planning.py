@@ -45,10 +45,17 @@ class RoutePlannerTests(unittest.TestCase):
         self.assertEqual(SearchMode.LIGHT, plan.mode)
 
     def test_planner_error_keeps_current_news_transform_on_light(self):
-        plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
-            SearchRequest("总结一下今天的新闻"), timeout_seconds=8
-        )
-        self.assertEqual(SearchMode.LIGHT, plan.mode)
+        for question in (
+            "总结一下今天的新闻",
+            "总结：今天的新闻",
+            "总结一下“今天的新闻”",
+            "总结一下“今天的新闻是什么？”",
+        ):
+            with self.subTest(question=question):
+                plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
+                    SearchRequest(question), timeout_seconds=8
+                )
+                self.assertEqual(SearchMode.LIGHT, plan.mode)
 
     def test_planner_error_skips_self_contained_creative_writing(self):
         plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
@@ -69,6 +76,19 @@ class RoutePlannerTests(unittest.TestCase):
         self.assertEqual(SearchMode.SKIP, supplied.mode)
         self.assertEqual(SearchMode.SKIP, supplied_current_text.mode)
         self.assertEqual(SearchMode.LIGHT, unsupplied.mode)
+
+    def test_planner_error_skips_self_contained_summary_source_text(self):
+        for question in (
+            "总结：项目按时完成，客户已确认验收",
+            "总结一下“项目按时完成，客户已确认验收”",
+            "总结：今天的新闻是新公园正式开放。",
+            "总结一下“今天的新闻是新公园正式开放。”",
+        ):
+            with self.subTest(question=question):
+                plan = RoutePlanner(FakeLLM(error=RuntimeError("planner unavailable"))).plan(
+                    SearchRequest(question), timeout_seconds=8
+                )
+                self.assertEqual(SearchMode.SKIP, plan.mode)
 
     def test_planner_error_skips_only_valid_pure_arithmetic(self):
         for question, expected in (
