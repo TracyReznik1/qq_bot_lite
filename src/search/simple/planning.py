@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import logging
 import re
 from typing import Any
 
 from .models import RequestSource, SearchMode, SearchPlan, SearchQuery, SearchRequest
+
+
+logger = logging.getLogger("qq-bot")
 
 
 _PLANNER_SYSTEM_PROMPT = """Decide whether answering the user's message needs web search and create concise search queries.
@@ -22,17 +27,33 @@ _GREETING_RE = re.compile(
     r"(?:呀|啊|哦|哟|！|!|。|\.|～|~|\s)*$",
     re.IGNORECASE,
 )
-_CREATIVE_RE = re.compile(
-    r"^(?:请|帮我|请帮我|能否|可以|给我|请给我)?\s*"
-    r"(?:(?:写|创作|编|续写|作|起草|生成|画)|讲(?:一个|个)?(?:故事|笑话)|tell\s+me\s+(?:a\s+)?(?:story|joke)\b)",
+_SELF_CONTAINED_CREATIVE_RE = re.compile(
+    r"(?:写|创作|编|续写|作|起草|生成|画).*(?:诗|故事|小说|歌词|文案|笑话|对联|剧本|信|邮件)"
+    r"|讲(?:一个|个)?(?:故事|笑话)"
+    r"|tell\s+me\s+(?:a\s+)?(?:story|joke)\b",
+    re.IGNORECASE,
+)
+_FACT_LOOKUP_CUE_RE = re.compile(
+    r"(?:最新|最近|近期|今天|今日|当前|现在|实时|新闻|漏洞|现任|今年|本周|本月|latest|current|today|news|recent)",
     re.IGNORECASE,
 )
 _TEXT_TRANSFORM_RE = re.compile(
-    r"^(?:请|帮我|请帮我|能否|可以)?\s*"
     r"(?:翻译|改写|重写|润色|校对|纠错|缩写|扩写|总结|概括|摘要|paraphrase|rewrite|translate|summari[sz]e)",
     re.IGNORECASE,
 )
-_ARITHMETIC_RE = re.compile(r"^[\d\s+\-*/%().=^]+$")
+_QUOTED_TEXT_RE = re.compile(r"[“‘\"']\s*[^”’\"']+\s*[”’\"']")
+_ALLOWED_ARITHMETIC_OPERATORS = (
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.BitXor,
+    ast.UAdd,
+    ast.USub,
+)
 
 
 class RoutePlanner:
@@ -52,8 +73,8 @@ class RoutePlanner:
             parsed = _parse_plan(getattr(response, "content", ""), request)
             if parsed is not None:
                 return parsed
-        except Exception:
-            pass
+        except Exception as error:
+            logger.debug("search route planner call failed (%s)", type(error).__name__)
         return _fallback_plan(request)
 
 
@@ -123,9 +144,14 @@ def _first_json_object(content: str) -> dict[str, Any] | None:
                     try:
                         value = json.loads(content[start : index + 1])
                     except (TypeError, ValueError):
-                        return None
-                    return value if isinstance(value, dict) else None
-        start = content.find("{", start + 1)
+                        start = content.find("{", index + 1)
+                        break
+                    if isinstance(value, dict):
+                        return value
+                    start = content.find("{", index + 1)
+                    break
+        else:
+            start = content.find("{", start + 1)
     return None
 
 
@@ -162,7 +188,45 @@ def _obviously_no_search(question: str) -> bool:
     text = " ".join(question.strip().split())
     return bool(
         _GREETING_RE.fullmatch(text)
-        or _CREATIVE_RE.match(text)
-        or _TEXT_TRANSFORM_RE.match(text)
-        or (_ARITHMETIC_RE.fullmatch(text) and any(char.isdigit() for char in text))
+        or _is_self_contained_creative(text)
+        or _is_supplied_text_transform(text)
+        or _is_valid_arithmetic_expression(text)
     )
+
+
+def _is_self_contained_creative(text: str) -> bool:
+    return bool(
+        _SELF_CONTAINED_CREATIVE_RE.search(text)
+        and not _FACT_LOOKUP_CUE_RE.search(text)
+    )
+
+
+def _is_supplied_text_transform(text: str) -> bool:
+    if not _TEXT_TRANSFORM_RE.search(text):
+        return False
+    delimiter = re.search(r"[:：]\s*(\S.*)$", text)
+    has_delimited_source = bool(delimiter and delimiter.group(1).strip())
+    return bool(has_delimited_source or _QUOTED_TEXT_RE.search(text))
+
+
+def _is_valid_arithmetic_expression(text: str) -> bool:
+    try:
+        root = ast.parse(text, mode="eval")
+    except (SyntaxError, ValueError):
+        return False
+
+    has_binary_operation = False
+    for node in ast.walk(root):
+        if isinstance(node, ast.BinOp):
+            has_binary_operation = True
+        elif isinstance(node, ast.UnaryOp):
+            continue
+        elif isinstance(node, (ast.operator, ast.unaryop)):
+            if not isinstance(node, _ALLOWED_ARITHMETIC_OPERATORS):
+                return False
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float, complex)):
+                return False
+        elif not isinstance(node, (ast.Expression, ast.Load)):
+            return False
+    return has_binary_operation
